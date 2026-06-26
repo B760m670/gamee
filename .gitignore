@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.local
+*.pem
+*.key
+*.keystore
+*.jks
+
+# Expo / React Native
+.expo/
+dist/
+web-build/
+*.orig.*
+
+# Native build output
+*.apk
+*.aab
+*.ipa
+
+# Note: this is a bare React Native app — the android/ and ios/ native
+# projects ARE committed. Only their build/ output is ignored (see
+# apps/mobile/.gitignore).
+
+# Go
+bin/
+*.test
+
+# Rust (future native core)
+target/
+
+# Logs
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/

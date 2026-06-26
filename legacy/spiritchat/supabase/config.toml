@@ -1,0 +1,8 @@
+# Supabase project configuration.
+# The `api` function does its own auth (custom HS256 JWT) and exposes public
+# OTP endpoints, so the platform-level JWT gate must be disabled for it.
+
+project_id = "vscasdbufemkzrjyqddn"
+
+[functions.dynamic-function]
+verify_jwt = false
