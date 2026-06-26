@@ -18,6 +18,7 @@ import {CallsScreen} from './src/screens/CallsScreen';
 import {SettingsScreen} from './src/screens/SettingsScreen';
 import {ChatScreen} from './src/screens/ChatScreen';
 import {LiquidTabBar} from './src/components/LiquidTabBar';
+import {UpdateGate} from './src/update/UpdateGate';
 import {colors} from './src/theme';
 
 export type RootStackParamList = {
@@ -70,6 +71,7 @@ function App(): React.JSX.Element {
           <Stack.Screen name="Chat" component={ChatScreen} options={{title: 'Чат'}} />
         </Stack.Navigator>
       </NavigationContainer>
+      <UpdateGate />
     </SafeAreaProvider>
   );
 }
