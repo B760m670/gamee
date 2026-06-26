@@ -25,9 +25,9 @@ web-build/
 *.aab
 *.ipa
 
-# Generated native projects (Expo Continuous Native Generation)
-/apps/mobile/android/
-/apps/mobile/ios/
+# Note: this is a bare React Native app — the android/ and ios/ native
+# projects ARE committed. Only their build/ output is ignored (see
+# apps/mobile/.gitignore).
 
 # Go
 bin/

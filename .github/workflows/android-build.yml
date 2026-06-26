@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build release APK
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -37,18 +37,15 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Expo prebuild (generate android/)
-        run: npx expo prebuild --platform android --no-install
-
-      - name: Build debug APK
+      - name: Build release APK
         run: |
           chmod +x android/gradlew
           cd android
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleRelease --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
-          path: apps/mobile/android/app/build/outputs/apk/debug/*.apk
+          name: app-release-apk
+          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
