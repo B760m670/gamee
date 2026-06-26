@@ -34,26 +34,9 @@ export const MOCK_USERS: PublicUser[] = [
   {id: 'u3', username: 'carol', display_name: 'Carol', avatar_url: null},
 ];
 
-export const MOCK_CONVERSATIONS: ConversationSummary[] = [
-  {
-    conversation_id: 'c1',
-    other: MOCK_USERS[0],
-    last_message: {content: 'Привет! Как дела?', media_url: null, sender_id: 'u1', created_at: iso(5)},
-    unread: 2,
-  },
-  {
-    conversation_id: 'c2',
-    other: MOCK_USERS[1],
-    last_message: {content: 'До встречи', media_url: null, sender_id: ME_ID, created_at: iso(140)},
-    unread: 0,
-  },
-  {
-    conversation_id: 'c3',
-    other: MOCK_USERS[2],
-    last_message: null,
-    unread: 0,
-  },
-];
+// Cleared for now — we're rebuilding screens gradually. The Chats list shows
+// its empty state until the P2P core feeds real conversations.
+export const MOCK_CONVERSATIONS: ConversationSummary[] = [];
 
 export function normalizeQuery(q: string): string {
   return q.trim().replace(/^@/, '').toLowerCase();
