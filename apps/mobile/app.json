@@ -6,6 +6,15 @@
     "platforms": ["android", "ios"],
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "enabled": true,
+      "url": "https://spiritchat-updates.metrvsapke.workers.dev/api/manifest",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
     "android": {
       "package": "com.spiritchat.app",
       "versionCode": 1
