@@ -24,8 +24,10 @@ web-build/
 *.apk
 *.aab
 *.ipa
-apps/*/android/app/build/
-apps/*/ios/build/
+
+# Generated native projects (Expo Continuous Native Generation)
+/apps/mobile/android/
+/apps/mobile/ios/
 
 # Go
 bin/
