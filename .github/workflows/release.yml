@@ -55,16 +55,10 @@ jobs:
           cd android
           ./gradlew assembleRelease --no-daemon
 
-      - name: Rename APK
-        run: |
-          mkdir -p ../release-out
-          cp android/app/build/outputs/apk/release/app-release.apk \
-             ../release-out/spiritchat-${{ inputs.version || github.ref_name }}.apk
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.version || github.ref_name }}
           name: ${{ inputs.version || github.ref_name }}
           generate_release_notes: true
-          files: release-out/*.apk
+          files: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
