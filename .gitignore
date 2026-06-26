@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.local
+*.pem
+*.key
+*.keystore
+*.jks
+
+# Expo / React Native
+.expo/
+dist/
+web-build/
+*.orig.*
+
+# Native build output
+*.apk
+*.aab
+*.ipa
+apps/*/android/app/build/
+apps/*/ios/build/
+
+# Go
+bin/
+*.test
+
+# Rust (future native core)
+target/
+
+# Logs
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
