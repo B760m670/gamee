@@ -1,0 +1,77 @@
+name: OTA Bundle
+
+# On every push, build the JS bundle and publish it to a fixed "ota" prerelease.
+# The installed app downloads and applies it on launch — no APK reinstall.
+# (Native changes still need a new APK via android-build.yml.)
+
+on:
+  push:
+    branches:
+      - claude/game-app-architecture-discussion-8gn7ep
+  workflow_dispatch:
+
+concurrency:
+  group: ota-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  ota:
+    name: Build and publish JS bundle
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build JS bundle
+        run: |
+          mkdir -p ota-out
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output ota-out/index.android.plain.bundle \
+            --assets-dest ota-out/assets
+
+      - name: Compile to Hermes bytecode
+        run: |
+          node_modules/react-native/sdks/hermesc/linux64-bin/hermesc \
+            -emit-binary \
+            -out ota-out/index.android.bundle \
+            ota-out/index.android.plain.bundle
+          rm -f ota-out/index.android.plain.bundle
+
+      - name: Write update manifest
+        run: |
+          cat > ota-out/update.json <<EOF
+          {
+            "version": ${{ github.run_number }},
+            "downloadAndroidUrl": "https://github.com/B760m670/gamee/releases/download/ota/index.android.bundle",
+            "commit": "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Publish OTA bundle
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ota
+          name: OTA dev channel
+          prerelease: true
+          make_latest: false
+          files: |
+            apps/mobile/ota-out/index.android.bundle
+            apps/mobile/ota-out/update.json

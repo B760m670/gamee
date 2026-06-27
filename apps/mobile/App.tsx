@@ -5,7 +5,7 @@
  * @format
  */
 
-import React from 'react';
+import React, {useEffect} from 'react';
 import {StatusBar} from 'react-native';
 import {NavigationContainer, DefaultTheme} from '@react-navigation/native';
 import {createNativeStackNavigator} from '@react-navigation/native-stack';
@@ -19,6 +19,7 @@ import {SettingsScreen} from './src/screens/SettingsScreen';
 import {ChatScreen} from './src/screens/ChatScreen';
 import {LiquidTabBar} from './src/components/LiquidTabBar';
 import {UpdateGate} from './src/update/UpdateGate';
+import {checkHotUpdate} from './src/ota/checkHotUpdate';
 import {colors} from './src/theme';
 
 export type RootStackParamList = {
@@ -57,6 +58,11 @@ function Tabs() {
 }
 
 function App(): React.JSX.Element {
+  useEffect(() => {
+    // Pull the latest JS bundle pushed by CI (no APK reinstall).
+    checkHotUpdate();
+  }, []);
+
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={colors.bg} />

@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - claude/game-app-architecture-discussion-8gn7ep
+    # Only rebuild the APK when native-affecting files change. Pure JS changes
+    # ship over-the-air via ota.yml, so they don't need a new APK.
+    paths:
+      - 'apps/mobile/android/**'
+      - 'apps/mobile/package.json'
+      - '.github/workflows/android-build.yml'
   workflow_dispatch:
 
 # Keep only the latest build per branch; cancel superseded runs.
