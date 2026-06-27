@@ -46,3 +46,9 @@ yarn-error.*
 .DS_Store
 .vscode/
 .idea/
+
+# Gradle / Kotlin Android app
+.gradle/
+apps/android/local.properties
+apps/android/**/build/
+*.hprof

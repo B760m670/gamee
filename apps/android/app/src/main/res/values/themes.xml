@@ -1,0 +1,8 @@
+<resources>
+    <!-- Activity shell theme; the real UI is drawn by Compose. -->
+    <style name="Theme.SpiritChat" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#000000</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <item name="android:windowBackground">#000000</item>
+    </style>
+</resources>

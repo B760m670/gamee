@@ -4,15 +4,8 @@ on:
   push:
     branches:
       - claude/game-app-architecture-discussion-8gn7ep
-    # Only rebuild the APK when native-affecting files change. Pure JS changes
-    # ship over-the-air via ota.yml, so they don't need a new APK.
-    paths:
-      - 'apps/mobile/android/**'
-      - 'apps/mobile/package.json'
-      - '.github/workflows/android-build.yml'
   workflow_dispatch:
 
-# Keep only the latest build per branch; cancel superseded runs.
 concurrency:
   group: android-build-${{ github.ref }}
   cancel-in-progress: true
@@ -23,16 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: apps/mobile
+        working-directory: apps/android
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -43,18 +31,14 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps
-
       - name: Build release APK
         run: |
-          chmod +x android/gradlew
-          cd android
+          chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
-          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
+          path: apps/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
