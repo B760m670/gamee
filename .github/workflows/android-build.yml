@@ -10,13 +10,19 @@ concurrency:
   group: android-build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build release APK
+    name: Build APK and publish dev channel
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: apps/android
+    env:
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 0.1.0-dev.${{ github.run_number }}
 
     steps:
       - name: Checkout
@@ -35,6 +41,28 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
+
+      - name: Write update manifest
+        run: |
+          cat > update.json <<EOF
+          {
+            "versionCode": ${{ github.run_number }},
+            "versionName": "0.1.0-dev.${{ github.run_number }}",
+            "apkUrl": "https://github.com/B760m670/gamee/releases/download/dev/app-release.apk",
+            "notes": "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Publish to dev channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: Dev channel
+          prerelease: true
+          make_latest: false
+          files: |
+            apps/android/app/build/outputs/apk/release/app-release.apk
+            apps/android/update.json
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
