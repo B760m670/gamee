@@ -11,7 +11,7 @@ import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.react.soloader.OpenSourceMergedSoMapping
 import com.facebook.soloader.SoLoader
-import com.otahotupdate.OtaHotUpdate
+import com.rnhotupdate.OtaHotUpdate
 import com.spiritchat.update.UpdatePackage
 
 class MainApplication : Application(), ReactApplication {
@@ -27,7 +27,7 @@ class MainApplication : Application(), ReactApplication {
         override fun getJSMainModuleName(): String = "index"
 
         // Load the OTA bundle if one has been downloaded, else the bundled JS.
-        override fun getJSBundleFile(): String? = OtaHotUpdate.bundleJS(this@MainApplication)
+        override fun getJSBundleFile(): String? = OtaHotUpdate.getBundleJS()
 
         override fun getUseDeveloperSupport(): Boolean = BuildConfig.DEBUG
 
