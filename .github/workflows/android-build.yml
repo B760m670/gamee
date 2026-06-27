@@ -3,10 +3,13 @@ name: Android APK
 on:
   push:
     branches:
-      - main
       - claude/game-app-architecture-discussion-8gn7ep
-  pull_request:
   workflow_dispatch:
+
+# Keep only the latest build per branch; cancel superseded runs.
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
