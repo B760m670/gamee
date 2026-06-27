@@ -93,7 +93,7 @@ fun LiquidTabBar(
             if (!dragging && itemPx > 0f) {
                 dropX.animateTo(
                     selectedIndex * itemPx,
-                    spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow),
+                    spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessMedium),
                 )
             }
         }
@@ -104,7 +104,6 @@ fun LiquidTabBar(
                 .height(BarHeight)
                 .clip(RoundedCornerShape(BarRadius))
                 .background(Color(0x14FFFFFF))
-                .border(0.7.dp, Color(0x33FFFFFF), RoundedCornerShape(BarRadius))
                 .pointerInput(itemPx, count) {
                     if (itemPx <= 0f) return@pointerInput
                     detectDragGestures(
@@ -119,7 +118,7 @@ fun LiquidTabBar(
                             scope.launch {
                                 dropX.animateTo(
                                     target * itemPx,
-                                    spring(dampingRatio = 0.6f, stiffness = Spring.StiffnessMedium),
+                                    spring(dampingRatio = 0.45f, stiffness = Spring.StiffnessMedium),
                                 )
                             }
                         },
