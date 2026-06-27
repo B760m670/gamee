@@ -18,12 +18,23 @@ android {
         versionName = System.getenv("VERSION_NAME") ?: "0.1.0"
     }
 
+    signingConfigs {
+        // A fixed key committed to the repo so every build (CI included) is
+        // signed identically — required for in-app updates to install over the
+        // previous build. Fine for a sideloaded dev app; a Play release would
+        // use a secret-based key instead.
+        create("shared") {
+            storeFile = file("spiritchat.keystore")
+            storePassword = "spiritchat"
+            keyAlias = "spiritchat"
+            keyPassword = "spiritchat"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Sign release with the debug key so the APK installs standalone
-            // (no keystore secret needed yet).
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("shared")
         }
     }
 
