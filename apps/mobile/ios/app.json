@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "MySocialApp",
-    "slug": "mysocialapp",
+    "name": "SpiritChat",
+    "slug": "spiritchat",
     "version": "1.0.0",
     "platforms": ["ios", "android"],
     "orientation": "portrait",
