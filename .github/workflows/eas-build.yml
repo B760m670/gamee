@@ -37,7 +37,7 @@ jobs:
 
       - name: Install mobile dependencies
         working-directory: apps/mobile/ios
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Install EAS CLI
         run: npm install -g eas-cli
