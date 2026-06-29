@@ -6,13 +6,13 @@ plugins {
 
 android {
     namespace = "com.spiritchat"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.spiritchat"
         // API 33+ for AGSL shaders + real-time RenderEffect blur (Liquid Glass).
         minSdk = 33
-        targetSdk = 35
+        targetSdk = 36
         // CI passes the run number so each push gets a higher versionCode,
         // letting the in-app updater install a newer build over the old one.
         versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
