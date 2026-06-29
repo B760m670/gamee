@@ -2,7 +2,6 @@ const { getDefaultConfig } = require('expo/metro-config');
 const path = require('path');
 
 const projectRoot = __dirname;
-const monorepoRoot = path.resolve(projectRoot, '../..');
 
 // Must be set before getDefaultConfig so the inline-env transform plugin
 // can statically replace require.context(process.env.EXPO_ROUTER_APP_ROOT)
@@ -13,14 +12,6 @@ if (!process.env.EXPO_ROUTER_APP_ROOT) {
 }
 
 const config = getDefaultConfig(projectRoot);
-
-// Monorepo: watch all workspace packages and resolve from both local and root
-// node_modules so shared packages (packages/*) are found during bundling.
-config.watchFolders = [...(config.watchFolders ?? []), monorepoRoot];
-config.resolver.nodeModulesPaths = [
-  path.resolve(projectRoot, 'node_modules'),
-  path.resolve(monorepoRoot, 'node_modules'),
-];
 
 const originalResolveRequest = config.resolver.resolveRequest;
 config.resolver.resolveRequest = (context, moduleName, platform) => {

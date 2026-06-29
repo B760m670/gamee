@@ -4,12 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - claude/threads-social-app-design-D9y4R
-      - claude/project-review-hMFw2
+      - claude/game-app-architecture-discussion-8gn7ep
       - main
     paths:
-      - 'apps/mobile/**'
-      - 'packages/**'
+      - 'apps/mobile/ios/**'
 
 jobs:
   update:
@@ -24,13 +22,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install root dependencies
+      - name: Install mobile dependencies
+        working-directory: apps/mobile/ios
         run: npm install
 
       - name: Patch missing module in expo bundled CLI
         # expo/node_modules/@expo/cli is missing autoAddConfigPlugins.js in SDK 55.
         # Write a no-op stub so applyPluginsAsync doesn't crash.
         # All config plugins are already declared in app.json manually.
+        working-directory: apps/mobile/ios
         run: |
           UTILS="node_modules/expo/node_modules/@expo/cli/build/src/install/utils"
           if [ -d "$(dirname "$UTILS")" ]; then
@@ -39,21 +39,14 @@ jobs:
           fi
 
       - name: Fix Expo package versions for SDK 55
-        working-directory: apps/mobile
+        working-directory: apps/mobile/ios
         run: npx expo install --fix || true
-
-      - name: Install mobile dependencies
-        working-directory: apps/mobile
-        run: npm install
 
       - name: Install EAS CLI
         run: npm install -g eas-cli
 
       - name: Publish update
-        working-directory: apps/mobile
+        working-directory: apps/mobile/ios
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-          EXPO_PUBLIC_SUPABASE_URL: https://vscasdbufemkzrjyqddn.supabase.co
-          EXPO_PUBLIC_SUPABASE_ANON_KEY: sb_publishable_E7OafHI6Hhgvvp9zZzDaIQ_ZmSQr1l7
-          EXPO_PUBLIC_WORKER_URL: https://mysocialapp-upload.metrvsapke.workers.dev
         run: eas update --branch main --message "$(git log -1 --pretty=%s)" --non-interactive

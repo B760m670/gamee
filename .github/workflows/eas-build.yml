@@ -6,18 +6,19 @@ on:
       platform:
         description: 'Platform to build'
         required: true
-        default: 'android'
+        default: 'ios'
         type: choice
         options:
-          - android
           - ios
+          - android
           - all
       profile:
         description: 'Build profile'
         required: true
-        default: 'preview'
+        default: 'development'
         type: choice
         options:
+          - development
           - preview
           - production
 
@@ -34,18 +35,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install root dependencies
-        run: npm install
-
       - name: Install mobile dependencies
-        working-directory: apps/mobile
+        working-directory: apps/mobile/ios
         run: npm install
 
       - name: Install EAS CLI
         run: npm install -g eas-cli
 
       - name: Build
-        working-directory: apps/mobile
+        working-directory: apps/mobile/ios
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: eas build --platform ${{ inputs.platform }} --profile ${{ inputs.profile }} --non-interactive
