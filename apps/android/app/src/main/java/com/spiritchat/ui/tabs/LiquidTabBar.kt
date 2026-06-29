@@ -43,9 +43,6 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeEffect
-import dev.chrisbanes.haze.materials.HazeMaterials
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -66,7 +63,6 @@ private val BarRadius = 32.dp
 fun LiquidTabBar(
     selected: TabItem,
     onSelect: (TabItem) -> Unit,
-    hazeState: HazeState,
     modifier: Modifier = Modifier,
 ) {
     val tabs = TabItem.entries
@@ -107,7 +103,7 @@ fun LiquidTabBar(
                 .fillMaxWidth()
                 .height(BarHeight)
                 .clip(RoundedCornerShape(BarRadius))
-                .hazeEffect(state = hazeState, style = HazeMaterials.ultraThin())
+                .background(Color(0x14FFFFFF))
                 .pointerInput(itemPx, count) {
                     if (itemPx <= 0f) return@pointerInput
                     detectDragGestures(

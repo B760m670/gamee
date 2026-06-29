@@ -16,8 +16,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.viewmodel.compose.viewModel
-import dev.chrisbanes.haze.hazeSource
-import dev.chrisbanes.haze.rememberHazeState
 import com.spiritchat.screens.CallsScreen
 import com.spiritchat.screens.ChatsScreen
 import com.spiritchat.screens.ContactsScreen
@@ -39,23 +37,18 @@ class MainActivity : ComponentActivity() {
 
                 // Chats is the default tab.
                 var selectedTab by remember { mutableStateOf(TabItem.Chats) }
-                val hazeState = rememberHazeState()
 
                 Box(Modifier.fillMaxSize().background(Color(0xFF000000))) {
-                    // Screen content is the blur source behind the floating tab bar.
-                    Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
-                        when (selectedTab) {
-                            TabItem.Contacts -> ContactsScreen()
-                            TabItem.Calls -> CallsScreen()
-                            TabItem.Chats -> ChatsScreen()
-                            TabItem.Settings -> SettingsScreen()
-                        }
+                    when (selectedTab) {
+                        TabItem.Contacts -> ContactsScreen()
+                        TabItem.Calls -> CallsScreen()
+                        TabItem.Chats -> ChatsScreen()
+                        TabItem.Settings -> SettingsScreen()
                     }
 
                     LiquidTabBar(
                         selected = selectedTab,
                         onSelect = { selectedTab = it },
-                        hazeState = hazeState,
                         modifier = Modifier.align(Alignment.BottomCenter),
                     )
 
