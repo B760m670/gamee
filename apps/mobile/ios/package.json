@@ -15,7 +15,6 @@
     "@react-native-masked-view/masked-view": "^0.3.2",
     "@shopify/flash-list": "2.0.2",
     "@shopify/react-native-skia": "2.4.18",
-    "@supabase/supabase-js": "2.43.0",
     "@tanstack/react-query": "^5.28.0",
     "expo": "~55.0.0",
     "expo-auth-session": "~55.0.16",

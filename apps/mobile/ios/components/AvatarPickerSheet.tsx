@@ -2,8 +2,6 @@ import { ActionSheetIOS } from 'react-native'
 import * as ImagePicker from 'expo-image-picker'
 import * as ImageManipulator from 'expo-image-manipulator'
 
-const WORKER_URL = 'https://mysocialapp-upload.metrvsapke.workers.dev'
-
 // Telegram uses 640×640 JPEG at 60% quality for avatar uploads
 const AVATAR_SIZE    = 640
 const AVATAR_QUALITY = 0.6
@@ -49,28 +47,15 @@ export function showAvatarPickerSheet(hasPhoto: boolean): Promise<AvatarPickerRe
   })
 }
 
-// Uploads image to Cloudflare R2 via Worker. Returns the public URL.
-export async function uploadAvatar(token: string, uri: string): Promise<string> {
+// Resizes/compresses an avatar to Telegram-style 640×640 JPEG and returns a
+// local file URI. The old cloud upload (Cloudflare R2 via a Worker) has been
+// removed along with the rest of the backend; avatar storage will be handled
+// by the P2P core once it lands. For now this stays fully on-device.
+export async function uploadAvatar(_token: string, uri: string): Promise<string> {
   const processed = await ImageManipulator.manipulateAsync(
     uri,
     [{ resize: { width: AVATAR_SIZE } }],
     { compress: AVATAR_QUALITY, format: ImageManipulator.SaveFormat.JPEG },
   )
-
-  const body = new FormData()
-  body.append('file', { uri: processed.uri, type: 'image/jpeg', name: 'avatar.jpg' } as unknown as Blob)
-
-  const res = await fetch(WORKER_URL, {
-    method:  'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body,
-  })
-
-  if (!res.ok) {
-    const msg = await res.text()
-    throw new Error(msg || 'Upload failed')
-  }
-
-  const { url } = await res.json() as { url: string }
-  return url
+  return processed.uri
 }

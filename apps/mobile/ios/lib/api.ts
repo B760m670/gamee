@@ -1,49 +1,37 @@
-const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'https://vscasdbufemkzrjyqddn.supabase.co/functions/v1/dynamic-function'
+// Offline placeholder for the former cloud REST backend.
+//
+// The app used to talk to a Supabase Edge Function through this client. That
+// backend has been removed: the messenger is moving to a pure peer-to-peer,
+// end-to-end-encrypted core with no server at all. Until that native core
+// lands, every request rejects with a clear "offline" error, so no code path
+// reaches a server. Call sites already handle rejected promises, so the
+// screens simply render as empty UI shells.
+
+export class OfflineError extends Error {
+  constructor(path: string) {
+    super(`Offline: backend removed, P2P core not implemented yet (${path})`)
+    this.name = 'OfflineError'
+  }
+}
 
 class ApiClient {
-  private token: string | null = null
+  // Kept for source compatibility with the former token-based client.
+  setToken(_token: string | null) {}
 
-  setToken(token: string | null) {
-    this.token = token
+  get<T>(path: string, _signal?: AbortSignal): Promise<T> {
+    return Promise.reject(new OfflineError(path))
   }
 
-  private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`
-    }
-
-    const res = await fetch(`${API_URL}${path}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal,
-    })
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ message: 'Network error' }))
-      throw new Error(err.message ?? 'Request failed')
-    }
-
-    return res.json()
+  post<T>(path: string, _body?: unknown): Promise<T> {
+    return Promise.reject(new OfflineError(path))
   }
 
-  get<T>(path: string, signal?: AbortSignal) {
-    return this.request<T>('GET', path, undefined, signal)
+  put<T>(path: string, _body?: unknown): Promise<T> {
+    return Promise.reject(new OfflineError(path))
   }
 
-  post<T>(path: string, body?: unknown) {
-    return this.request<T>('POST', path, body)
-  }
-
-  put<T>(path: string, body?: unknown) {
-    return this.request<T>('PUT', path, body)
-  }
-
-  delete<T>(path: string) {
-    return this.request<T>('DELETE', path)
+  delete<T>(path: string): Promise<T> {
+    return Promise.reject(new OfflineError(path))
   }
 }
 
