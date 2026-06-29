@@ -1,5 +1,6 @@
 package com.spiritchat.ui.tabs
 
+import android.graphics.RuntimeShader
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -34,7 +35,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -50,6 +53,20 @@ import kotlin.math.roundToInt
 private val Inactive = Color(0xFF8E8E93)
 private val BarHeight = 64.dp
 private val BarRadius = 32.dp
+
+// AGSL glass shader for the selection drop: a clear (mostly transparent) white
+// glass with a top sheen and a soft specular band that can track the finger.
+private const val GLASS_SHADER = """
+uniform float2 iResolution;
+uniform float iHighlight;
+half4 main(float2 fragCoord) {
+    float2 uv = fragCoord / iResolution;
+    float a = 0.06;
+    a += (1.0 - smoothstep(0.0, 0.5, uv.y)) * 0.16;
+    a += (1.0 - smoothstep(0.0, 0.22, abs(uv.x - iHighlight))) * 0.20;
+    return half4(half3(a), half(a));
+}
+"""
 
 /**
  * Liquid-Glass-style tab bar (iteration 1, no shaders yet):
@@ -72,6 +89,10 @@ fun LiquidTabBar(
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
+
+    // Build the glass shader once; fall back gracefully if it fails to compile.
+    val dropShader = remember { runCatching { RuntimeShader(GLASS_SHADER) }.getOrNull() }
+    val dropBrush = remember(dropShader) { dropShader?.let { ShaderBrush(it) } }
 
     BoxWithConstraints(
         modifier
@@ -150,7 +171,17 @@ fun LiquidTabBar(
                     .fillMaxHeight()
                     .padding(6.dp)
                     .clip(RoundedCornerShape(BarRadius - 6.dp))
-                    .background(Color(0x12FFFFFF))
+                    .drawBehind {
+                        val s = dropShader
+                        val b = dropBrush
+                        if (s != null && b != null) {
+                            s.setFloatUniform("iResolution", size.width, size.height)
+                            s.setFloatUniform("iHighlight", 0.5f)
+                            drawRect(b)
+                        } else {
+                            drawRect(Color(0x14FFFFFF))
+                        }
+                    }
                     .border(0.8.dp, Color(0x4DFFFFFF), RoundedCornerShape(BarRadius - 6.dp)),
             )
 
