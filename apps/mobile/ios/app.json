@@ -53,14 +53,14 @@
       "policy": "sdkVersion"
     },
     "updates": {
-      "url": "https://u.expo.dev/203c2383-447a-4eeb-8be1-6259226049c3"
+      "url": "https://u.expo.dev/537e54dc-1e68-4bc8-a6dc-aed60b01ef17"
     },
     "experiments": {
       "typedRoutes": true
     },
     "extra": {
       "eas": {
-        "projectId": "203c2383-447a-4eeb-8be1-6259226049c3"
+        "projectId": "537e54dc-1e68-4bc8-a6dc-aed60b01ef17"
       }
     }
   }
