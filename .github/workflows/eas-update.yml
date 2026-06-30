@@ -71,3 +71,15 @@ jobs:
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: eas update --branch main --message "$(git log -1 --pretty=%s)" --non-interactive
+
+      - name: Ensure channel/deployment exists
+        # Publishing only writes to the "main" branch. A channel must point at
+        # that branch for a deployment to exist, which is what surfaces the app
+        # in Expo Go. Both commands are idempotent.
+        if: steps.token.outputs.present == 'true'
+        working-directory: apps/mobile/ios
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          eas channel:create main 2>/dev/null || true
+          eas channel:edit main --branch main 2>/dev/null || true
