@@ -3,27 +3,30 @@ name: Android APK
 on:
   push:
     branches:
-      - main
       - claude/game-app-architecture-discussion-8gn7ep
-  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    name: Build release APK
+    name: Build APK and publish dev channel
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: apps/mobile
+        working-directory: apps/android
+    env:
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 0.1.0-dev.${{ github.run_number }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -34,18 +37,36 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps
-
       - name: Build release APK
         run: |
-          chmod +x android/gradlew
-          cd android
+          chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
+
+      - name: Write update manifest
+        run: |
+          cat > update.json <<EOF
+          {
+            "versionCode": ${{ github.run_number }},
+            "versionName": "0.1.0-dev.${{ github.run_number }}",
+            "apkUrl": "https://github.com/B760m670/gamee/releases/download/dev/app-release.apk",
+            "notes": "${{ github.sha }}"
+          }
+          EOF
+
+      - name: Publish to dev channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: Dev channel
+          prerelease: true
+          make_latest: false
+          files: |
+            apps/android/app/build/outputs/apk/release/app-release.apk
+            apps/android/update.json
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
-          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
+          path: apps/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error

@@ -4,6 +4,12 @@ node_modules/
 .pnp.*
 .yarn/*
 
+# Lockfiles are intentionally not committed (CI uses `npm install
+# --legacy-peer-deps`, not `npm ci`; the RN/Expo peer-dep graph makes a
+# committed lockfile fragile).
+package-lock.json
+yarn.lock
+
 # Environment / secrets
 .env
 .env.local
@@ -46,3 +52,12 @@ yarn-error.*
 .DS_Store
 .vscode/
 .idea/
+
+# Gradle / Kotlin Android app
+.gradle/
+apps/android/local.properties
+apps/android/**/build/
+*.hprof
+
+# Keep the shared dev signing key (committed on purpose for sideload updates)
+!apps/android/app/spiritchat.keystore

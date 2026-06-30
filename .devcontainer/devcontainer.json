@@ -1,0 +1,14 @@
+{
+  "name": "SpiritChat iOS (Expo dev server)",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:20",
+  "forwardPorts": [8081],
+  "portsAttributes": {
+    "8081": {
+      "label": "Expo Metro",
+      "visibility": "public",
+      "onAutoForward": "silent"
+    }
+  },
+  "postCreateCommand": "cd apps/mobile/ios && npm install --legacy-peer-deps",
+  "postStartCommand": "bash .devcontainer/start-expo.sh"
+}

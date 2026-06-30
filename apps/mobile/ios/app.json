@@ -1,0 +1,68 @@
+{
+  "expo": {
+    "name": "SpiritChat",
+    "slug": "spiritchat",
+    "owner": "millionfirst",
+    "version": "1.0.0",
+    "platforms": ["ios", "android"],
+    "orientation": "portrait",
+    "scheme": "mysocialapp",
+    "userInterfaceStyle": "dark",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.mysocialapp.mobile",
+      "buildNumber": "1",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "package": "com.mysocialapp.mobile",
+      "versionCode": 1
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#000000"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "$(PRODUCT_NAME) запрашивает доступ к фотографиям, чтобы вы могли установить фото профиля."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "$(PRODUCT_NAME) запрашивает доступ к камере для сканирования QR-кодов."
+        }
+      ]
+    ],
+    "runtimeVersion": {
+      "policy": "sdkVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/537e54dc-1e68-4bc8-a6dc-aed60b01ef17"
+    },
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "537e54dc-1e68-4bc8-a6dc-aed60b01ef17"
+      }
+    }
+  }
+}

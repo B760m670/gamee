@@ -1,6 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <!-- Exposes the downloaded update.apk in
-         Android/data/<pkg>/files/Download for the package installer. -->
-    <external-files-path name="updates" path="Download/" />
-</paths>
