@@ -1,11 +1,13 @@
 {
   "expo": {
     "name": "SpiritChat",
-    "slug": "spiritchat",
+    "slug": "spiritchat-app",
     "owner": "millionfirst",
-    "privacy": "unlisted",
     "version": "1.0.0",
-    "platforms": ["ios", "android"],
+    "platforms": [
+      "ios",
+      "android"
+    ],
     "orientation": "portrait",
     "scheme": "mysocialapp",
     "userInterfaceStyle": "dark",
@@ -55,14 +57,14 @@
       "policy": "sdkVersion"
     },
     "updates": {
-      "url": "https://u.expo.dev/537e54dc-1e68-4bc8-a6dc-aed60b01ef17"
+      "url": "https://u.expo.dev/a2350d8f-8ba5-45d0-9557-c9600cefbfe3"
     },
     "experiments": {
       "typedRoutes": true
     },
     "extra": {
       "eas": {
-        "projectId": "537e54dc-1e68-4bc8-a6dc-aed60b01ef17"
+        "projectId": "a2350d8f-8ba5-45d0-9557-c9600cefbfe3"
       }
     }
   }
