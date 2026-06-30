@@ -1,10 +1,10 @@
-name: EAS Diagnose
+name: EAS Init Fresh Project
 
 on:
   workflow_dispatch:
 
 jobs:
-  diagnose:
+  init:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,13 +16,26 @@ jobs:
         run: npm install --legacy-peer-deps
       - name: Install EAS CLI
         run: npm install -g eas-cli
-      - name: Diagnose
+      - name: Create fresh project
         working-directory: apps/mobile/ios
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: |
-          echo "===== whoami ====="; eas whoami || true
-          echo "===== project:info ====="; eas project:info || true
-          echo "===== channel:list ====="; eas channel:list --json --non-interactive || eas channel:list || true
-          echo "===== channel main view ====="; eas channel:view main --json --non-interactive || eas channel:view main || true
-          echo "===== update:list (branch main) ====="; eas update:list --branch main --limit 5 --non-interactive || true
+          cat > /tmp/fix.js <<'JS'
+          const fs=require('fs');
+          const p='app.json';
+          const j=JSON.parse(fs.readFileSync(p,'utf8'));
+          j.expo.slug='spiritchat-app';
+          delete j.expo.updates;
+          delete j.expo.privacy;
+          if (j.expo.extra && j.expo.extra.eas) delete j.expo.extra.eas.projectId;
+          fs.writeFileSync(p, JSON.stringify(j,null,2));
+          console.log('rewrote app.json (slug=spiritchat-app, projectId removed)');
+          JS
+          node /tmp/fix.js
+          echo "===== eas init ====="
+          eas init --non-interactive --force || eas init --non-interactive || true
+          echo "===== RESULT app.json ====="
+          cat app.json
+          echo "===== project:info ====="
+          eas project:info || true
