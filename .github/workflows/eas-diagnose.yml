@@ -1,0 +1,28 @@
+name: EAS Diagnose
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        working-directory: apps/mobile/ios
+        run: npm install --legacy-peer-deps
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+      - name: Diagnose
+        working-directory: apps/mobile/ios
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          echo "===== whoami ====="; eas whoami || true
+          echo "===== project:info ====="; eas project:info || true
+          echo "===== channel:list ====="; eas channel:list --json --non-interactive || eas channel:list || true
+          echo "===== channel main view ====="; eas channel:view main --json --non-interactive || eas channel:view main || true
+          echo "===== update:list (branch main) ====="; eas update:list --branch main --limit 5 --non-interactive || true
