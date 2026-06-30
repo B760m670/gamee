@@ -1,0 +1,36 @@
+name: EAS Access Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g eas-cli
+      - name: Who/owns
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        working-directory: apps/mobile/ios
+        run: |
+          echo "=== whoami ==="; eas whoami || true
+          echo "=== project:info ==="; eas project:info || true
+      - name: Manifest fetch (unauth vs authed)
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          PID=a2350d8f-8ba5-45d0-9557-c9600cefbfe3
+          H=(-H "expo-platform: ios" -H "expo-runtime-version: exposdk:57.0.0" -H "expo-channel-name: main" -H "Accept: application/expo+json,application/json")
+          echo "===== UNAUTHENTICATED ====="
+          curl -s -o /tmp/u.json -w "HTTP %{http_code}\n" "${H[@]}" "https://u.expo.dev/$PID"
+          echo "body:"; head -c 400 /tmp/u.json; echo
+          echo "===== AUTHENTICATED (Bearer EXPO_TOKEN) ====="
+          curl -s -o /tmp/a.json -w "HTTP %{http_code}\n" "${H[@]}" -H "Authorization: Bearer $EXPO_TOKEN" "https://u.expo.dev/$PID"
+          echo "body:"; head -c 400 /tmp/a.json; echo
+          echo "===== AUTHENTICATED (expo-session header) ====="
+          curl -s -o /tmp/s.json -w "HTTP %{http_code}\n" "${H[@]}" -H "expo-session: $EXPO_TOKEN" "https://u.expo.dev/$PID"
+          echo "body:"; head -c 400 /tmp/s.json; echo
