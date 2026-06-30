@@ -61,3 +61,6 @@ apps/android/**/build/
 
 # Keep the shared dev signing key (committed on purpose for sideload updates)
 !apps/android/app/spiritchat.keystore
+
+# Codespaces: generated Expo Go URL banner
+OPEN-IN-EXPO-GO.txt

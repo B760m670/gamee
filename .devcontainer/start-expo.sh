@@ -10,14 +10,17 @@
 
 set -u
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../apps/mobile/ios" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_DIR="${REPO_ROOT}/apps/mobile/ios"
 cd "$APP_DIR" || exit 1
 
 HOST="${CODESPACE_NAME:-localhost}-8081.app.github.dev"
 echo "REACT_NATIVE_PACKAGER_HOSTNAME=${HOST}" > .env.local
 
 URL="exp://${HOST}"
-BANNER="/workspaces/OPEN-IN-EXPO-GO.txt"
+# Write the link to the repo root so it shows at the top of the Codespace
+# file explorer (gitignored - see .gitignore).
+BANNER="${REPO_ROOT}/OPEN-IN-EXPO-GO.txt"
 {
   echo "========================================"
   echo "  Open this in Expo Go (tap or paste):"
