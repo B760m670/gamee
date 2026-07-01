@@ -1,4 +1,4 @@
-name: EAS Privacy Fix Attempt
+name: EAS Privacy Fix Attempt 2
 
 on:
   workflow_dispatch:
@@ -7,24 +7,23 @@ jobs:
   fix:
     runs-on: ubuntu-latest
     steps:
-      - name: Introspect App mutations for privacy field
+      - name: Introspect AppInfoInput fields
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: |
-          echo "===== search AppMutation type fields ====="
+          echo "===== AppInfoInput fields ====="
           curl -s -X POST https://api.expo.dev/graphql \
             -H "Authorization: Bearer $EXPO_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"query":"query { __type(name: \"AppMutation\") { fields { name args { name type { name kind ofType { name } } } } } }"}' \
-            > /tmp/appmut.json
-          node -e "const d=require('/tmp/appmut.json'); const fs=d.data.__type.fields; for(const f of fs){ console.log(f.name, '(', f.args.map(a=>a.name).join(', '), ')'); }"
+            -d '{"query":"query { __type(name: \"AppInfoInput\") { inputFields { name type { name kind ofType { name kind } } } } }"}' \
+            > /tmp/inp.json
+          cat /tmp/inp.json
           echo
-          echo "===== raw (privacy-related only) ====="
-          grep -io '"name":"[a-zA-Z]*[Pp]rivacy[a-zA-Z]*"' /tmp/appmut.json || echo "no privacy-named field"
+          node -e "const d=require('/tmp/inp.json'); if(d.data && d.data.__type){ for(const f of d.data.__type.inputFields){ console.log(f.name); } } else { console.log('NO TYPE / errors:', JSON.stringify(d)); }"
           echo
-          echo "===== try setPrivacy mutation if it exists ====="
+          echo "===== try setAppInfo with privacy ====="
           curl -s -X POST https://api.expo.dev/graphql \
             -H "Authorization: Bearer $EXPO_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"query":"mutation($appId: String!, $privacy: AppPrivacy!) { app { setPrivacy(appId: $appId, privacy: $privacy) { id privacy } } }","variables":{"appId":"a2350d8f-8ba5-45d0-9557-c9600cefbfe3","privacy":"PUBLIC"}}'
+            -d '{"query":"mutation($appId: String!, $appInfo: AppInfoInput!) { app { setAppInfo(appId: $appId, appInfo: $appInfo) { id privacy } } }","variables":{"appId":"a2350d8f-8ba5-45d0-9557-c9600cefbfe3","appInfo":{"privacy":"PUBLIC"}}}'
           echo
