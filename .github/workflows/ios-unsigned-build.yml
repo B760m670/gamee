@@ -18,12 +18,20 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: apps/mobile/ios
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select newest available Xcode (>= 16.1 required by RN 0.86)
+        run: |
+          ls /Applications | grep -i xcode
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          echo "Selecting: $LATEST"
+          sudo xcode-select -s "$LATEST"
+          xcodebuild -version
 
       - uses: actions/setup-node@v4
         with:
