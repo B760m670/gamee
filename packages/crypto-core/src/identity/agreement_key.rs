@@ -2,7 +2,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
 use super::keypair::{IdentityKeyPair, IdentityPublicKey};
-use crate::error::Result;
+use crate::error::{CryptoError, Result};
 
 const AGREEMENT_KEY_CONTEXT: &[u8] = b"SpiritChat-AgreementKey-v1";
 
@@ -47,6 +47,24 @@ impl AgreementKeyPair {
             signature: identity.sign(&signing_message(&public)),
         }
     }
+
+    /// The raw 32-byte scalar, for persistence alongside the identity key.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let array: [u8; 32] =
+            bytes
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyLength {
+                    expected: 32,
+                    actual: bytes.len(),
+                })?;
+        Ok(Self {
+            secret: StaticSecret::from(array),
+        })
+    }
 }
 
 impl SignedAgreementKeyPublic {
@@ -88,5 +106,13 @@ mod tests {
         signed.public = other_agreement.public();
 
         assert!(signed.verify(&identity.public_key()).is_err());
+    }
+
+    #[test]
+    fn secret_round_trips_through_bytes() {
+        let mut rng = ChaCha20Rng::seed_from_u64(1);
+        let agreement = AgreementKeyPair::generate(&mut rng);
+        let restored = AgreementKeyPair::from_bytes(&agreement.to_bytes()).unwrap();
+        assert_eq!(agreement.public(), restored.public());
     }
 }

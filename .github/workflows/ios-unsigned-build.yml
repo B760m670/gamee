@@ -40,6 +40,51 @@ jobs:
       - name: Install JS dependencies
         run: npm install --legacy-peer-deps
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust build (crypto-core-ffi)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/crypto-core-ffi/target
+          key: rust-crypto-core-ffi-ios-${{ runner.os }}-${{ hashFiles('packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml') }}
+          restore-keys: |
+            rust-crypto-core-ffi-ios-${{ runner.os }}-
+
+      - name: Cross-compile crypto core for iOS (device + Apple Silicon simulator)
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --release --lib --target aarch64-apple-ios
+          cargo build --release --lib --target aarch64-apple-ios-sim
+
+      - name: Generate Swift bindings from the crypto core
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --bin uniffi-bindgen
+          ./target/debug/uniffi-bindgen generate \
+            --library target/aarch64-apple-ios-sim/release/libspiritchat_crypto_core_ffi.dylib \
+            --language swift \
+            --out-dir bindgen-out \
+            --no-format
+
+          MODULE_DIR=../../apps/mobile/ios/modules/spiritchat-crypto-core/ios
+          cp bindgen-out/spiritchat_crypto_core_ffi.swift "$MODULE_DIR/"
+
+          mkdir -p headers
+          cp bindgen-out/spiritchat_crypto_core_ffiFFI.h headers/
+          cp bindgen-out/spiritchat_crypto_core_ffiFFI.modulemap headers/module.modulemap
+
+          rm -rf "$MODULE_DIR/SpiritchatCryptoCoreFFI.xcframework"
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libspiritchat_crypto_core_ffi.a -headers headers \
+            -library target/aarch64-apple-ios-sim/release/libspiritchat_crypto_core_ffi.a -headers headers \
+            -output "$MODULE_DIR/SpiritchatCryptoCoreFFI.xcframework"
+
       - name: Prebuild native iOS project
         run: npx expo prebuild --platform ios --no-install
 

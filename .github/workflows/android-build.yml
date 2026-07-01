@@ -37,6 +37,50 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build (crypto-core-ffi)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/crypto-core-ffi/target
+          key: rust-crypto-core-ffi-android-${{ runner.os }}-${{ hashFiles('packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml') }}
+          restore-keys: |
+            rust-crypto-core-ffi-android-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Cross-compile crypto core for Android (arm64-v8a, x86_64)
+        working-directory: packages/crypto-core-ffi
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 -o ../../apps/android/app/src/main/jniLibs build --release --lib
+
+      - name: Generate Kotlin bindings from the crypto core
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --bin uniffi-bindgen
+          ./target/debug/uniffi-bindgen generate \
+            --library ../../apps/android/app/src/main/jniLibs/arm64-v8a/libspiritchat_crypto_core_ffi.so \
+            --language kotlin \
+            --out-dir bindgen-out \
+            --no-format
+          mkdir -p ../../apps/android/app/src/main/java/uniffi
+          cp -r bindgen-out/uniffi/spiritchat_crypto_core_ffi ../../apps/android/app/src/main/java/uniffi/
+
       - name: Build release APK
         run: |
           chmod +x gradlew

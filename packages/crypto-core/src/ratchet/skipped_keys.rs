@@ -51,6 +51,27 @@ impl SkippedKeyStore {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// All entries as owned tuples, for serializing the store (e.g. as part
+    /// of persisting a [`super::DoubleRatchet`] across app restarts).
+    pub fn entries(&self) -> Vec<([u8; 32], u32, MessageKey)> {
+        self.keys
+            .iter()
+            .map(|(&(dh_public, message_number), key)| (dh_public, message_number, key.clone()))
+            .collect()
+    }
+
+    /// Rebuilds a store from entries produced by [`Self::entries`]. Does not
+    /// re-check the [`MAX_SKIPPED_KEYS`] cap against the input length — a
+    /// store that was valid when serialized (the cap was already enforced
+    /// on every [`Self::insert`]) stays valid on the way back in.
+    pub fn from_entries(entries: Vec<([u8; 32], u32, MessageKey)>) -> Self {
+        let keys = entries
+            .into_iter()
+            .map(|(dh_public, message_number, key)| ((dh_public, message_number), key))
+            .collect();
+        Self { keys }
+    }
 }
 
 #[cfg(test)]
@@ -98,5 +119,21 @@ mod tests {
             .insert(public, MAX_SKIPPED_KEYS as u32, MessageKey([0u8; 32]))
             .unwrap_err();
         assert_eq!(err, CryptoError::TooManySkippedKeys);
+    }
+
+    #[test]
+    fn round_trips_through_entries() {
+        let mut store = SkippedKeyStore::new();
+        let a = dummy_public(1);
+        let b = dummy_public(2);
+        store.insert(a, 1, MessageKey([1u8; 32])).unwrap();
+        store.insert(b, 2, MessageKey([2u8; 32])).unwrap();
+
+        let restored = SkippedKeyStore::from_entries(store.entries());
+        assert_eq!(restored.len(), 2);
+
+        let mut restored = restored;
+        assert_eq!(restored.take(&a, 1).unwrap().as_bytes(), &[1u8; 32]);
+        assert_eq!(restored.take(&b, 2).unwrap().as_bytes(), &[2u8; 32]);
     }
 }

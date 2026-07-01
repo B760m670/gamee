@@ -42,6 +42,65 @@ impl PrekeyBundle {
         self.identity
             .verify(&message, &self.signed_prekey.signature)
     }
+
+    /// The wire format that goes inside a QR contact card: every public
+    /// field, concatenated with fixed-size framing plus a one-byte flag for
+    /// the optional one-time prekey. All public data — safe to put in a QR
+    /// code or a URL, but still unverified until [`Self::verify`] is
+    /// called by whoever scans it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 32 + 64 + 32 + 64 + 1 + 32);
+        out.extend_from_slice(&self.identity.to_bytes());
+        out.extend_from_slice(self.identity_agreement_key.public.as_bytes());
+        out.extend_from_slice(&self.identity_agreement_key.signature);
+        out.extend_from_slice(self.signed_prekey.public.as_bytes());
+        out.extend_from_slice(&self.signed_prekey.signature);
+        match self.one_time_prekey {
+            Some(otp) => {
+                out.push(1);
+                out.extend_from_slice(otp.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    pub fn from_bytes(input: &[u8]) -> Result<Self> {
+        const FIXED_LEN: usize = 32 + 32 + 64 + 32 + 64 + 1;
+        if input.len() < FIXED_LEN {
+            return Err(CryptoError::Decode("contact card too short"));
+        }
+
+        let identity = IdentityPublicKey::from_bytes(&input[0..32])?;
+        let agreement_public = x25519_public_from_bytes(&input[32..64])?;
+        let agreement_signature: [u8; 64] = input[64..128].try_into().unwrap();
+        let spk_public = x25519_public_from_bytes(&input[128..160])?;
+        let spk_signature: [u8; 64] = input[160..224].try_into().unwrap();
+
+        let one_time_prekey = match input[224] {
+            0 => None,
+            1 => {
+                let otp_bytes = input
+                    .get(225..257)
+                    .ok_or(CryptoError::Decode("truncated one-time prekey"))?;
+                Some(x25519_public_from_bytes(otp_bytes)?)
+            }
+            _ => return Err(CryptoError::Decode("invalid one-time-prekey flag byte")),
+        };
+
+        Ok(Self {
+            identity,
+            identity_agreement_key: SignedAgreementKeyPublic {
+                public: agreement_public,
+                signature: agreement_signature,
+            },
+            signed_prekey: SignedPrekeyPublic {
+                public: spk_public,
+                signature: spk_signature,
+            },
+            one_time_prekey,
+        })
+    }
 }
 
 pub(crate) fn sign_prekey(
@@ -113,5 +172,34 @@ mod tests {
         bundle.signed_prekey = other_bundle.signed_prekey;
 
         assert!(bundle.verify().is_err());
+    }
+
+    #[test]
+    fn round_trips_through_bytes_with_a_one_time_prekey() {
+        let (identity, agreement, mut store) = make_bundle(1);
+        let bundle = store.public_bundle(identity.public_key(), agreement.sign_with(&identity));
+        assert!(bundle.one_time_prekey.is_some());
+
+        let restored = super::PrekeyBundle::from_bytes(&bundle.to_bytes()).unwrap();
+        restored.verify().unwrap();
+        assert_eq!(restored.identity, bundle.identity);
+        assert_eq!(
+            restored.one_time_prekey.unwrap().as_bytes(),
+            bundle.one_time_prekey.unwrap().as_bytes()
+        );
+    }
+
+    #[test]
+    fn round_trips_through_bytes_without_a_one_time_prekey() {
+        let mut rng = ChaCha20Rng::seed_from_u64(1);
+        let identity = IdentityKeyPair::generate(&mut rng);
+        let agreement = AgreementKeyPair::generate(&mut rng);
+        let mut store = PrekeyStore::generate(&identity, &mut rng, 0);
+        let bundle = store.public_bundle(identity.public_key(), agreement.sign_with(&identity));
+        assert!(bundle.one_time_prekey.is_none());
+
+        let restored = super::PrekeyBundle::from_bytes(&bundle.to_bytes()).unwrap();
+        restored.verify().unwrap();
+        assert!(restored.one_time_prekey.is_none());
     }
 }

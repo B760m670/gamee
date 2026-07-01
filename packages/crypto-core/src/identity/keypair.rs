@@ -32,6 +32,27 @@ impl IdentityKeyPair {
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing_key.sign(message).to_bytes()
     }
+
+    /// The raw 32-byte seed. Callers are responsible for putting this
+    /// somewhere that survives an app restart (Android Keystore, iOS
+    /// Keychain) — this crate has no storage of its own — and for treating
+    /// it with the same care as any other long-term private key.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let array: [u8; 32] =
+            bytes
+                .try_into()
+                .map_err(|_| CryptoError::InvalidKeyLength {
+                    expected: 32,
+                    actual: bytes.len(),
+                })?;
+        Ok(Self {
+            signing_key: SigningKey::from_bytes(&array),
+        })
+    }
 }
 
 impl IdentityPublicKey {
@@ -117,5 +138,13 @@ mod tests {
                 actual: 10
             }
         );
+    }
+
+    #[test]
+    fn secret_round_trips_through_bytes_and_still_signs_the_same_way() {
+        let identity = IdentityKeyPair::generate(&mut test_rng());
+        let restored = IdentityKeyPair::from_bytes(&identity.to_bytes()).unwrap();
+        assert_eq!(identity.public_key(), restored.public_key());
+        assert_eq!(identity.sign(b"hello"), restored.sign(b"hello"));
     }
 }

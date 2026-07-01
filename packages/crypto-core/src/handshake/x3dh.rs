@@ -41,6 +41,60 @@ pub struct HandshakeResult {
     pub initial_message: InitialMessage,
 }
 
+impl InitialMessage {
+    /// The wire format sent to the responder to complete the handshake:
+    /// every field is public (it's exactly what a passive network observer
+    /// would see anyway), so this is a plain fixed-size concatenation.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 32 + 64 + 32 + 1 + 32);
+        out.extend_from_slice(&self.initiator_identity.to_bytes());
+        out.extend_from_slice(self.initiator_agreement_key.public.as_bytes());
+        out.extend_from_slice(&self.initiator_agreement_key.signature);
+        out.extend_from_slice(self.ephemeral_key.as_bytes());
+        match self.used_one_time_prekey {
+            Some(otp) => {
+                out.push(1);
+                out.extend_from_slice(otp.as_bytes());
+            }
+            None => out.push(0),
+        }
+        out
+    }
+
+    pub fn from_bytes(input: &[u8]) -> Result<Self> {
+        const FIXED_LEN: usize = 32 + 32 + 64 + 32 + 1;
+        if input.len() < FIXED_LEN {
+            return Err(CryptoError::Decode("initial message too short"));
+        }
+
+        let initiator_identity = IdentityPublicKey::from_bytes(&input[0..32])?;
+        let agreement_public = crate::prekey::x25519_public_from_bytes(&input[32..64])?;
+        let agreement_signature: [u8; 64] = input[64..128].try_into().unwrap();
+        let ephemeral_key = crate::prekey::x25519_public_from_bytes(&input[128..160])?;
+
+        let used_one_time_prekey = match input[160] {
+            0 => None,
+            1 => {
+                let otp_bytes = input
+                    .get(161..193)
+                    .ok_or(CryptoError::Decode("truncated one-time prekey reference"))?;
+                Some(crate::prekey::x25519_public_from_bytes(otp_bytes)?)
+            }
+            _ => return Err(CryptoError::Decode("invalid one-time-prekey flag byte")),
+        };
+
+        Ok(Self {
+            initiator_identity,
+            initiator_agreement_key: SignedAgreementKeyPublic {
+                public: agreement_public,
+                signature: agreement_signature,
+            },
+            ephemeral_key,
+            used_one_time_prekey,
+        })
+    }
+}
+
 /// Runs the initiator ("Alice") side: verifies the peer's bundle, performs
 /// the four DH computations against a fresh ephemeral key, and returns both
 /// the derived secret and the message to send the responder.
@@ -249,5 +303,18 @@ mod tests {
         let err = initiate(&mut rng, &alice.identity, &alice.agreement, &tampered_bundle)
             .unwrap_err();
         assert_eq!(err, CryptoError::SignatureInvalid);
+    }
+
+    #[test]
+    fn initial_message_round_trips_through_bytes_and_still_completes_the_handshake() {
+        let alice = Party::new(1, 1);
+        let mut bob = Party::new(2, 1);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        let result = initiate(&mut rng, &alice.identity, &alice.agreement, &bob.bundle()).unwrap();
+        let restored = InitialMessage::from_bytes(&result.initial_message.to_bytes()).unwrap();
+
+        let bob_secret = respond(&bob.agreement, &mut bob.prekeys, &restored).unwrap();
+        assert_eq!(result.shared_secret.as_bytes(), bob_secret.as_bytes());
     }
 }

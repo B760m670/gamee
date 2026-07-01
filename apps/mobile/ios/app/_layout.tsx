@@ -1,4 +1,4 @@
-import { Component } from 'react'
+import { Component, useEffect } from 'react'
 import { View, Text, ScrollView } from 'react-native'
 import { Stack } from 'expo-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -6,6 +6,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar'
 import { useFonts, Nunito_700Bold, Nunito_800ExtraBold } from '@expo-google-fonts/nunito'
+import { selfCheck as cryptoCoreSelfCheck } from '../modules/spiritchat-crypto-core'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -31,6 +32,17 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({ Nunito_700Bold, Nunito_800ExtraBold })
+
+  useEffect(() => {
+    // Proves the native crypto core (packages/crypto-core-ffi) actually
+    // loaded through the XCFramework and runs on-device. Remove once real
+    // identity/session code depends on this module directly.
+    try {
+      console.log('[CryptoCore] native crypto core loaded ok, fingerprint=' + cryptoCoreSelfCheck())
+    } catch (err) {
+      console.error('[CryptoCore] native crypto core failed to load', err)
+    }
+  }, [])
 
   return (
     <ErrorBoundary>

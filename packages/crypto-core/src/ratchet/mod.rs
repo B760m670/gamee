@@ -1,5 +1,6 @@
 mod aead;
 mod chain;
+pub mod envelope;
 mod header;
 mod root_kdf;
 mod skipped_keys;

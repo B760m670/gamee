@@ -56,5 +56,10 @@
   },
   "overrides": {
     "react": "19.2.3"
+  },
+  "expo": {
+    "autolinking": {
+      "searchPaths": ["./modules"]
+    }
   }
 }
