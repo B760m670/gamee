@@ -4,13 +4,14 @@ public class SpiritchatCryptoCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("SpiritchatCryptoCore")
 
-    // Proves the native crypto core (packages/crypto-core-ffi) actually
-    // loaded through the XCFramework and a full identity/fingerprint round
-    // trip works on-device. Remove once real identity/session code depends
-    // on this module directly.
-    Function("selfCheck") { () -> String in
-      let identity = FfiIdentity.generate()
-      return identity.fingerprint()
+    // This device's persistent identity (see IdentitySession.swift):
+    // generated once and stored in the Keychain, not regenerated per call.
+    Function("fingerprint") { () -> String in
+      IdentitySession.shared.fingerprint
+    }
+
+    Function("publicKeyBase64") { () -> String in
+      IdentitySession.shared.publicKeyBytes.base64EncodedString()
     }
   }
 }

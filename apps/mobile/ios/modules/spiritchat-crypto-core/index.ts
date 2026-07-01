@@ -3,12 +3,16 @@ import { requireNativeModule } from 'expo-modules-core'
 const NativeCryptoCore = requireNativeModule('SpiritchatCryptoCore')
 
 /**
- * Generates a throwaway identity through the native Rust crypto core
- * (packages/crypto-core-ffi) and returns its fingerprint. Proves the
- * XCFramework loaded and the UniFFI bridge works end to end on-device —
- * not part of the real identity/session lifecycle, which lands as its own
- * feature once the data layer moves off its current UI-shell stub.
+ * This device's persistent identity fingerprint ("1234 5678 9012"). The
+ * underlying identity/agreement keys and prekey store are generated once
+ * and stored in the iOS Keychain (see IdentitySession.swift) — this value
+ * is stable across app restarts, not regenerated on every call.
  */
-export function selfCheck(): string {
-  return NativeCryptoCore.selfCheck()
+export function fingerprint(): string {
+  return NativeCryptoCore.fingerprint()
+}
+
+/** This device's public identity key, base64-encoded. */
+export function publicKeyBase64(): string {
+  return NativeCryptoCore.publicKeyBase64()
 }

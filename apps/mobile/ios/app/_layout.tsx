@@ -6,7 +6,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar'
 import { useFonts, Nunito_700Bold, Nunito_800ExtraBold } from '@expo-google-fonts/nunito'
-import { selfCheck as cryptoCoreSelfCheck } from '../modules/spiritchat-crypto-core'
+import { fingerprint as cryptoCoreFingerprint } from '../modules/spiritchat-crypto-core'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -34,13 +34,14 @@ export default function RootLayout() {
   const [fontsLoaded] = useFonts({ Nunito_700Bold, Nunito_800ExtraBold })
 
   useEffect(() => {
-    // Proves the native crypto core (packages/crypto-core-ffi) actually
-    // loaded through the XCFramework and runs on-device. Remove once real
-    // identity/session code depends on this module directly.
+    // Loads (or, on first launch, creates) this device's persistent
+    // identity from the Keychain. A stable fingerprint across restarts is
+    // the proof that persistence actually works, not just that the
+    // native library loaded.
     try {
-      console.log('[CryptoCore] native crypto core loaded ok, fingerprint=' + cryptoCoreSelfCheck())
+      console.log('[CryptoCore] identity fingerprint: ' + cryptoCoreFingerprint())
     } catch (err) {
-      console.error('[CryptoCore] native crypto core failed to load', err)
+      console.error('[CryptoCore] failed to load/create identity', err)
     }
   }, [])
 

@@ -13,10 +13,23 @@ name: iOS Unsigned Build (SideStore)
 # Android in-app updater, no manual re-download/re-import needed after the
 # one-time setup.
 #
-# Run manually from the Actions tab whenever a fresh build is needed.
+# Runs automatically on changes to the iOS app or the shared Rust crypto
+# core, or manually from the Actions tab.
 
 on:
+  push:
+    branches:
+      - claude/game-app-architecture-discussion-8gn7ep
+    paths:
+      - 'apps/mobile/ios/**'
+      - 'packages/crypto-core/**'
+      - 'packages/crypto-core-ffi/**'
+      - '.github/workflows/ios-unsigned-build.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
