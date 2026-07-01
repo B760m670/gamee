@@ -1,0 +1,23 @@
+name: EAS New Project Privacy Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check privacy of destiny-app
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          echo "===== app by fullName =====" 
+          curl -s -X POST https://api.expo.dev/graphql \
+            -H "Authorization: Bearer $EXPO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"query($fullName: String!) { app { byFullName(fullName: $fullName) { id fullName privacy ownerAccount { id name } } } }","variables":{"fullName":"@millionfirst-2/destiny-app"}}' \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.stringify(JSON.parse(d),null,2)))"
+          echo
+          echo "===== whoami ====="
+          npm install -g eas-cli >/dev/null 2>&1
+          eas whoami || true
