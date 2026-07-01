@@ -3,18 +3,36 @@ name: iOS Unsigned Build (SideStore)
 # Produces an UNSIGNED .ipa for the iOS app. It is not code-signed by Apple —
 # SideStore/AltStore sign it locally on-device with the user's own free
 # Apple ID when sideloading, so no Apple Developer Program membership is
-# needed on the CI side. Once this native shell is installed, future JS-only
-# changes are delivered the normal way, via the existing EAS Update pipeline
-# (expo-updates talks directly to u.expo.dev with its own embedded manifest
-# URL — it does not go through Expo Go's project list/visibility gate that
-# is broken for this account, so it is unaffected by that bug).
+# needed on the CI side.
 #
-# Run manually from the Actions tab when a fresh native shell is needed
-# (i.e. after native dependency changes). Pure JS changes do not need a
-# rebuild — they ship via EAS Update as usual.
+# Every run also publishes the .ipa plus an AltSource-format source.json to
+# the "ios-dev" GitHub Release (stable URLs — see "Publish to iOS dev
+# channel" below). Add that source.json's raw URL to LiveContainer's own
+# Sources tab (Sources → + → paste URL) once, and LiveContainer will offer
+# each new build as an in-app update from then on — same idea as the
+# Android in-app updater, no manual re-download/re-import needed after the
+# one-time setup.
+#
+# Runs automatically on changes to the iOS app or the shared Rust crypto
+# core, or manually from the Actions tab.
 
 on:
+  push:
+    branches:
+      - claude/game-app-architecture-discussion-8gn7ep
+    paths:
+      - 'apps/mobile/ios/**'
+      - 'packages/crypto-core/**'
+      - 'packages/crypto-core-ffi/**'
+      - '.github/workflows/ios-unsigned-build.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -39,6 +57,51 @@ jobs:
 
       - name: Install JS dependencies
         run: npm install --legacy-peer-deps
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust build (crypto-core-ffi)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/crypto-core-ffi/target
+          key: rust-crypto-core-ffi-ios-${{ runner.os }}-${{ hashFiles('packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml') }}
+          restore-keys: |
+            rust-crypto-core-ffi-ios-${{ runner.os }}-
+
+      - name: Cross-compile crypto core for iOS (device + Apple Silicon simulator)
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --release --lib --target aarch64-apple-ios
+          cargo build --release --lib --target aarch64-apple-ios-sim
+
+      - name: Generate Swift bindings from the crypto core
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --bin uniffi-bindgen
+          ./target/debug/uniffi-bindgen generate \
+            --library target/aarch64-apple-ios-sim/release/libspiritchat_crypto_core_ffi.dylib \
+            --language swift \
+            --out-dir bindgen-out \
+            --no-format
+
+          MODULE_DIR=../../apps/mobile/ios/modules/spiritchat-crypto-core/ios
+          cp bindgen-out/spiritchat_crypto_core_ffi.swift "$MODULE_DIR/"
+
+          mkdir -p headers
+          cp bindgen-out/spiritchat_crypto_core_ffiFFI.h headers/
+          cp bindgen-out/spiritchat_crypto_core_ffiFFI.modulemap headers/module.modulemap
+
+          rm -rf "$MODULE_DIR/SpiritchatCryptoCoreFFI.xcframework"
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libspiritchat_crypto_core_ffi.a -headers headers \
+            -library target/aarch64-apple-ios-sim/release/libspiritchat_crypto_core_ffi.a -headers headers \
+            -output "$MODULE_DIR/SpiritchatCryptoCoreFFI.xcframework"
 
       - name: Prebuild native iOS project
         run: npx expo prebuild --platform ios --no-install
@@ -105,3 +168,40 @@ jobs:
           name: spiritchat-app-unsigned-ipa
           path: apps/mobile/ios/dist/App-unsigned.ipa
           retention-days: 14
+
+      - name: Write LiveContainer/SideStore source manifest
+        run: |
+          VERSION="1.0.0-dev.${{ github.run_number }}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          SIZE="$(stat -f%z dist/App-unsigned.ipa)"
+          BUNDLE_ID="$(node -e "console.log(require('./app.json').expo.ios.bundleIdentifier)")"
+          cat > dist/source.json <<EOF
+          {
+            "name": "SpiritChat Dev",
+            "identifier": "com.spiritchat.sources.ios-dev",
+            "apps": [
+              {
+                "name": "SpiritChat",
+                "bundleIdentifier": "$BUNDLE_ID",
+                "developerName": "SpiritChat",
+                "version": "$VERSION",
+                "versionDate": "$DATE",
+                "versionDescription": "${{ github.sha }}",
+                "localizedDescription": "SpiritChat — decentralized end-to-end-encrypted messenger (unsigned dev build, sideloaded via SideStore/LiveContainer).",
+                "downloadURL": "https://github.com/${{ github.repository }}/releases/download/ios-dev/App-unsigned.ipa",
+                "size": $SIZE
+              }
+            ]
+          }
+          EOF
+
+      - name: Publish to iOS dev channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-dev
+          name: iOS dev channel
+          prerelease: true
+          make_latest: false
+          files: |
+            apps/mobile/ios/dist/App-unsigned.ipa
+            apps/mobile/ios/dist/source.json

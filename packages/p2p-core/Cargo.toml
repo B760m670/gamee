@@ -1,0 +1,11 @@
+[package]
+name = "spiritchat-p2p-core"
+version = "0.1.0"
+edition = "2021"
+description = "Serverless peer-to-peer transport for SpiritChat: no relay, no VPS, no infrastructure this project operates. Peers find each other via local mDNS and the public IPFS Kademlia DHT (the same shared, already-running network millions of libp2p/IPFS nodes use), connect directly or through peer-run circuit relays with hole-punching, and exchange already end-to-end-encrypted envelopes produced by spiritchat-crypto-core."
+
+[dependencies]
+libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "kad", "mdns", "identify", "relay", "dcutr", "request-response", "cbor", "macros", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+thiserror = "2"

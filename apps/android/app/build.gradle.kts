@@ -66,4 +66,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    // The UniFFI-generated bindings for packages/crypto-core-ffi talk to the
+    // native library through JNA rather than raw JNI class registration.
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
 }

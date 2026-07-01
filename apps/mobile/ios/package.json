@@ -35,7 +35,6 @@
     "expo-splash-screen": "~57.0.0",
     "expo-status-bar": "~57.0.0",
     "expo-system-ui": "~57.0.0",
-    "expo-updates": "~57.0.2",
     "expo-video": "~57.0.0",
     "expo-web-browser": "~57.0.0",
     "react": "19.2.3",
@@ -56,5 +55,10 @@
   },
   "overrides": {
     "react": "19.2.3"
+  },
+  "expo": {
+    "autolinking": {
+      "searchPaths": ["./modules"]
+    }
   }
 }

@@ -1,4 +1,4 @@
-import { Component } from 'react'
+import { Component, useEffect } from 'react'
 import { View, Text, ScrollView } from 'react-native'
 import { Stack } from 'expo-router'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -6,6 +6,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar'
 import { useFonts, Nunito_700Bold, Nunito_800ExtraBold } from '@expo-google-fonts/nunito'
+import { fingerprint as cryptoCoreFingerprint } from '../modules/spiritchat-crypto-core'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -31,6 +32,18 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({ Nunito_700Bold, Nunito_800ExtraBold })
+
+  useEffect(() => {
+    // Loads (or, on first launch, creates) this device's persistent
+    // identity from the Keychain. A stable fingerprint across restarts is
+    // the proof that persistence actually works, not just that the
+    // native library loaded.
+    try {
+      console.log('[CryptoCore] identity fingerprint: ' + cryptoCoreFingerprint())
+    } catch (err) {
+      console.error('[CryptoCore] failed to load/create identity', err)
+    }
+  }, [])
 
   return (
     <ErrorBoundary>
