@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - claude/game-app-architecture-discussion-8gn7ep
+    paths:
+      - 'apps/android/**'
+      - 'packages/crypto-core/**'
+      - 'packages/crypto-core-ffi/**'
+      - '.github/workflows/android-build.yml'
   workflow_dispatch:
 
 concurrency:
