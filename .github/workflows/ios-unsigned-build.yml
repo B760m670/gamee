@@ -52,9 +52,23 @@ jobs:
         run: |
           WORKSPACE=$(ls -d *.xcworkspace | head -1)
           echo "WORKSPACE=$WORKSPACE" >> "$GITHUB_ENV"
-          SCHEME=$(xcodebuild -list -json -workspace "$WORKSPACE" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const j=JSON.parse(d);console.log(j.workspace.schemes.find(s=>!s.includes('Pods'))||j.workspace.schemes[0])})")
+          APP_NAME=$(node -e "console.log(require('../app.json').expo.name)")
+          echo "All schemes:"
+          xcodebuild -list -json -workspace "$WORKSPACE" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.parse(d).workspace.schemes.join('\n')))"
+          SCHEME=$(xcodebuild -list -json -workspace "$WORKSPACE" | node -e "
+            let d='';process.stdin.on('data',c=>d+=c);
+            process.stdin.on('end',()=>{
+              const schemes = JSON.parse(d).workspace.schemes;
+              const appName = '$APP_NAME';
+              const exact = schemes.find(s => s === appName);
+              if (exact) { console.log(exact); return; }
+              const deny = ['Pods', 'EASClient', 'ExpoModulesCore', 'ExpoModulesJSI', 'React-Core-prebuilt', 'ReactNativeDependencies', 'React-RCTFBReactNativeSpec', 'hermes-engine'];
+              const fallback = schemes.find(s => !deny.some(d => s.includes(d)));
+              console.log(fallback || schemes[0]);
+            })
+          ")
           echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
-          echo "Detected workspace=$WORKSPACE scheme=$SCHEME"
+          echo "Detected workspace=$WORKSPACE app=$APP_NAME scheme=$SCHEME"
 
       - name: Archive (unsigned)
         working-directory: apps/mobile/ios/ios
@@ -75,8 +89,11 @@ jobs:
       - name: Package unsigned .ipa
         working-directory: apps/mobile/ios/ios
         run: |
+          echo "Archive contents:"
+          find build/App.xcarchive -maxdepth 4
           APP_PATH=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
           echo "App bundle: $APP_PATH"
+          if [ -z "$APP_PATH" ]; then echo "::error::No .app found in archive"; exit 1; fi
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -r -y App-unsigned.ipa Payload
