@@ -1,0 +1,28 @@
+[package]
+name = "spiritchat-crypto-core"
+version = "0.1.0"
+edition = "2021"
+description = "Identity, key agreement (X3DH) and Double Ratchet messaging core for SpiritChat"
+
+# A plain Rust library for now. FFI bindings (JNI for Android, a C ABI for
+# iOS) are separate crates that depend on this one, added once a platform
+# actually needs to link against it.
+[lib]
+name = "spiritchat_crypto_core"
+crate-type = ["lib"]
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+base64 = "0.22"
+
+[dev-dependencies]
+# Deterministic RNG for reproducible tests.
+rand_chacha = "0.3"
