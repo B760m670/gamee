@@ -1,34 +1,30 @@
-name: EAS Org State Check
+name: EAS Privacy Fix Attempt
 
 on:
   workflow_dispatch:
 
 jobs:
-  check:
+  fix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: npm install -g eas-cli
-      - name: Account/org state via GraphQL
+      - name: Introspect App mutations for privacy field
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: |
-          echo "===== whoami --json ====="
-          eas whoami --json || true
-          echo
-          echo "===== GraphQL: account details, plan, billing status ====="
+          echo "===== search AppMutation type fields ====="
           curl -s -X POST https://api.expo.dev/graphql \
             -H "Authorization: Bearer $EXPO_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"query":"query { meActor { __typename ... on User { id username } ... on Robot { id firstName } accounts { id name ownerUserActor { __typename } subscription { name planId } } } }"}' \
-            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.stringify(JSON.parse(d),null,2)))"
+            -d '{"query":"query { __type(name: \"AppMutation\") { fields { name args { name type { name kind ofType { name } } } } } }"}' \
+            > /tmp/appmut.json
+          node -e "const d=require('/tmp/appmut.json'); const fs=d.data.__type.fields; for(const f of fs){ console.log(f.name, '(', f.args.map(a=>a.name).join(', '), ')'); }"
           echo
-          echo "===== GraphQL: app by fullName, privacy + updateBranches ====="
+          echo "===== raw (privacy-related only) ====="
+          grep -io '"name":"[a-zA-Z]*[Pp]rivacy[a-zA-Z]*"' /tmp/appmut.json || echo "no privacy-named field"
+          echo
+          echo "===== try setPrivacy mutation if it exists ====="
           curl -s -X POST https://api.expo.dev/graphql \
             -H "Authorization: Bearer $EXPO_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"query":"query($fullName: String!) { app { byFullName(fullName: $fullName) { id fullName privacy ownerAccount { id name } } } }","variables":{"fullName":"@millionfirst/spiritchat-app"}}' \
-            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.stringify(JSON.parse(d),null,2)))"
+            -d '{"query":"mutation($appId: String!, $privacy: AppPrivacy!) { app { setPrivacy(appId: $appId, privacy: $privacy) { id privacy } } }","variables":{"appId":"a2350d8f-8ba5-45d0-9557-c9600cefbfe3","privacy":"PUBLIC"}}'
+          echo
