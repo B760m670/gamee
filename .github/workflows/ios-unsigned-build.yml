@@ -3,15 +3,23 @@ name: iOS Unsigned Build (SideStore)
 # Produces an UNSIGNED .ipa for the iOS app. It is not code-signed by Apple —
 # SideStore/AltStore sign it locally on-device with the user's own free
 # Apple ID when sideloading, so no Apple Developer Program membership is
-# needed on the CI side. There is no separate OTA update channel (EAS Update
-# and everything else Expo-account-specific was removed — SideStore +
-# LiveContainer is the whole distribution story) — every change, JS or
-# native, ships by rerunning this workflow and resideloading the new .ipa.
+# needed on the CI side.
+#
+# Every run also publishes the .ipa plus an AltSource-format source.json to
+# the "ios-dev" GitHub Release (stable URLs — see "Publish to iOS dev
+# channel" below). Add that source.json's raw URL to LiveContainer's own
+# Sources tab (Sources → + → paste URL) once, and LiveContainer will offer
+# each new build as an in-app update from then on — same idea as the
+# Android in-app updater, no manual re-download/re-import needed after the
+# one-time setup.
 #
 # Run manually from the Actions tab whenever a fresh build is needed.
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -147,3 +155,40 @@ jobs:
           name: spiritchat-app-unsigned-ipa
           path: apps/mobile/ios/dist/App-unsigned.ipa
           retention-days: 14
+
+      - name: Write LiveContainer/SideStore source manifest
+        run: |
+          VERSION="1.0.0-dev.${{ github.run_number }}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          SIZE="$(stat -f%z dist/App-unsigned.ipa)"
+          BUNDLE_ID="$(node -e "console.log(require('./app.json').expo.ios.bundleIdentifier)")"
+          cat > dist/source.json <<EOF
+          {
+            "name": "SpiritChat Dev",
+            "identifier": "com.spiritchat.sources.ios-dev",
+            "apps": [
+              {
+                "name": "SpiritChat",
+                "bundleIdentifier": "$BUNDLE_ID",
+                "developerName": "SpiritChat",
+                "version": "$VERSION",
+                "versionDate": "$DATE",
+                "versionDescription": "${{ github.sha }}",
+                "localizedDescription": "SpiritChat — decentralized end-to-end-encrypted messenger (unsigned dev build, sideloaded via SideStore/LiveContainer).",
+                "downloadURL": "https://github.com/${{ github.repository }}/releases/download/ios-dev/App-unsigned.ipa",
+                "size": $SIZE
+              }
+            ]
+          }
+          EOF
+
+      - name: Publish to iOS dev channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-dev
+          name: iOS dev channel
+          prerelease: true
+          make_latest: false
+          files: |
+            apps/mobile/ios/dist/App-unsigned.ipa
+            apps/mobile/ios/dist/source.json
