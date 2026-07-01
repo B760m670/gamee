@@ -1,0 +1,34 @@
+name: EAS Org State Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g eas-cli
+      - name: Account/org state via GraphQL
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          echo "===== whoami --json ====="
+          eas whoami --json || true
+          echo
+          echo "===== GraphQL: account details, plan, billing status ====="
+          curl -s -X POST https://api.expo.dev/graphql \
+            -H "Authorization: Bearer $EXPO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"query { meActor { __typename ... on User { id username } ... on Robot { id firstName } accounts { id name ownerUserActor { __typename } subscription { name planId } } } }"}' \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.stringify(JSON.parse(d),null,2)))"
+          echo
+          echo "===== GraphQL: app by fullName, privacy + updateBranches ====="
+          curl -s -X POST https://api.expo.dev/graphql \
+            -H "Authorization: Bearer $EXPO_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"query($fullName: String!) { app { byFullName(fullName: $fullName) { id fullName privacy ownerAccount { id name } } } }","variables":{"fullName":"@millionfirst/spiritchat-app"}}' \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>console.log(JSON.stringify(JSON.parse(d),null,2)))"
