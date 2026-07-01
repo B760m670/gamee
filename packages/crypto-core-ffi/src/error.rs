@@ -7,14 +7,17 @@ use spiritchat_crypto_core::error::CryptoError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
-    #[error("{message}")]
-    Crypto { message: String },
+    // Field is deliberately not named `message`: UniFFI's generated Kotlin
+    // exception class extends `Throwable`, which already declares a
+    // `message` property, and a same-named field collides with it.
+    #[error("{reason}")]
+    Crypto { reason: String },
 }
 
 impl From<CryptoError> for FfiError {
     fn from(err: CryptoError) -> Self {
         FfiError::Crypto {
-            message: err.to_string(),
+            reason: err.to_string(),
         }
     }
 }

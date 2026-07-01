@@ -3,15 +3,12 @@ name: iOS Unsigned Build (SideStore)
 # Produces an UNSIGNED .ipa for the iOS app. It is not code-signed by Apple —
 # SideStore/AltStore sign it locally on-device with the user's own free
 # Apple ID when sideloading, so no Apple Developer Program membership is
-# needed on the CI side. Once this native shell is installed, future JS-only
-# changes are delivered the normal way, via the existing EAS Update pipeline
-# (expo-updates talks directly to u.expo.dev with its own embedded manifest
-# URL — it does not go through Expo Go's project list/visibility gate that
-# is broken for this account, so it is unaffected by that bug).
+# needed on the CI side. There is no separate OTA update channel (EAS Update
+# and everything else Expo-account-specific was removed — SideStore +
+# LiveContainer is the whole distribution story) — every change, JS or
+# native, ships by rerunning this workflow and resideloading the new .ipa.
 #
-# Run manually from the Actions tab when a fresh native shell is needed
-# (i.e. after native dependency changes). Pure JS changes do not need a
-# rebuild — they ship via EAS Update as usual.
+# Run manually from the Actions tab whenever a fresh build is needed.
 
 on:
   workflow_dispatch:
