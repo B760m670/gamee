@@ -1,0 +1,82 @@
+name: iOS Unsigned Build (SideStore)
+
+# Produces an UNSIGNED .ipa for the iOS app. It is not code-signed by Apple —
+# SideStore/AltStore sign it locally on-device with the user's own free
+# Apple ID when sideloading, so no Apple Developer Program membership is
+# needed on the CI side. Once this native shell is installed, future JS-only
+# changes are delivered the normal way, via the existing EAS Update pipeline
+# (expo-updates talks directly to u.expo.dev with its own embedded manifest
+# URL — it does not go through Expo Go's project list/visibility gate that
+# is broken for this account, so it is unaffected by that bug).
+#
+# Run manually from the Actions tab when a fresh native shell is needed
+# (i.e. after native dependency changes). Pure JS changes do not need a
+# rebuild — they ship via EAS Update as usual.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: apps/mobile/ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install JS dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Prebuild native iOS project
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios/ios
+        run: pod install --repo-update
+
+      - name: Detect Xcode scheme
+        working-directory: apps/mobile/ios/ios
+        run: |
+          WORKSPACE=$(ls -d *.xcworkspace | head -1)
+          echo "WORKSPACE=$WORKSPACE" >> "$GITHUB_ENV"
+          SCHEME=$(xcodebuild -list -json -workspace "$WORKSPACE" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const j=JSON.parse(d);console.log(j.workspace.schemes.find(s=>!s.includes('Pods'))||j.workspace.schemes[0])})")
+          echo "SCHEME=$SCHEME" >> "$GITHUB_ENV"
+          echo "Detected workspace=$WORKSPACE scheme=$SCHEME"
+
+      - name: Archive (unsigned)
+        working-directory: apps/mobile/ios/ios
+        run: |
+          xcodebuild archive \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath build/App.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+
+      - name: Package unsigned .ipa
+        working-directory: apps/mobile/ios/ios
+        run: |
+          APP_PATH=$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          echo "App bundle: $APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r -y App-unsigned.ipa Payload
+          mkdir -p ../dist
+          mv App-unsigned.ipa ../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spiritchat-app-unsigned-ipa
+          path: apps/mobile/ios/dist/App-unsigned.ipa
+          retention-days: 14
