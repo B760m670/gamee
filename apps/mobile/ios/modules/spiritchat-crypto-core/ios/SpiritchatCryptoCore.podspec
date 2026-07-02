@@ -25,4 +25,13 @@ Pod::Spec.new do |s|
   # committed to git; see the repo root .gitignore.
   s.source_files = '*.swift'
   s.vendored_frameworks = 'SpiritchatCryptoCoreFFI.xcframework'
+
+  # packages/p2p-core's network-interface-change watcher (the `if-watch`
+  # crate, pulled in by libp2p-mdns/libp2p-tcp) calls SystemConfiguration's
+  # SCDynamicStore API on iOS. Cargo's own `rustc-link-lib=framework=...`
+  # directives only take effect inside `cargo build` itself — they aren't
+  # embedded in the static .a Xcode links here — so the framework has to be
+  # declared again at this end or the final app binary fails to link with
+  # "Undefined symbols ... SCDynamicStore*".
+  s.frameworks = 'SystemConfiguration'
 end
