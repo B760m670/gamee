@@ -87,6 +87,56 @@ async fn bob_resolves_a_username_alice_announced() {
     }
 }
 
+/// Reproduces the real-world "the quorum failed; needed 1 peers" failure:
+/// a DHT command issued the instant a node spawns, before it has connected
+/// to anyone, used to fail immediately (Kademlia has nobody to even ask).
+/// It should instead be held and replayed once the first connection lands,
+/// so the caller sees it succeed rather than an error that was really just
+/// "you asked before bootstrapping finished."
+#[tokio::test]
+async fn a_username_announced_before_any_connection_is_deferred_until_one_exists() {
+    let mut alice = P2pNode::spawn_with_bootstrap([13u8; 32], vec![]).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([14u8; 32], vec![]).unwrap();
+    let bob_peer_id = bob.local_peer_id();
+
+    // Announce before alice has connected to anyone at all — this is the
+    // exact race a real app hits announcing a username moments after
+    // launch/onboarding, before the public DHT bootstrap connection lands.
+    let claim = b"pretend-this-is-pubkey-and-signature".to_vec();
+    alice
+        .command(Command::AnnounceUsername { username: "Alice".to_string(), claim: claim.clone() })
+        .unwrap();
+
+    let bob_addr = loop {
+        match bob.next_event().await.expect("bob's event loop is alive") {
+            P2pEvent::ListeningOn(addr) if !addr.to_string().contains("0.0.0.0") => break addr,
+            _ => continue,
+        }
+    };
+
+    alice
+        .command(Command::Dial { peer: bob_peer_id, known_addresses: vec![bob_addr] })
+        .unwrap();
+
+    loop {
+        tokio::select! {
+            Some(event) = alice.next_event() => {
+                match event {
+                    P2pEvent::UsernameAnnounced { username } => {
+                        assert_eq!(username, "Alice");
+                        return;
+                    }
+                    P2pEvent::UsernameAnnouncementFailed { reason, .. } => {
+                        panic!("the deferred announce still failed: {reason}")
+                    }
+                    _ => {}
+                }
+            }
+            Some(_) = bob.next_event() => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn resolving_an_unclaimed_username_fails_cleanly() {
     let mut alice = P2pNode::spawn_with_bootstrap([11u8; 32], vec![]).unwrap();

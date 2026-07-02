@@ -156,6 +156,17 @@ async fn run_event_loop(
     // job (it already has the bytes; it just re-issues SetLocalBlob).
     let mut local_blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
+    // A put_record/get_record issued before this node has connected to
+    // *anyone* fails immediately with "the quorum failed; needed 1 peers"
+    // — Kademlia has nobody to even ask yet, since connecting to the
+    // public DHT's bootstrap nodes (DNS resolution + handshake) takes real
+    // wall-clock time after spawn, especially on a slow/lossy mobile
+    // connection. Rather than surface that as a user-facing error the
+    // first time a screen touches the DHT moments after launch, hold such
+    // commands here and replay them once the first connection lands.
+    let mut dht_ready = false;
+    let mut deferred_commands: Vec<Command> = Vec::new();
+
     loop {
         tokio::select! {
             Some(command) = commands.recv() => {
@@ -168,14 +179,38 @@ async fn run_event_loop(
                 if matches!(command, Command::Shutdown) {
                     break;
                 }
-                handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
+                if !dht_ready && needs_dht_peer(&command) {
+                    deferred_commands.push(command);
+                } else {
+                    handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
+                }
             }
             swarm_event = swarm.select_next_some() => {
+                if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
+                    dht_ready = true;
+                    for command in deferred_commands.drain(..) {
+                        handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
+                    }
+                }
                 handle_swarm_event(&mut swarm, &mut pending, &local_blobs, &events, swarm_event);
             }
             else => break,
         }
     }
+}
+
+/// Whether `command` needs at least one connected peer to have any real
+/// chance of succeeding — the four commands that go straight to Kademlia's
+/// `put_record`/`get_record`. Dialing itself is excluded: it's how a
+/// connection gets made in the first place, so it must never be deferred.
+fn needs_dht_peer(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::ResolvePeerAddresses { .. }
+            | Command::AnnounceAddresses { .. }
+            | Command::AnnounceUsername { .. }
+            | Command::ResolveUsername { .. }
+    )
 }
 
 fn handle_command(
