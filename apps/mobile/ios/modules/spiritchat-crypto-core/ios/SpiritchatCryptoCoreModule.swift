@@ -79,6 +79,7 @@ public class SpiritchatCryptoCoreModule: Module {
     // reusing this one's now-meaningless connections. There is no server
     // session to invalidate; this local wipe is the entire effect.
     Function("signOut") { () in
+      MiningController.shared.stop()
       P2pSession.signOut()
       IdentitySession.signOut()
     }
@@ -101,6 +102,7 @@ public class SpiritchatCryptoCoreModule: Module {
             try? await Task.sleep(nanoseconds: 200_000_000)
           }
           guard let session = P2pSession.shared else { continue }
+          MiningController.shared.start()
           while let event = await session.node.nextEvent() {
             self.sendEvent("onP2pEvent", P2pSession.encode(event))
           }
@@ -270,12 +272,12 @@ public class SpiritchatCryptoCoreModule: Module {
     // it mines to `publicKeyBase64` (an attribution key, not necessarily
     // this device's own identity key — base64 to match every other public
     // key that crosses this bridge, e.g. `publicKeyBase64()`). Runs
-    // continuously until `p2pStopMining`. Debug-triggered for now,
-    // deliberately decoupled from the real foreground+charging gate a
-    // `MiningController` would enforce — that gating is real UI/lifecycle
-    // work, not FFI plumbing, and isolating it from this call keeps the
-    // two easy to test separately. Successful blocks surface as
-    // `newBlockMined` on `onP2pEvent`.
+    // continuously until `p2pStopMining`. Kept exposed for tests/tooling
+    // even though normal operation never needs it directly — see
+    // `MiningController`, which is what actually calls this (and
+    // `p2pStopMining`), gated on foreground+charging, without any JS
+    // involvement. Successful blocks surface as `newBlockMined` on
+    // `onP2pEvent`.
     Function("p2pStartMining") { (publicKeyBase64: String) throws in
       guard let publicKey = Data(base64Encoded: publicKeyBase64) else {
         throw MiningError.malformedPublicKey(publicKeyBase64)

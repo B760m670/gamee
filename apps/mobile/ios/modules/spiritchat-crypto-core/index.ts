@@ -507,13 +507,14 @@ export function requestLedgerChainSync(peerId: string, timeoutMs = 30_000): Prom
  * same key as whoever's claim ends up in the mined block). Runs
  * continuously until `stopLedgerMining`.
  *
- * This is debug-triggered plumbing only: nothing here gates on foreground
- * state or charging status, unlike the real mining policy the project plan
- * calls for (mining should only run foreground + charging, to keep it out
- * of normal battery/thermal budget) — wire that gating in before exposing
- * a mining toggle to real users. Successful blocks surface as
- * `newBlockMined` on the event stream, alongside the `chainTipChanged`
- * every new tip fires.
+ * Normal operation never needs to call this: `MiningController.swift`
+ * already starts/stops mining automatically based on real device state
+ * (foreground + charging, both required — mining is real sustained CPU
+ * work with no other throttle) as soon as a session exists, entirely on
+ * the native side. This wrapper exists for tests/tooling — a manual debug
+ * toggle, if one is ever needed — not for product UI to call directly.
+ * Successful blocks surface as `newBlockMined` on the event stream,
+ * alongside the `chainTipChanged` every new tip fires.
  */
 export function startLedgerMining(publicKeyBase64Value: string = publicKeyBase64()): void {
   NativeCryptoCore.p2pStartMining(publicKeyBase64Value)
