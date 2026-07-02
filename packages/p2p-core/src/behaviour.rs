@@ -69,7 +69,18 @@ pub fn build(
     // peer here is relied on to store other peers' address records (there
     // is no dedicated server pulling that weight), every node must run in
     // Server mode explicitly, not wait to earn it.
-    let mut kad = kad::Behaviour::new(peer_id, kad::store::MemoryStore::new(peer_id));
+    // libp2p-kad's own default query timeout is 60s — reasonable as a
+    // generic library default, but this crate's put_record/get_record
+    // calls are all small, single-record lookups on a narrow custom
+    // keyspace, not general content routing. A "not found" result (the
+    // common case when checking whether a username is free) is the
+    // *slowest* outcome for Kademlia to reach, since it has to actually
+    // walk to the key's closest peers before concluding nobody has it —
+    // capping this at a shorter, still realistic bound keeps that worst
+    // case from stretching a UI "checking..." state out past a minute.
+    let mut kad_config = kad::Config::default();
+    kad_config.set_query_timeout(Duration::from_secs(25));
+    let mut kad = kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), kad_config);
     kad.set_mode(Some(kad::Mode::Server));
 
     Ok(Behaviour {

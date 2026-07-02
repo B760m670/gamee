@@ -233,8 +233,15 @@ export type UsernameLookup =
  * DHT record expire without re-publishing. A plain DHT can't tell those
  * apart, and can't stop a different identity from claiming the name out
  * from under an inactive holder — this is advisory, not a reservation.
+ *
+ * Unlike a server round-trip, a DHT lookup can genuinely take a while —
+ * "not found" is the *slowest* outcome, since Kademlia has to walk to the
+ * key's closest peers before it can conclude nobody published it. The
+ * native side caps its own query at 25s (see p2p-core's `Config`); this
+ * default sits comfortably above that so a real answer from the network
+ * always wins the race instead of this timeout preempting it.
  */
-export function lookupUsername(username: string, timeoutMs = 10_000): Promise<UsernameLookup> {
+export function lookupUsername(username: string, timeoutMs = 30_000): Promise<UsernameLookup> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       unsubscribe()
@@ -267,8 +274,11 @@ export function lookupUsername(username: string, timeoutMs = 10_000): Promise<Us
  * treat a `resolved` result from a *different* fingerprint as taken —
  * this call itself doesn't check, and publishing here doesn't reserve the
  * name against a determined second claimant (see `lookupUsername`'s doc).
+ *
+ * See `lookupUsername`'s doc for why the default timeout is as high as it
+ * is — the same DHT round-trip cost applies here.
  */
-export function announceUsername(username: string, timeoutMs = 10_000): Promise<void> {
+export function announceUsername(username: string, timeoutMs = 30_000): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       unsubscribe()

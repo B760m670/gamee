@@ -158,6 +158,10 @@ export default function UsernameScreen() {
 
 function StatusLine({ status }: { status: Status }) {
   switch (status.kind) {
+    case 'checking':
+      // A DHT lookup walks the network to answer, so this can take a
+      // while — say so, rather than leave a bare spinner that looks stuck.
+      return <Text style={s.statusHint}>Ищём в сети — может занять до 30 секунд</Text>
     case 'available':
       return <Text style={s.statusOk}>Свободно</Text>
     case 'mine':
@@ -187,7 +191,8 @@ const s = StyleSheet.create({
   at:    { color: '#71717a', fontSize: 17, fontWeight: '600' },
   input: { flex: 1, color: '#fff', fontSize: 17, paddingVertical: 0 },
 
-  statusOk:  { color: '#4ade80', fontSize: 13, marginTop: 10, marginHorizontal: 4 },
+  statusOk:   { color: '#4ade80', fontSize: 13, marginTop: 10, marginHorizontal: 4 },
+  statusHint: { color: '#71717a', fontSize: 13, marginTop: 10, marginHorizontal: 4 },
   statusErr: { color: '#f87171', fontSize: 13, marginTop: 10, marginHorizontal: 4 },
 
   clearBtn:        { marginTop: 28, alignItems: 'center', paddingVertical: 12 },

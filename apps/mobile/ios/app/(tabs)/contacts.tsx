@@ -109,7 +109,6 @@ export default function ContactsScreen() {
           autoCorrect={false}
           returnKeyType="search"
         />
-        {result.kind === 'checking' && <ActivityIndicator size="small" color="#52525b" />}
         {query.length > 0 ? (
           <Pressable onPress={() => setQuery('')} hitSlop={8}>
             <Ionicons name="close-circle" size={18} color="#52525b" />
@@ -132,6 +131,11 @@ export default function ContactsScreen() {
       ) : result.kind === 'error' ? (
         <View style={s.empty}>
           <Text style={s.errorText}>{result.message}</Text>
+        </View>
+      ) : result.kind === 'checking' ? (
+        <View style={s.empty}>
+          <ActivityIndicator color="#52525b" />
+          <Text style={s.emptyHint}>Ищём в открытой сети — может занять до 30 секунд</Text>
         </View>
       ) : result.kind === 'notFound' ? (
         <View style={s.empty}>
