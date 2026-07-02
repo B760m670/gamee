@@ -14,24 +14,24 @@ final class P2pSession {
   // on disk (see `ledgerDatabasePath`, added alongside the `@username`
   // ledger), the worst outcome of that race was a wasted, harmless second
   // `FfiP2pNode` — now it means two `ChainStore::open()` calls racing for
-  // the same `redb` file, which can fail with a lock conflict and, since
-  // `init` below treats any spawn failure as fatal, crash the app. Only
-  // ever held for the duration of the check-then-create (or check-then-
-  // clear) below, never across a call into `node` itself.
+  // the same `redb` file, which can fail with a lock conflict. Only ever
+  // held for the duration of the check-then-create (or check-then-clear)
+  // below, never across a call into `node` itself.
   private static let lock = NSLock()
   private static var cached: P2pSession?
 
+  /// The error from the most recent failed start attempt, if any — not
+  /// acted on by this class itself, just somewhere a debug screen (or a
+  /// developer attached to the console) can find *some* signal for why P2P
+  /// isn't up, given this environment doesn't reliably surface standard
+  /// crash reports (see `shared`'s doc comment on why this class no longer
+  /// treats a start failure as fatal).
+  private(set) static var lastStartupError: Error?
+
   let node: FfiP2pNode
 
-  private init(identitySeed: Data) {
-    do {
-      node = try FfiP2pNode.spawn(identitySeed: identitySeed, ledgerDataDir: Self.ledgerDatabasePath.path)
-    } catch {
-      // Mirrors IdentitySession's fatalError: a node that silently failed
-      // to start would leave the app looking connected while never sending
-      // or receiving anything.
-      fatalError("Failed to start the P2P node: \(error)")
-    }
+  private init(node: FfiP2pNode) {
+    self.node = node
   }
 
   /// Where the `@username` ledger's on-disk `redb` database file lives —
@@ -44,21 +44,52 @@ final class P2pSession {
   private static var ledgerDatabasePath: URL {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     let dir = base.appendingPathComponent("Ledger", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    do {
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    } catch {
+      // Not treated as fatal here either — `ChainStore::open` (Rust) will
+      // itself fail loudly a moment later if the directory genuinely isn't
+      // usable, and `shared` below is what actually decides how to react
+      // to that. Logged so the underlying reason isn't silently lost.
+      NSLog("[P2pSession] failed to create the ledger directory at \(dir.path): \(error)")
+    }
     return dir.appendingPathComponent("ledger.redb")
   }
 
-  /// `nil` until `IdentitySession.shared` exists — the node's identity
-  /// comes from the exact same seed, so there is nothing to start until
-  /// onboarding (create or restore) has produced one.
+  /// `nil` until `IdentitySession.shared` exists (there's nothing to start
+  /// before onboarding produces one) **or** if the most recent attempt to
+  /// spawn the node failed. A failure is deliberately not fatal — bringing
+  /// down the entire app over the P2P/ledger subsystem specifically (out
+  /// of every subsystem this app has) would mean a device or environment
+  /// this one piece doesn't like (a locked-out ledger file, a networking
+  /// permission the OS won't grant, anything else in
+  /// `spiritchat_p2p_core::P2pNode::spawn`) makes the whole app unusable
+  /// instead of just leaving P2P/username features degraded. Every caller
+  /// of `shared` already treats `nil` as "not ready yet" (see
+  /// `requireP2pSession()` in SpiritchatCryptoCoreModule), which reads as a
+  /// normal, catchable error to JS rather than a crash. Not cached as a
+  /// permanent failure — retried on the next access (the OnCreate polling
+  /// loop tries again every 200ms) since a cause like a transient file
+  /// lock isn't necessarily permanent.
   static var shared: P2pSession? {
     lock.lock()
     defer { lock.unlock() }
     if let cached { return cached }
     guard let identitySession = IdentitySession.shared else { return nil }
-    let session = P2pSession(identitySeed: identitySession.identity.secretBytes())
-    cached = session
-    return session
+    do {
+      let node = try FfiP2pNode.spawn(
+        identitySeed: identitySession.identity.secretBytes(),
+        ledgerDataDir: Self.ledgerDatabasePath.path
+      )
+      let session = P2pSession(node: node)
+      cached = session
+      lastStartupError = nil
+      return session
+    } catch {
+      lastStartupError = error
+      NSLog("[P2pSession] failed to start the P2P node: \(error)")
+      return nil
+    }
   }
 
   /// Stops the node and forgets it — for "sign out", where the identity
