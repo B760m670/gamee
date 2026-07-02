@@ -144,8 +144,23 @@ fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<Swarm<Behaviour>> {
         // this call they were never dialable, so this node could never
         // reach the public DHT, no matter how long anything downstream of
         // it waited.
-        .with_dns()
-        .map_err(|err| P2pError::Setup(err.to_string()))?
+        //
+        // Deliberately `.with_dns_config(...)` over the plain `.with_dns()`
+        // shortcut: the latter reads the OS's `/etc/resolv.conf` via
+        // `libp2p_dns::tokio::Transport::system` — a file libp2p-dns's own
+        // docs warn "fails (panics even!) if it does not exist" on
+        // platforms without one (they call out Android; a sandboxed iOS
+        // process — this app's sideloaded LiveContainer target — is the
+        // same story, and every P2P/ledger startup was failing outright
+        // over exactly this before it was ever noticed, since the failure
+        // used to be reported as a generic swarm-setup error with no
+        // reachable diagnostic). A hardcoded public resolver config needs
+        // no filesystem access at all, at the cost of not respecting
+        // whatever custom DNS the OS is actually configured with — an
+        // acceptable trade here since this transport only ever resolves
+        // the handful of `/dnsaddr/...` bootstrap addresses in
+        // `bootstrap.rs`, not arbitrary user-facing lookups.
+        .with_dns_config(libp2p::dns::ResolverConfig::cloudflare(), libp2p::dns::ResolverOpts::default())
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .with_behaviour(behaviour::build)
