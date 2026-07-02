@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
@@ -14,7 +16,9 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
-use spiritchat_ledger_core::{ApplyOutcome, Block, ChainStore, Hash32, Transaction};
+use spiritchat_ledger_core::block::MAX_TXS_PER_BLOCK;
+use spiritchat_ledger_core::difficulty::expand_target;
+use spiritchat_ledger_core::{ApplyOutcome, Block, BlockHeader, ChainStore, Hash32, Transaction};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -179,6 +183,152 @@ struct Pending {
     chain_sync_blocks: HashMap<OutboundRequestId, PeerId>,
 }
 
+/// One in-flight `spawn_blocking` nonce search — tagged with a generation
+/// number so a result arriving after it's been superseded (a newer
+/// candidate started, or mining was stopped and restarted) can be told
+/// apart from the one still being waited on.
+struct MiningState {
+    public_key: [u8; 32],
+    stop: Arc<AtomicBool>,
+    generation: u64,
+}
+
+/// This node's mining loop, if enabled. Only one attempt ever runs at a
+/// time (deliberately single-core, for thermal/battery reasons — see the
+/// project plan) — `restart_if_active` is how every place that changes the
+/// tip or the mempool asks the in-flight attempt to abandon its now-stale
+/// candidate and start over, keeping mining continuous without the event
+/// loop itself needing to know when that's necessary.
+struct Mining {
+    active: Option<MiningState>,
+    next_generation: u64,
+    result_tx: mpsc::UnboundedSender<(u64, Block)>,
+}
+
+impl Mining {
+    fn new(result_tx: mpsc::UnboundedSender<(u64, Block)>) -> Self {
+        Mining { active: None, next_generation: 0, result_tx }
+    }
+
+    fn stop(&mut self) {
+        if let Some(state) = self.active.take() {
+            state.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn start(&mut self, public_key: [u8; 32], chain_store: &ChainStore, mempool: &HashMap<Hash32, Transaction>) {
+        self.stop();
+        self.next_generation += 1;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.active = Some(MiningState { public_key, stop: stop.clone(), generation: self.next_generation });
+        spawn_mining_attempt(chain_store, mempool, public_key, stop, self.next_generation, self.result_tx.clone());
+    }
+
+    /// A no-op unless mining is currently enabled — kills whatever attempt
+    /// is in flight and starts a fresh one against `chain_store`/`mempool`
+    /// as they stand right now.
+    fn restart_if_active(&mut self, chain_store: &ChainStore, mempool: &HashMap<Hash32, Transaction>) {
+        if let Some(state) = &self.active {
+            let public_key = state.public_key;
+            self.start(public_key, chain_store, mempool);
+        }
+    }
+}
+
+/// Assembles a candidate block extending the current tip — selecting up to
+/// `MAX_TXS_PER_BLOCK` mempool transactions (deterministic tx-id-ascending
+/// order, so two nodes with the same mempool build the same candidate),
+/// re-checked against the tip's own state so a candidate never bundles a
+/// transaction that would make the whole block invalid — then hands the
+/// actual nonce search to a blocking thread, since SHA-256 grinding must
+/// never share a thread with the async event loop driving the swarm.
+fn spawn_mining_attempt(
+    chain_store: &ChainStore,
+    mempool: &HashMap<Hash32, Transaction>,
+    public_key: [u8; 32],
+    stop: Arc<AtomicBool>,
+    generation: u64,
+    result_tx: mpsc::UnboundedSender<(u64, Block)>,
+) {
+    let (Ok(difficulty_target), Ok(median_time_past)) =
+        (chain_store.expected_difficulty(), chain_store.median_time_past())
+    else {
+        // The tip is momentarily in a state these can't be computed for
+        // (shouldn't happen in practice — the tip is always a validated
+        // block) — nothing sensible to mine against.
+        return;
+    };
+    let prev_hash = chain_store.tip_hash();
+    let height = chain_store.tip_height() + 1;
+
+    let mut candidates: Vec<&Transaction> = mempool.values().collect();
+    candidates.sort_by_key(|tx| tx.id());
+    let mut selected = Vec::with_capacity(MAX_TXS_PER_BLOCK);
+    let mut usernames_in_candidate = std::collections::HashSet::new();
+    for tx in candidates {
+        if selected.len() >= MAX_TXS_PER_BLOCK {
+            break;
+        }
+        if !usernames_in_candidate.insert(tx.username.clone()) {
+            continue; // a second mempool tx racing for the same name this attempt already took
+        }
+        if chain_store.is_valid_candidate_transaction(tx, height) {
+            selected.push(tx.clone());
+        }
+    }
+
+    let tx_commitment = Block::compute_tx_commitment(&selected);
+    // Must land strictly after median-time-past; never *behind* real time
+    // either, since that would just mean an immediate re-check failure the
+    // moment this block reaches any other node's clock.
+    let timestamp = now_unix().max(median_time_past + 1);
+
+    let header = BlockHeader {
+        version: 1,
+        height,
+        prev_hash,
+        timestamp,
+        tx_commitment,
+        difficulty_target,
+        nonce: 0,
+        miner_public_key: public_key,
+    };
+
+    tokio::task::spawn_blocking(move || mine(header, selected, stop, generation, result_tx));
+}
+
+/// The actual nonce search — pure CPU work, deliberately kept free of any
+/// `ChainStore`/`Swarm` access so it only ever needs what's captured here.
+/// Checks `stop` and refreshes the timestamp (so a long-running search
+/// doesn't end up submitting a block timestamped from when it started)
+/// only every `CHECK_INTERVAL` attempts — checking every single nonce would
+/// waste real hashing time on synchronization instead of hashing.
+fn mine(
+    mut header: BlockHeader,
+    transactions: Vec<Transaction>,
+    stop: Arc<AtomicBool>,
+    generation: u64,
+    result_tx: mpsc::UnboundedSender<(u64, Block)>,
+) {
+    const CHECK_INTERVAL: u64 = 50_000;
+    let target = expand_target(header.difficulty_target);
+    let mut attempts: u64 = 0;
+    loop {
+        if header.hash().meets_target(&target) {
+            let _ = result_tx.send((generation, Block { header, transactions }));
+            return;
+        }
+        header.nonce = header.nonce.wrapping_add(1);
+        attempts += 1;
+        if attempts.is_multiple_of(CHECK_INTERVAL) {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            header.timestamp = header.timestamp.max(now_unix());
+        }
+    }
+}
+
 async fn run_event_loop(
     mut swarm: Swarm<Behaviour>,
     mut chain_store: ChainStore,
@@ -198,6 +348,9 @@ async fn run_event_loop(
     // this process restarts before that happens, the claim's original
     // submitter still has it and can resubmit.
     let mut mempool: HashMap<Hash32, Transaction> = HashMap::new();
+
+    let (mining_result_tx, mut mining_result_rx) = mpsc::unbounded_channel::<(u64, Block)>();
+    let mut mining = Mining::new(mining_result_tx);
 
     // A put_record/get_record issued before this node has connected to
     // *anyone* fails immediately with "the quorum failed; needed 1 peers"
@@ -225,17 +378,41 @@ async fn run_event_loop(
                 if !dht_ready && needs_dht_peer(&command) {
                     deferred_commands.push(command);
                 } else {
-                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &events, command);
+                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &events, command);
                 }
             }
             swarm_event = swarm.select_next_some() => {
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
-                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &events, command);
+                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &events, command);
                     }
                 }
-                handle_swarm_event(&mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &events, swarm_event);
+                handle_swarm_event(&mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining, &events, swarm_event);
+            }
+            Some((generation, block)) = mining_result_rx.recv() => {
+                let is_current = mining.active.as_ref().map(|state| state.generation) == Some(generation);
+                if is_current {
+                    let height = block.header.height;
+                    let outcome = apply_and_broadcast_block(&mut swarm, &mut chain_store, &mut mempool, &mut mining, &events, block);
+                    match outcome {
+                        Some(ApplyOutcome::ExtendedTip) | Some(ApplyOutcome::ReorgedTo { .. }) => {
+                            let _ = events.send(P2pEvent::NewBlockMined { height });
+                        }
+                        _ => {
+                            // Lost a race to another miner, or otherwise
+                            // didn't advance the tip. Either way this
+                            // attempt has now finished and
+                            // apply_and_broadcast_block only restarts
+                            // mining when the tip actually changed, so
+                            // mining would otherwise stall here forever.
+                            mining.restart_if_active(&chain_store, &mempool);
+                        }
+                    }
+                }
+                // A stale result from an attempt already superseded by a
+                // newer generation — silently dropped, the superseding
+                // attempt is already running.
             }
             else => break,
         }
@@ -256,12 +433,18 @@ fn needs_dht_peer(command: &Command) -> bool {
     )
 }
 
+// One parameter per independent piece of event-loop state this function can
+// touch (mirrors run_event_loop's own locals) — bundling them into a struct
+// would just move the same eight names one level down without reducing
+// what a caller needs to reason about.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     pending: &mut Pending,
     local_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     mempool: &mut HashMap<Hash32, Transaction>,
+    mining: &mut Mining,
     events: &mpsc::UnboundedSender<P2pEvent>,
     command: Command,
 ) {
@@ -360,7 +543,7 @@ fn handle_command(
         }
 
         Command::SubmitMinedBlock { block } => {
-            apply_and_broadcast_block(swarm, chain_store, mempool, events, block);
+            apply_and_broadcast_block(swarm, chain_store, mempool, mining, events, block);
         }
 
         Command::QueryUsernameOwner { username } => {
@@ -390,6 +573,14 @@ fn handle_command(
             });
         }
 
+        Command::StartMining { public_key } => {
+            mining.start(public_key, chain_store, mempool);
+        }
+
+        Command::StopMining => {
+            mining.stop();
+        }
+
         // Handled in run_event_loop before this function is ever called —
         // present only because Command's match must stay exhaustive.
         Command::Shutdown => {}
@@ -398,17 +589,22 @@ fn handle_command(
 
 /// Shared by a locally-mined block (`Command::SubmitMinedBlock`) and one
 /// received over gossip: validate, apply, and — only for a block this node
-/// didn't already have — clear its transactions out of the mempool and
-/// tell the app the tip may have moved.
+/// didn't already have — clear its transactions out of the mempool, tell
+/// the app the tip may have moved, and (if the tip actually changed) ask
+/// any in-flight mining attempt to restart against the new tip rather than
+/// keep grinding toward a now-stale parent. Returns the outcome so a caller
+/// that cares (the mining-result branch in `run_event_loop`, to tell a real
+/// new tip from a lost race) doesn't have to re-derive it.
 fn apply_and_broadcast_block(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     mempool: &mut HashMap<Hash32, Transaction>,
+    mining: &mut Mining,
     events: &mpsc::UnboundedSender<P2pEvent>,
     block: Block,
-) {
+) -> Option<ApplyOutcome> {
     match chain_store.try_apply(block.clone(), now_unix()) {
-        Ok(ApplyOutcome::AlreadyKnown) => {}
+        Ok(ApplyOutcome::AlreadyKnown) => Some(ApplyOutcome::AlreadyKnown),
         Ok(outcome @ (ApplyOutcome::ExtendedTip | ApplyOutcome::AddedToFork | ApplyOutcome::ReorgedTo { .. })) => {
             for tx in &block.transactions {
                 mempool.remove(&tx.id());
@@ -421,20 +617,25 @@ fn apply_and_broadcast_block(
                     height: chain_store.tip_height(),
                     hash: format!("{}", chain_store.tip_hash()),
                 });
+                mining.restart_if_active(chain_store, mempool);
             }
+            Some(outcome)
         }
         Err(err) => {
             let _ = events.send(P2pEvent::LedgerSubmissionRejected { reason: err.to_string() });
+            None
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_swarm_event(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     pending: &mut Pending,
     local_blobs: &HashMap<Vec<u8>, Vec<u8>>,
     mempool: &mut HashMap<Hash32, Transaction>,
+    mining: &mut Mining,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: SwarmEvent<BehaviourEvent>,
 ) {
@@ -492,11 +693,11 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerGossip(gossip_event)) => {
-            handle_ledger_gossip_event(swarm, chain_store, mempool, events, gossip_event);
+            handle_ledger_gossip_event(swarm, chain_store, mempool, mining, events, gossip_event);
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerSync(sync_event)) => {
-            handle_ledger_sync_event(swarm, chain_store, pending, events, sync_event);
+            handle_ledger_sync_event(swarm, chain_store, pending, mempool, mining, events, sync_event);
         }
 
         _ => {}
@@ -660,6 +861,7 @@ fn handle_ledger_gossip_event(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     mempool: &mut HashMap<Hash32, Transaction>,
+    mining: &mut Mining,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: gossipsub::Event,
 ) {
@@ -669,12 +871,16 @@ fn handle_ledger_gossip_event(
 
     if message.topic == ledger::blocks_topic().hash() {
         if let Ok(block) = bincode::deserialize::<Block>(&message.data) {
-            apply_and_broadcast_block(swarm, chain_store, mempool, events, block);
+            apply_and_broadcast_block(swarm, chain_store, mempool, mining, events, block);
         }
     } else if message.topic == ledger::txs_topic().hash() {
         if let Ok(transaction) = bincode::deserialize::<Transaction>(&message.data) {
             if transaction.verify_self_contained().is_ok() {
                 mempool.insert(transaction.id(), transaction);
+                // A newly arrived claim might be includable in the block
+                // this node is already grinding on — restart so it isn't
+                // stuck waiting for the *next* attempt to notice it.
+                mining.restart_if_active(chain_store, mempool);
             }
         }
     }
@@ -684,6 +890,8 @@ fn handle_ledger_sync_event(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     pending: &mut Pending,
+    mempool: &mut HashMap<Hash32, Transaction>,
+    mining: &mut Mining,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: request_response::Event<ChainSyncRequest, ChainSyncResponse>,
 ) {
@@ -694,7 +902,7 @@ fn handle_ledger_sync_event(
                 let _ = swarm.behaviour_mut().ledger_sync.send_response(channel, response);
             }
             request_response::Message::Response { request_id, response } => {
-                handle_chain_sync_response(swarm, chain_store, pending, events, request_id, response);
+                handle_chain_sync_response(swarm, chain_store, pending, mempool, mining, events, request_id, response);
             }
         },
         request_response::Event::OutboundFailure { request_id, error, .. } => {
@@ -745,10 +953,13 @@ fn build_chain_sync_response(chain_store: &ChainStore, request: ChainSyncRequest
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_chain_sync_response(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     pending: &mut Pending,
+    mempool: &mut HashMap<Hash32, Transaction>,
+    mining: &mut Mining,
     events: &mpsc::UnboundedSender<P2pEvent>,
     request_id: OutboundRequestId,
     response: ChainSyncResponse,
@@ -774,12 +985,16 @@ fn handle_chain_sync_response(
     if let Some(peer) = pending.chain_sync_blocks.remove(&request_id) {
         match response {
             ChainSyncResponse::Blocks(blocks) => {
+                let tip_before = chain_store.tip_hash();
                 for block in blocks {
                     // Applied one at a time, in the order the peer sent
                     // them (ascending height) — `try_apply` rejects a
                     // block whose parent it hasn't seen yet, so an
                     // out-of-order or gappy batch simply stops making
                     // progress rather than corrupting anything.
+                    for tx in &block.transactions {
+                        mempool.remove(&tx.id());
+                    }
                     if let Err(err) = chain_store.try_apply(block, now_unix()) {
                         let _ = events.send(P2pEvent::ChainSyncFailed { peer, reason: err.to_string() });
                         return;
@@ -790,6 +1005,9 @@ fn handle_chain_sync_response(
                     hash: format!("{}", chain_store.tip_hash()),
                 });
                 let _ = events.send(P2pEvent::ChainSyncCompleted { height: chain_store.tip_height() });
+                if chain_store.tip_hash() != tip_before {
+                    mining.restart_if_active(chain_store, mempool);
+                }
             }
             _ => {
                 let _ = events.send(P2pEvent::ChainSyncFailed {

@@ -236,6 +236,28 @@ impl FfiP2pNode {
         self.send(Command::QueryChainTip)
     }
 
+    /// Starts (or restarts, if already mining) this node's mining loop,
+    /// attributing any block it mines to `public_key` — a raw 32-byte
+    /// Ed25519 key, not necessarily the same key as this node's own
+    /// identity (a miner is an attribution/reward target, not a claimant).
+    /// Runs continuously until `stop_mining`. The app is responsible for
+    /// deciding *when* mining should run (e.g. only foreground + charging
+    /// — see the project plan's `MiningController`); this call does not
+    /// itself gate on either. Successful blocks surface as `NewBlockMined`
+    /// from `next_event`.
+    pub fn start_mining(&self, public_key: Vec<u8>) -> FfiResult<()> {
+        let public_key: [u8; 32] = public_key.try_into().map_err(|bytes: Vec<u8>| FfiError::P2p {
+            reason: format!("mining public key must be exactly 32 bytes, got {}", bytes.len()),
+        })?;
+        self.send(Command::StartMining { public_key })
+    }
+
+    /// Stops the mining loop started by `start_mining`. A no-op if not
+    /// currently mining.
+    pub fn stop_mining(&self) -> FfiResult<()> {
+        self.send(Command::StopMining)
+    }
+
     /// Cleanly stops this node — after this, `next_event` returns `None`.
     /// For "sign out": the identity this node was built from is going
     /// away, and a new one needs a new node, not a reused one. Dropping

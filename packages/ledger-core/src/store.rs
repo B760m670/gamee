@@ -21,8 +21,11 @@ use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::block::Block;
 use crate::chain_state::{ApplyOutcome, Chain, Checkpoint};
+use crate::difficulty::CompactTarget;
 use crate::error::{LedgerError, Result};
 use crate::hash::Hash32;
+use crate::transaction::Transaction;
+use crate::validation;
 
 /// hash (32 bytes) -> bincode(Block) — full bodies, pruned outside the
 /// retention window.
@@ -178,6 +181,28 @@ impl ChainStore {
     /// trusted outright (see `ledger.rs`'s doc comment in `p2p-core`).
     pub fn checkpoint_at_tip(&self) -> Checkpoint {
         self.chain.checkpoint_at_tip()
+    }
+
+    /// The `difficulty_target` a block extending the current tip must
+    /// have — what a miner assembling a new candidate needs, computed the
+    /// same way `try_apply` itself independently re-derives it (never
+    /// trusting a miner's self-declared value).
+    pub fn expected_difficulty(&self) -> Result<CompactTarget> {
+        self.chain.expected_difficulty(&self.chain.tip_hash())
+    }
+
+    /// The timestamp floor (exclusive) a block extending the current tip
+    /// must be strictly after.
+    pub fn median_time_past(&self) -> Result<u64> {
+        self.chain.median_time_past(&self.chain.tip_hash())
+    }
+
+    /// Whether `tx` could be included in a block extending the current tip
+    /// at `candidate_height` right now — see
+    /// `validation::is_valid_for_mempool` for what this actually checks. A
+    /// miner uses this to filter its mempool before assembling a candidate.
+    pub fn is_valid_candidate_transaction(&self, tx: &Transaction, candidate_height: u64) -> bool {
+        validation::is_valid_for_mempool(&self.chain, tx, candidate_height)
     }
 
     /// Validates and durably accepts `block`. Returns the same

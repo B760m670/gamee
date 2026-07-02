@@ -11,6 +11,7 @@ use crate::block::{Block, MAX_BLOCK_BYTES, MAX_TXS_PER_BLOCK};
 use crate::chain_state::Chain;
 use crate::difficulty::expand_target;
 use crate::error::{LedgerError, Result};
+use crate::transaction::Transaction;
 
 /// How old a transaction's `anchor_block_hash` is allowed to be relative
 /// to the block including it — roughly 12h at the 5-minute target block
@@ -71,6 +72,33 @@ pub fn validate_block(chain: &Chain, block: &Block, now: u64) -> Result<()> {
     validate_transactions(chain, block)?;
 
     Ok(())
+}
+
+/// Whether `tx` could validly be included in a block extending the current
+/// tip at `candidate_height` right now — the same anchor/ownership checks
+/// `validate_transactions` applies inside a block, evaluated standalone
+/// against the tip. A miner assembling a candidate uses this to filter its
+/// mempool down to transactions that won't make the whole block invalid
+/// (`validate_block` rejects a block entirely if *any* transaction in it is
+/// invalid) — it is not a substitute for `validate_block`, which is still
+/// what actually decides whether a mined block gets accepted.
+pub fn is_valid_for_mempool(chain: &Chain, tx: &Transaction, candidate_height: u64) -> bool {
+    if tx.verify_self_contained().is_err() {
+        return false;
+    }
+    let tip_hash = chain.tip_hash();
+    let Ok(ancestry) = chain.ancestors(&tip_hash) else { return false };
+    if !ancestry.contains(&tx.anchor_block_hash) {
+        return false;
+    }
+    let Some(anchor_meta) = chain.get_meta(&tx.anchor_block_hash) else { return false };
+    if candidate_height.saturating_sub(anchor_meta.height) > ANCHOR_MAX_AGE_BLOCKS {
+        return false;
+    }
+    match chain.state_at(&tip_hash) {
+        Ok(state) => !state.contains_key(&tx.username),
+        Err(_) => false,
+    }
 }
 
 fn validate_transactions(chain: &Chain, block: &Block) -> Result<()> {

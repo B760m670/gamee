@@ -139,6 +139,8 @@ final class P2pSession {
       return ["type": "chainSyncCompleted", "height": height]
     case .chainSyncFailed(let peerId, let reason):
       return ["type": "chainSyncFailed", "peerId": peerId, "reason": reason]
+    case .newBlockMined(let height):
+      return ["type": "newBlockMined", "height": height]
     }
   }
 }

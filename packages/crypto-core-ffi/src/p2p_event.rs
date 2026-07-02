@@ -35,6 +35,7 @@ pub enum FfiP2pEvent {
     UsernameOwnerNotFound { username: String },
     ChainSyncCompleted { height: u64 },
     ChainSyncFailed { peer_id: String, reason: String },
+    NewBlockMined { height: u64 },
 }
 
 impl From<P2pEvent> for FfiP2pEvent {
@@ -93,6 +94,7 @@ impl From<P2pEvent> for FfiP2pEvent {
             P2pEvent::ChainSyncFailed { peer, reason } => {
                 Self::ChainSyncFailed { peer_id: peer.to_string(), reason }
             }
+            P2pEvent::NewBlockMined { height } => Self::NewBlockMined { height },
         }
     }
 }

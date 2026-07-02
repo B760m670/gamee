@@ -33,6 +33,7 @@ export type P2pEvent =
   | { type: 'usernameOwnerNotFound'; username: string }
   | { type: 'chainSyncCompleted'; height: number }
   | { type: 'chainSyncFailed'; peerId: string; reason: string }
+  | { type: 'newBlockMined'; height: number }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -66,6 +67,8 @@ const NativeCryptoCore = requireNativeModule<
     p2pQueryUsernameOwner(username: string): void
     p2pRequestChainSync(peerId: string): void
     p2pQueryChainTip(): void
+    p2pStartMining(publicKeyBase64: string): void
+    p2pStopMining(): void
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -465,4 +468,28 @@ export function requestLedgerChainSync(peerId: string, timeoutMs = 30_000): Prom
 
     NativeCryptoCore.p2pRequestChainSync(peerId)
   })
+}
+
+/**
+ * Starts (or restarts) this node's mining loop, attributing any block it
+ * mines to `publicKeyBase64Value` (defaults to this device's own identity
+ * key via `publicKeyBase64()` — an attribution key, not necessarily the
+ * same key as whoever's claim ends up in the mined block). Runs
+ * continuously until `stopLedgerMining`.
+ *
+ * This is debug-triggered plumbing only: nothing here gates on foreground
+ * state or charging status, unlike the real mining policy the project plan
+ * calls for (mining should only run foreground + charging, to keep it out
+ * of normal battery/thermal budget) — wire that gating in before exposing
+ * a mining toggle to real users. Successful blocks surface as
+ * `newBlockMined` on the event stream, alongside the `chainTipChanged`
+ * every new tip fires.
+ */
+export function startLedgerMining(publicKeyBase64Value: string = publicKeyBase64()): void {
+  NativeCryptoCore.p2pStartMining(publicKeyBase64Value)
+}
+
+/** Stops mining started by `startLedgerMining`. A no-op if not currently mining. */
+export function stopLedgerMining(): void {
+  NativeCryptoCore.p2pStopMining()
 }

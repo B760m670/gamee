@@ -5,6 +5,10 @@ enum BlobStoreError: Error {
   case malformedId(String)
 }
 
+enum MiningError: Error {
+  case malformedPublicKey(String)
+}
+
 private func requireIdentity() throws -> IdentitySession {
   guard let session = IdentitySession.shared else { throw IdentitySessionError.notYetInitialized }
   return session
@@ -260,6 +264,29 @@ public class SpiritchatCryptoCoreModule: Module {
     // by a `chainTipChanged` event on `onP2pEvent`.
     Function("p2pQueryChainTip") { () throws in
       try requireP2pSession().node.queryChainTip()
+    }
+
+    // Starts (or restarts) this node's mining loop, attributing any block
+    // it mines to `publicKeyBase64` (an attribution key, not necessarily
+    // this device's own identity key — base64 to match every other public
+    // key that crosses this bridge, e.g. `publicKeyBase64()`). Runs
+    // continuously until `p2pStopMining`. Debug-triggered for now,
+    // deliberately decoupled from the real foreground+charging gate a
+    // `MiningController` would enforce — that gating is real UI/lifecycle
+    // work, not FFI plumbing, and isolating it from this call keeps the
+    // two easy to test separately. Successful blocks surface as
+    // `newBlockMined` on `onP2pEvent`.
+    Function("p2pStartMining") { (publicKeyBase64: String) throws in
+      guard let publicKey = Data(base64Encoded: publicKeyBase64) else {
+        throw MiningError.malformedPublicKey(publicKeyBase64)
+      }
+      try requireP2pSession().node.startMining(publicKey: publicKey)
+    }
+
+    // Stops mining started by `p2pStartMining`. A no-op if not currently
+    // mining.
+    Function("p2pStopMining") { () throws in
+      try requireP2pSession().node.stopMining()
     }
   }
 }

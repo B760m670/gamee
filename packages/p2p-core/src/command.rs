@@ -115,6 +115,21 @@ pub enum Command {
     /// shape of answer either way.
     QueryChainTip,
 
+    /// Starts (or restarts, if already mining) this node's mining loop,
+    /// attributing any block it successfully mines to `public_key`. Mining
+    /// runs continuously — one attempt at a time, restarted with a fresh
+    /// candidate whenever the tip changes (locally mined, gossiped, or
+    /// synced) or a prior attempt finishes — until `StopMining`. The app
+    /// layer is responsible for deciding *when* this should be active
+    /// (e.g. only in the foreground while charging); this crate just does
+    /// what it's told. Successful blocks surface as
+    /// `P2pEvent::NewBlockMined`, same as any other new tip.
+    StartMining { public_key: [u8; 32] },
+
+    /// Stops the mining loop started by `StartMining`. A no-op if not
+    /// currently mining.
+    StopMining,
+
     /// Cleanly stops the event loop — after this, `next_event` returns
     /// `None` and the node can no longer be used; a new identity needs a
     /// new `P2pNode::spawn`, not a reused one. For an app-level "sign out":

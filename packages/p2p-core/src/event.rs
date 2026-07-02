@@ -105,4 +105,12 @@ pub enum P2pEvent {
     /// also a success).
     ChainSyncCompleted { height: u64 },
     ChainSyncFailed { peer: PeerId, reason: String },
+
+    /// This node's own mining loop (`Command::StartMining`) found a valid
+    /// block at `height` and it was accepted onto the canonical chain —
+    /// `P2pEvent::ChainTipChanged` fires alongside this for the same
+    /// reason it does for any other new tip; this event exists only so the
+    /// app can distinguish "this device mined it" for its own UI (e.g. a
+    /// mining-status screen) without guessing from `ChainTipChanged` alone.
+    NewBlockMined { height: u64 },
 }
