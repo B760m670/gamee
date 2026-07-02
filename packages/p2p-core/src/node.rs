@@ -116,6 +116,17 @@ fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<Swarm<Behaviour>> {
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .with_quic()
+        // Without this, `.with_relay_client(...)` below silently calls its
+        // own `.without_dns()` on the way to the relay phase (that's what
+        // the type-state builder does when you skip straight past this
+        // phase) and the transport ends up with no way to resolve a
+        // `/dnsaddr/...` multiaddr at all. That's exactly the shape of the
+        // four public IPFS bootstrap addresses in `bootstrap.rs` — without
+        // this call they were never dialable, so this node could never
+        // reach the public DHT, no matter how long anything downstream of
+        // it waited.
+        .with_dns()
+        .map_err(|err| P2pError::Setup(err.to_string()))?
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .with_behaviour(behaviour::build)
