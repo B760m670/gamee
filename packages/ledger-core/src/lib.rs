@@ -17,12 +17,16 @@ pub mod chain_state;
 pub mod difficulty;
 pub mod error;
 pub mod hash;
+pub mod store;
+#[cfg(test)]
+mod test_support;
 pub mod transaction;
 pub mod validation;
 
 pub use block::{Block, BlockHeader};
-pub use chain_state::{ApplyOutcome, Chain, UsernameOwner};
+pub use chain_state::{ApplyOutcome, Chain, Checkpoint, UsernameOwner};
 pub use difficulty::{CompactTarget, INITIAL_DIFFICULTY_BITS, RETARGET_INTERVAL_BLOCKS, TARGET_BLOCK_TIME_SECS};
 pub use error::{LedgerError, Result};
 pub use hash::Hash32;
+pub use store::ChainStore;
 pub use transaction::Transaction;

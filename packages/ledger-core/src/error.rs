@@ -49,8 +49,14 @@ pub enum LedgerError {
     #[error("a block hash was referenced that this chain has never seen: {0:?}")]
     UnknownBlock(Hash32),
 
+    #[error("no canonical block at height {0} — it's either not yet mined or already pruned")]
+    HeightNotFound(u64),
+
     #[error("candidate genesis block does not match the hardcoded genesis")]
     GenesisMismatch,
+
+    #[error("persistent storage error: {0}")]
+    Storage(String),
 }
 
 pub type Result<T> = core::result::Result<T, LedgerError>;

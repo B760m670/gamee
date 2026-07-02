@@ -106,49 +106,12 @@ fn validate_transactions(chain: &Chain, block: &Block) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use rand_chacha::rand_core::SeedableRng;
-    use rand_chacha::ChaCha20Rng;
-    use spiritchat_crypto_core::identity::IdentityKeyPair;
-
     use super::*;
-    use crate::block::BlockHeader;
     use crate::chain_state::{ApplyOutcome, Chain};
-    use crate::difficulty::{work_of, INITIAL_DIFFICULTY_BITS, TARGET_BLOCK_TIME_SECS};
+    use crate::difficulty::{expand_target, work_of, INITIAL_DIFFICULTY_BITS, TARGET_BLOCK_TIME_SECS};
     use crate::hash::Hash32;
+    use crate::test_support::{identity, mine_block};
     use crate::transaction::Transaction;
-
-    fn identity(seed: u64) -> IdentityKeyPair {
-        IdentityKeyPair::generate(&mut ChaCha20Rng::seed_from_u64(seed))
-    }
-
-    /// Mines a valid block extending `chain`'s current tip with
-    /// `transactions`, by brute-forcing a nonce — the test-only equivalent
-    /// of the real mining loop (Phase 5), used here purely to produce
-    /// fixtures that satisfy proof-of-work.
-    fn mine_block(chain: &Chain, transactions: Vec<Transaction>, timestamp: u64) -> Block {
-        let parent_hash = chain.tip_hash();
-        let parent = chain.get_block(&parent_hash).unwrap();
-        let difficulty_target = chain.expected_difficulty(&parent_hash).unwrap();
-        let target = expand_target(difficulty_target);
-
-        let mut header = BlockHeader {
-            version: 1,
-            height: parent.header.height + 1,
-            prev_hash: parent_hash,
-            timestamp,
-            tx_commitment: Block::compute_tx_commitment(&transactions),
-            difficulty_target,
-            nonce: 0,
-            miner_public_key: [0u8; 32],
-        };
-        loop {
-            if header.hash().meets_target(&target) {
-                break;
-            }
-            header.nonce += 1;
-        }
-        Block { header, transactions }
-    }
 
     #[test]
     fn a_solo_mined_empty_block_extends_the_tip() {
