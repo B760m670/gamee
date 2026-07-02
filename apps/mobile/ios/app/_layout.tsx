@@ -13,6 +13,7 @@ import {
   addP2pEventListener,
   requestLedgerChainSync,
 } from '../modules/spiritchat-crypto-core'
+import { useProfileStore } from '../store/profile'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -34,6 +35,33 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
     }
     return this.props.children
   }
+}
+
+/**
+ * Global, always-visible surface for `p2pStartupError` (see profile.ts's
+ * doc comment on the field) — onboarding no longer blocks on a P2P
+ * startup failure, so this is the only place left where the real
+ * underlying reason is still shown, in an environment (sideloaded via
+ * LiveContainer) where standard OS crash/diagnostic logs aren't reliably
+ * reachable. Not dismissible: it reflects live state (see profile.ts's
+ * background retry loop in `bootstrap`) and disappears on its own the
+ * moment P2P actually comes up.
+ */
+function P2pStartupErrorBanner() {
+  const error = useProfileStore(s => s.p2pStartupError)
+  if (!error) return null
+  return (
+    <View style={{
+      position: 'absolute', top: 50, left: 12, right: 12, zIndex: 999,
+      backgroundColor: 'rgba(127,29,29,0.92)', borderRadius: 12, borderWidth: 1, borderColor: '#b91c1c',
+      padding: 12,
+    }}>
+      <Text style={{ color: '#fecaca', fontSize: 11, fontWeight: '700', marginBottom: 4 }}>
+        P2P не запустился
+      </Text>
+      <Text style={{ color: '#fecaca', fontSize: 11 }}>{error}</Text>
+    </View>
+  )
 }
 
 export default function RootLayout() {
@@ -87,6 +115,7 @@ export default function RootLayout() {
         <SafeAreaProvider style={{ backgroundColor: '#000000' }}>
           <QueryClientProvider client={queryClient}>
             <StatusBar style="light" />
+            <P2pStartupErrorBanner />
             <Stack
               screenOptions={{
                 headerShown: false,

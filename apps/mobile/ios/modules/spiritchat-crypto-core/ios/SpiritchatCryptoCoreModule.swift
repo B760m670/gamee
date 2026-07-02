@@ -116,6 +116,26 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().node.localPeerId()
     }
 
+    // Whether the P2P/ledger subsystem is currently up — checked (not
+    // assumed) rather than inferred from some other call succeeding, since
+    // a startup failure there is deliberately non-fatal now (see
+    // P2pSession.shared's doc comment) and callers need a real way to tell
+    // "not ready yet" from "actually broken" without treating either as
+    // an app-breaking error.
+    Function("p2pIsReady") { () -> Bool in
+      P2pSession.shared != nil
+    }
+
+    // The underlying reason the most recent P2P/ledger startup attempt
+    // failed, if any — `nil` once it succeeds. This is this app's only
+    // window into *why* P2P isn't up in an environment (e.g. sideloaded
+    // via LiveContainer) where standard OS crash/diagnostic logs aren't
+    // reliably available; surfaced directly in onboarding's error banner
+    // rather than requiring a connected Mac or Console access.
+    Function("p2pLastStartupErrorDescription") { () -> String? in
+      P2pSession.lastStartupError.map { "\($0)" }
+    }
+
     Function("p2pDial") { (peerId: String, knownAddresses: [String]) throws in
       try requireP2pSession().node.dial(peerId: peerId, knownAddresses: knownAddresses)
     }

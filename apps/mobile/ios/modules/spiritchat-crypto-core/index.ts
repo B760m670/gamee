@@ -56,6 +56,8 @@ const NativeCryptoCore = requireNativeModule<
     publicKeyBase64(): string
     signOut(): void
     p2pLocalPeerId(): string
+    p2pIsReady(): boolean
+    p2pLastStartupErrorDescription(): string | null
     p2pDial(peerId: string, knownAddresses: string[]): void
     p2pResolvePeerAddresses(peerId: string): void
     p2pAnnounceAddresses(addresses: string[]): void
@@ -170,6 +172,29 @@ export function signOut(): void {
  */
 export function p2pLocalPeerId(): string {
   return NativeCryptoCore.p2pLocalPeerId()
+}
+
+/**
+ * Whether the P2P/ledger node is currently up. A P2P startup failure is
+ * deliberately non-fatal to the rest of the app (see `P2pSession.shared`'s
+ * doc comment) and is retried automatically in the background, so this is
+ * "not yet" rather than "never" — check it instead of assuming any P2P
+ * call will succeed just because `hasIdentity()` is true.
+ */
+export function p2pIsReady(): boolean {
+  return NativeCryptoCore.p2pIsReady()
+}
+
+/**
+ * The underlying reason the P2P/ledger node's most recent startup attempt
+ * failed, if any — `null` once it succeeds. This is the only window into
+ * *why* P2P isn't up in an environment (e.g. sideloaded via LiveContainer)
+ * where standard OS crash/diagnostic logs aren't reliably reachable —
+ * onboarding surfaces this directly in its error banner rather than
+ * requiring a connected Mac or device console access to diagnose.
+ */
+export function p2pLastStartupErrorDescription(): string | null {
+  return NativeCryptoCore.p2pLastStartupErrorDescription()
 }
 
 /** Dials a peer directly at `knownAddresses`, or via the DHT if empty. */

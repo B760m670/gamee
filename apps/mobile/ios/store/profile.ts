@@ -4,6 +4,7 @@ import {
   fingerprint as cryptoCoreFingerprint,
   publicKeyBase64,
   p2pLocalPeerId,
+  p2pLastStartupErrorDescription,
   blobSaveFromFile,
   blobLocalPath,
   blobClear,
@@ -48,6 +49,14 @@ interface ProfileState {
   fingerprint:     string
   publicKey:       string
   peerId:          string
+  /**
+   * The underlying reason the P2P/ledger node hasn't started, if it
+   * hasn't — surfaced from `p2pLastStartupErrorDescription()` (see its own
+   * doc comment) so this is visible in the UI without a device console.
+   * `null` once P2P comes up; identity/profile data is usable regardless,
+   * since a P2P failure no longer blocks onboarding (see `bootstrap`).
+   */
+  p2pStartupError: string | null
   displayName:     string
   bio:             string
   avatarId:        string | null
@@ -63,11 +72,19 @@ interface ProfileState {
   signOut:            () => Promise<void>
 }
 
+/** How often to retry reading `peerId` while P2P hasn't come up yet. */
+const P2P_RETRY_INTERVAL_MS = 1000
+/** Give up updating the store after this many retries — P2P keeps trying
+ * to start in the background regardless (see P2pSession.swift); this just
+ * bounds how long `bootstrap` itself keeps polling for a first success. */
+const P2P_RETRY_ATTEMPTS = 30
+
 export const useProfileStore = create<ProfileState>((set, get) => ({
   isReady:         false,
   fingerprint:     '',
   publicKey:       '',
   peerId:          '',
+  p2pStartupError: null,
   displayName:     '',
   bio:             '',
   avatarId:        null,
@@ -84,17 +101,54 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
 
     const avatarId = storedAvatarId && blobReserve(storedAvatarId) ? storedAvatarId : null
 
+    // A P2P/ledger startup failure must never block onboarding — the
+    // identity itself (fingerprint/publicKey, both purely local) is
+    // already real regardless of whether P2P ever comes up. `peerId` is
+    // the only field genuinely dependent on it; degrade to an empty
+    // string and surface the real reason instead of throwing.
+    let peerId = ''
+    let p2pStartupError: string | null = null
+    try {
+      peerId = p2pLocalPeerId()
+    } catch {
+      p2pStartupError = p2pLastStartupErrorDescription()
+    }
+
     set({
       isReady:         true,
       fingerprint:     cryptoCoreFingerprint(),
       publicKey:       publicKeyBase64(),
-      peerId:          p2pLocalPeerId(),
+      peerId,
+      p2pStartupError,
       displayName:     storedName ?? '',
       bio:             storedBio ?? '',
       avatarId,
       avatarLocalPath: avatarId ? blobLocalPath(avatarId) : null,
       username:        storedUsername,
     })
+
+    // P2pSession.swift retries starting the node in the background on its
+    // own (every 200ms) regardless of this store — poll for a first
+    // success here just long enough to update `peerId`/clear the error
+    // without the user having to relaunch once it does come up. Explicitly
+    // NOT awaited: onboarding is waiting on `bootstrap()`'s own promise to
+    // navigate into the app, and blocking that on up to
+    // P2P_RETRY_ATTEMPTS * P2P_RETRY_INTERVAL_MS would defeat the entire
+    // point of degrading gracefully instead of failing outright.
+    if (!peerId) {
+      void (async () => {
+        for (let attempt = 0; attempt < P2P_RETRY_ATTEMPTS; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, P2P_RETRY_INTERVAL_MS))
+          try {
+            set({ peerId: p2pLocalPeerId(), p2pStartupError: null })
+            return
+          } catch {
+            // still not up — keep the latest error text current in case it changed
+            set({ p2pStartupError: p2pLastStartupErrorDescription() })
+          }
+        }
+      })()
+    }
 
     // Unlike the old DHT claims, a confirmed ledger claim never expires or
     // needs re-publishing — it's permanent chain state. But this node's
@@ -177,6 +231,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
       fingerprint:     '',
       publicKey:       '',
       peerId:          '',
+      p2pStartupError: null,
       displayName:     '',
       bio:             '',
       avatarId:        null,
