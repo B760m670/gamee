@@ -208,5 +208,58 @@ public class SpiritchatCryptoCoreModule: Module {
       guard let id = Data(hexEncoded: idHex) else { throw BlobStoreError.malformedId(idHex) }
       try requireP2pSession().node.fetchBlob(peerId: peerId, id: id)
     }
+
+    // Builds and signs a new @username ledger claim — pure (nothing sent
+    // anywhere yet); pass the result to `p2pSubmitUsernameClaim`. Claim-
+    // building lives in Rust (not hand-encoded here, unlike the old DHT
+    // claim's simple concat) since the ledger's signed preimage is more
+    // structured. `nonce` should be 8 fresh random bytes per call.
+    Function("ledgerBuildUsernameClaim") { (
+      username: String, anchorHeight: UInt64, anchorBlockHash: Data, nonce: Data
+    ) throws -> Data in
+      let identity = try requireIdentity().identity
+      return try ledgerBuildUsernameClaim(
+        identity: identity,
+        username: username,
+        anchorHeight: anchorHeight,
+        anchorBlockHash: anchorBlockHash,
+        nonce: nonce
+      )
+    }
+
+    // Broadcasts an already-built claim (see `ledgerBuildUsernameClaim`)
+    // to the ledger's mempool topic. Does not by itself confirm the name
+    // — watch `chainTipChanged` and re-check via `p2pQueryUsernameOwner`.
+    Function("p2pSubmitUsernameClaim") { (transactionBytes: Data) throws in
+      try requireP2pSession().node.submitUsernameClaim(transactionBytes: transactionBytes)
+    }
+
+    // Submits an already-mined ledger block — for a future mining loop
+    // and for testing; validates and applies it locally like a gossiped
+    // block, then gossips it onward.
+    Function("p2pSubmitMinedBlock") { (blockBytes: Data) throws in
+      try requireP2pSession().node.submitMinedBlock(blockBytes: blockBytes)
+    }
+
+    // Answers from this node's own local materialized ledger state only
+    // — no network round trip. Answered by `usernameOwnerResolved`/
+    // `usernameOwnerNotFound` on `onP2pEvent`.
+    Function("p2pQueryUsernameOwner") { (username: String) throws in
+      try requireP2pSession().node.queryUsernameOwner(username: username)
+    }
+
+    // Catches this node up to `peerId`'s ledger chain tip if it's heavier
+    // than this node's own. Dial first if not already connected. Answered
+    // by `chainSyncCompleted`/`chainSyncFailed` on `onP2pEvent`.
+    Function("p2pRequestChainSync") { (peerId: String) throws in
+      try requireP2pSession().node.requestChainSync(peerId: peerId)
+    }
+
+    // This node's own current ledger chain tip — needed as the anchor for
+    // a new claim (see `ledgerBuildUsernameClaim`). Answered synchronously
+    // by a `chainTipChanged` event on `onP2pEvent`.
+    Function("p2pQueryChainTip") { () throws in
+      try requireP2pSession().node.queryChainTip()
+    }
   }
 }

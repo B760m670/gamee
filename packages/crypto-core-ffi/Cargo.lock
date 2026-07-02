@@ -3004,9 +3004,11 @@ dependencies = [
 name = "spiritchat-crypto-core-ffi"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "rand_core 0.6.4",
  "sha2",
  "spiritchat-crypto-core",
+ "spiritchat-ledger-core",
  "spiritchat-p2p-core",
  "thiserror 2.0.18",
  "tokio",

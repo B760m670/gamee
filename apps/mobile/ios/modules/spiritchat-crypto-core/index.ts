@@ -27,6 +27,12 @@ export type P2pEvent =
   | { type: 'usernameResolutionFailed'; username: string }
   | { type: 'usernameAnnounced'; username: string }
   | { type: 'usernameAnnouncementFailed'; username: string; reason: string }
+  | { type: 'chainTipChanged'; height: number; hash: string }
+  | { type: 'ledgerSubmissionRejected'; reason: string }
+  | { type: 'usernameOwnerResolved'; username: string; ownerPublicKeyBase64: string; claimedAtHeight: number }
+  | { type: 'usernameOwnerNotFound'; username: string }
+  | { type: 'chainSyncCompleted'; height: number }
+  | { type: 'chainSyncFailed'; peerId: string; reason: string }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -54,6 +60,12 @@ const NativeCryptoCore = requireNativeModule<
     blobClear(idHex: string): void
     blobReserve(idHex: string): boolean
     p2pFetchBlob(peerId: string, idHex: string): void
+    ledgerBuildUsernameClaim(username: string, anchorHeight: number, anchorBlockHash: Uint8Array, nonce: Uint8Array): Uint8Array
+    p2pSubmitUsernameClaim(transactionBytes: Uint8Array): void
+    p2pSubmitMinedBlock(blockBytes: Uint8Array): void
+    p2pQueryUsernameOwner(username: string): void
+    p2pRequestChainSync(peerId: string): void
+    p2pQueryChainTip(): void
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -298,5 +310,159 @@ export function announceUsername(username: string, timeoutMs = 30_000): Promise<
     })
 
     NativeCryptoCore.p2pAnnounceUsername(username)
+  })
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16)
+  }
+  return bytes
+}
+
+/**
+ * Not cryptographically secure — deliberately fine here, since a claim's
+ * `nonce` only needs to make two otherwise-identical-looking claims
+ * distinguishable (e.g. a resubmission), not resist prediction. Avoids
+ * adding a dependency (e.g. `expo-crypto`) for something this low-stakes.
+ */
+function randomNonce(length: number): Uint8Array {
+  const bytes = new Uint8Array(length)
+  for (let i = 0; i < length; i++) {
+    bytes[i] = Math.floor(Math.random() * 256)
+  }
+  return bytes
+}
+
+/**
+ * This node's own current `@username` ledger chain tip — needed as the
+ * anchor for a new claim (see `submitLedgerUsernameClaim`). Answered
+ * synchronously (no network round trip): this is purely a read of local
+ * state, not a DHT lookup.
+ */
+export function queryLedgerChainTip(timeoutMs = 10_000): Promise<{ height: number; hash: string }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe()
+      reject(new Error('Chain tip query timed out'))
+    }, timeoutMs)
+
+    const unsubscribe = addP2pEventListener((event) => {
+      if (event.type === 'chainTipChanged') {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({ height: event.height, hash: event.hash })
+      }
+    })
+
+    NativeCryptoCore.p2pQueryChainTip()
+  })
+}
+
+export type LedgerUsernameOwner =
+  | { status: 'found'; ownerPublicKeyBase64: string; claimedAtHeight: number }
+  | { status: 'not_found' }
+
+/**
+ * Looks up `username` in this node's own materialized ledger state —
+ * unlike `lookupUsername` (the DHT-based, best-effort predecessor this is
+ * replacing), this is a real first-claim-wins answer with no "advisory
+ * only" caveat, and (once synced) never needs a network round trip: this
+ * node's local chain view *is* the answer.
+ */
+export function queryLedgerUsernameOwner(username: string, timeoutMs = 10_000): Promise<LedgerUsernameOwner> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe()
+      reject(new Error('Username owner query timed out'))
+    }, timeoutMs)
+
+    const unsubscribe = addP2pEventListener((event) => {
+      if (event.type === 'usernameOwnerResolved' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({ status: 'found', ownerPublicKeyBase64: event.ownerPublicKeyBase64, claimedAtHeight: event.claimedAtHeight })
+      } else if (event.type === 'usernameOwnerNotFound' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({ status: 'not_found' })
+      }
+    })
+
+    NativeCryptoCore.p2pQueryUsernameOwner(username)
+  })
+}
+
+/**
+ * Signs `username` with this device's identity, anchored to this node's
+ * current chain tip, and broadcasts the claim to the ledger's mempool.
+ *
+ * Unlike `announceUsername`'s DHT-based predecessor, this does **not**
+ * mean the name is confirmed yet — nobody has necessarily mined it into a
+ * block. There is no "accepted into the mempool" event to wait for (only
+ * an explicit `ledgerSubmissionRejected` on failure), so this resolves
+ * once `timeoutMs` passes with no rejection — treat the resolved promise
+ * as "submitted, not yet confirmed," and watch `chainTipChanged` /
+ * `queryLedgerUsernameOwner` afterward to see whether/when it actually
+ * lands. Callers should `queryLedgerUsernameOwner` first and treat a
+ * `found` result from a different key as taken — this call itself
+ * doesn't check.
+ */
+export function submitLedgerUsernameClaim(username: string, timeoutMs = 10_000): Promise<void> {
+  return queryLedgerChainTip().then(
+    (tip) =>
+      new Promise<void>((resolve, reject) => {
+        const transactionBytes = NativeCryptoCore.ledgerBuildUsernameClaim(
+          username,
+          tip.height,
+          hexToBytes(tip.hash),
+          randomNonce(8)
+        )
+
+        const timer = setTimeout(() => {
+          unsubscribe()
+          resolve()
+        }, timeoutMs)
+
+        const unsubscribe = addP2pEventListener((event) => {
+          if (event.type === 'ledgerSubmissionRejected') {
+            clearTimeout(timer)
+            unsubscribe()
+            reject(new Error(event.reason))
+          }
+        })
+
+        NativeCryptoCore.p2pSubmitUsernameClaim(transactionBytes)
+      })
+  )
+}
+
+/**
+ * Catches this node up to `peerId`'s ledger chain tip if it's heavier
+ * than this node's own (a no-op, resolving immediately, if this node's
+ * chain is already at least as heavy). Dial first if not already
+ * connected. Resolves with the resulting local tip height.
+ */
+export function requestLedgerChainSync(peerId: string, timeoutMs = 30_000): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe()
+      reject(new Error('Chain sync timed out'))
+    }, timeoutMs)
+
+    const unsubscribe = addP2pEventListener((event) => {
+      if (event.type === 'chainSyncCompleted') {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve(event.height)
+      } else if (event.type === 'chainSyncFailed' && event.peerId === peerId) {
+        clearTimeout(timer)
+        unsubscribe()
+        reject(new Error(event.reason))
+      }
+    })
+
+    NativeCryptoCore.p2pRequestChainSync(peerId)
   })
 }

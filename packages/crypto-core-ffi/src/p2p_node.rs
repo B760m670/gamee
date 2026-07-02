@@ -10,12 +10,17 @@
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
+use spiritchat_ledger_core::{Block, Transaction};
 use spiritchat_p2p_core::{Command, Multiaddr, P2pNode, PeerId};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 use crate::error::{FfiError, FfiResult};
 use crate::p2p_event::FfiP2pEvent;
+
+fn ledger_err(reason: impl std::fmt::Display) -> FfiError {
+    FfiError::P2p { reason: reason.to_string() }
+}
 
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -184,6 +189,51 @@ impl FfiP2pNode {
     /// layer only fetches whatever bytes are stored, it doesn't check them.
     pub fn resolve_username(&self, username: String) -> FfiResult<()> {
         self.send(Command::ResolveUsername { username })
+    }
+
+    /// Broadcasts an already-signed `@username` claim (see
+    /// `ledger_build_username_claim`) to the ledger's mempool topic, so
+    /// any connected peer's miner — not just this node's own, if it mines
+    /// at all — can pick it up and include it in a block. This alone does
+    /// not confirm the name; watch for `ChainTipChanged` events and
+    /// re-check via `query_username_owner` to see whether/when it lands.
+    pub fn submit_username_claim(&self, transaction_bytes: Vec<u8>) -> FfiResult<()> {
+        let transaction: Transaction = bincode::deserialize(&transaction_bytes).map_err(ledger_err)?;
+        self.send(Command::SubmitUsernameClaim { transaction })
+    }
+
+    /// Submits an already-mined, `bincode`-encoded ledger block — for the
+    /// mining loop (see `start_mining`) to publish what it finds, and for
+    /// tests. Validates and applies it locally exactly like a block
+    /// received over gossip, then gossips it onward.
+    pub fn submit_mined_block(&self, block_bytes: Vec<u8>) -> FfiResult<()> {
+        let block: Block = bincode::deserialize(&block_bytes).map_err(ledger_err)?;
+        self.send(Command::SubmitMinedBlock { block })
+    }
+
+    /// Answers from this node's own local materialized ledger state only
+    /// — no network round trip, since once synced this node's view of the
+    /// chain *is* the answer. Answered by
+    /// `UsernameOwnerResolved`/`UsernameOwnerNotFound`.
+    pub fn query_username_owner(&self, username: String) -> FfiResult<()> {
+        self.send(Command::QueryUsernameOwner { username })
+    }
+
+    /// Asks `peer_id` for its current ledger chain tip and, if it's
+    /// heavier than this node's own, fetches and applies whatever blocks
+    /// are missing. Answered by `ChainSyncCompleted`/`ChainSyncFailed`.
+    /// Dial first if not already connected.
+    pub fn request_chain_sync(&self, peer_id: String) -> FfiResult<()> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.send(Command::RequestChainSync { peer })
+    }
+
+    /// This node's own current ledger chain tip — needed to build a new
+    /// claim's anchor (see `ledger_build_username_claim`). Answered
+    /// synchronously (no network round trip) by a `ChainTipChanged` event
+    /// on `next_event`.
+    pub fn query_chain_tip(&self) -> FfiResult<()> {
+        self.send(Command::QueryChainTip)
     }
 
     /// Cleanly stops this node — after this, `next_event` returns `None`.

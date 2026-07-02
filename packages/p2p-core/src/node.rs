@@ -383,6 +383,13 @@ fn handle_command(
             pending.chain_sync_tip.insert(request_id, peer);
         }
 
+        Command::QueryChainTip => {
+            let _ = events.send(P2pEvent::ChainTipChanged {
+                height: chain_store.tip_height(),
+                hash: format!("{}", chain_store.tip_hash()),
+            });
+        }
+
         // Handled in run_event_loop before this function is ever called —
         // present only because Command's match must stay exhaustive.
         Command::Shutdown => {}

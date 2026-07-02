@@ -106,6 +106,15 @@ pub enum Command {
     /// first if not already connected.
     RequestChainSync { peer: PeerId },
 
+    /// This node's own current ledger chain tip — for building a new
+    /// claim's `anchor_block_hash`/`anchor_height` (see
+    /// `spiritchat_ledger_core::Transaction::new_claim`), since a claim
+    /// must anchor to a real, recent block. Answered synchronously (no
+    /// network round trip) by `P2pEvent::ChainTipChanged`, the same event
+    /// a real tip change fires — querying and changing produce the same
+    /// shape of answer either way.
+    QueryChainTip,
+
     /// Cleanly stops the event loop — after this, `next_event` returns
     /// `None` and the node can no longer be used; a new identity needs a
     /// new `P2pNode::spawn`, not a reused one. For an app-level "sign out":

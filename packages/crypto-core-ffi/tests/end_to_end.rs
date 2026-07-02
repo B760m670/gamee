@@ -6,8 +6,8 @@
 //! contact cards → handshake → ratchet → persist → resume.
 
 use spiritchat_crypto_core_ffi::{
-    identity_verify, x3dh_initiate, x3dh_respond, FfiAgreementKey, FfiContactCard, FfiIdentity,
-    FfiPrekeyStore, FfiRatchet, FfiRecoveryPhrase,
+    identity_verify, ledger_build_username_claim, x3dh_initiate, x3dh_respond, FfiAgreementKey,
+    FfiContactCard, FfiIdentity, FfiPrekeyStore, FfiRatchet, FfiRecoveryPhrase,
 };
 
 struct Party {
@@ -168,6 +168,42 @@ fn a_username_claim_signed_by_one_identity_does_not_verify_against_another() {
 
     // Signed for "alice" — must not verify as a claim for a different name.
     assert!(!identity_verify(alice.public_key_bytes(), b"bob".to_vec(), signature));
+}
+
+#[test]
+fn ledger_build_username_claim_produces_a_transaction_that_deserializes_and_verifies() {
+    let identity = FfiIdentity::generate();
+    let anchor_hash = vec![7u8; 32];
+    let nonce = vec![1u8; 8];
+
+    let claim_bytes =
+        ledger_build_username_claim(&identity, "alice".to_string(), 42, anchor_hash.clone(), nonce)
+            .expect("a valid username should build a valid claim");
+
+    let transaction: spiritchat_ledger_core::Transaction =
+        bincode::deserialize(&claim_bytes).expect("must round-trip through bincode");
+
+    assert_eq!(transaction.username, "alice");
+    assert_eq!(transaction.owner_public_key.to_vec(), identity.public_key_bytes());
+    assert_eq!(transaction.claimed_at_height_hint, 42);
+    assert_eq!(transaction.anchor_block_hash.as_bytes().to_vec(), anchor_hash);
+    transaction.verify_self_contained().expect("a freshly built claim must verify");
+}
+
+#[test]
+fn ledger_build_username_claim_rejects_an_invalid_username() {
+    let identity = FfiIdentity::generate();
+    let err = ledger_build_username_claim(&identity, "no".to_string(), 0, vec![0u8; 32], vec![0u8; 8])
+        .expect_err("a too-short username must be rejected before signing anything");
+    assert!(err.to_string().contains("shorter than"), "unexpected error: {err}");
+}
+
+#[test]
+fn ledger_build_username_claim_rejects_a_malformed_anchor_hash() {
+    let identity = FfiIdentity::generate();
+    let err = ledger_build_username_claim(&identity, "alice".to_string(), 0, vec![0u8; 31], vec![0u8; 8])
+        .expect_err("a 31-byte anchor hash is not 32 bytes and must be rejected");
+    assert!(err.to_string().contains("32 bytes"), "unexpected error: {err}");
 }
 
 #[test]
