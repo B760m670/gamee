@@ -60,4 +60,11 @@ pub enum P2pEvent {
     /// this has happened at least once.
     AddressesAnnounced,
     AddressAnnouncementFailed { reason: String },
+
+    /// `Command::FetchBlob` succeeded; `bytes` is exactly what `peer` had
+    /// registered under `id` via its own `SetLocalBlob`.
+    BlobFetched { peer: PeerId, id: Vec<u8>, bytes: Vec<u8> },
+    /// `peer` doesn't have `id` registered (or is unreachable / the
+    /// request otherwise failed outright).
+    BlobFetchFailed { peer: PeerId, id: Vec<u8>, reason: String },
 }

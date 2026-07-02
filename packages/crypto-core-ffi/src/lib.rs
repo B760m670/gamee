@@ -6,6 +6,7 @@
 //! apps never re-implement (or subtly diverge on) the handshake or ratchet.
 
 mod agreement;
+mod blob;
 mod contact_card;
 mod error;
 mod handshake;
@@ -16,6 +17,7 @@ mod prekeys;
 mod ratchet;
 
 pub use agreement::FfiAgreementKey;
+pub use blob::blob_content_id;
 pub use contact_card::FfiContactCard;
 pub use error::FfiError;
 pub use handshake::{x3dh_initiate, x3dh_respond, FfiHandshakeResult};

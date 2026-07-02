@@ -10,6 +10,8 @@ import { useProfileStore } from '../../store/profile'
 import { Avatar } from '../../components/Avatar'
 import { SettingsRow } from '../../components/SettingsRow'
 import { QrCodeModal } from '../../components/QrCodeModal'
+import { useAvatarUpload } from '../../hooks/useAvatarUpload'
+import { AvatarEditorModal } from '../../components/AvatarEditorModal'
 
 const AVATAR_SIZE = 100
 const BTN_H       = 44
@@ -17,10 +19,12 @@ const BTN_H       = 44
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets()
   const router  = useRouter()
-  const { displayName, fingerprint } = useProfileStore(s => ({
-    displayName: s.displayName,
-    fingerprint: s.fingerprint,
+  const { displayName, fingerprint, avatarLocalPath } = useProfileStore(s => ({
+    displayName:     s.displayName,
+    fingerprint:     s.fingerprint,
+    avatarLocalPath: s.avatarLocalPath,
   }))
+  const { pickAndUpload, uploading, editorUri, handleEditorDone, handleEditorCancel } = useAvatarUpload()
 
   const [qrVisible, setQrVisible] = useState(false)
 
@@ -38,12 +42,24 @@ export default function SettingsScreen() {
       >
         {/* Profile section */}
         <View style={s.profileSection}>
-          <Avatar uri={null} size={AVATAR_SIZE} username={displayName || '?'} />
+          <Avatar uri={avatarLocalPath} size={AVATAR_SIZE} username={displayName || '?'} />
           <View style={s.profileTextWrap}>
             <Text style={s.name}>{displayName || 'Без имени'}</Text>
             <Text style={s.subInfo}>{fingerprint}</Text>
           </View>
         </View>
+
+        {/* Photo button — blue action row, same pattern as Telegram Settings */}
+        <SettingsRow onPress={pickAndUpload} style={s.photoRow}>
+          <View style={[s.iconWrap, { backgroundColor: '#2f7bff' }]}>
+            <Ionicons name="camera" size={15} color="#fff" />
+          </View>
+          <Text style={s.photoLabel}>
+            {uploading
+              ? 'Сохранение...'
+              : avatarLocalPath ? 'Изменить фото' : 'Выбрать фотографию'}
+          </Text>
+        </SettingsRow>
 
         <View style={s.rowGap} />
 
@@ -79,6 +95,11 @@ export default function SettingsScreen() {
         visible={qrVisible}
         onClose={() => setQrVisible(false)}
       />
+      <AvatarEditorModal
+        uri={editorUri}
+        onDone={handleEditorDone}
+        onCancel={handleEditorCancel}
+      />
     </View>
   )
 }
@@ -103,6 +124,8 @@ const s = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   rowLabel:  { flex: 1, color: '#fff',     fontSize: 17 },
+  photoRow:  { marginBottom: 0 },
+  photoLabel: { flex: 1, color: '#2f7bff', fontSize: 17 },
   rowGap:    { height: 10 },
 
   btnOverlay: { position: 'absolute', zIndex: 10 },

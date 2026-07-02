@@ -20,6 +20,8 @@ export type P2pEvent =
   | { type: 'peerAddressResolutionFailed'; peerId: string }
   | { type: 'addressesAnnounced' }
   | { type: 'addressAnnouncementFailed'; reason: string }
+  | { type: 'blobFetched'; peerId: string; id: string; localPath: string }
+  | { type: 'blobFetchFailed'; peerId: string; id: string; reason: string }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -35,6 +37,11 @@ const NativeCryptoCore = requireNativeModule<
     p2pAnnounceAddresses(addresses: string[]): void
     p2pSendEnvelope(peerId: string, bytes: Uint8Array): void
     p2pReserveRelaySlot(relayAddress: string): void
+    blobSaveFromFile(fileUri: string): string
+    blobLocalPath(idHex: string): string | null
+    blobClear(idHex: string): void
+    blobReserve(idHex: string): boolean
+    p2pFetchBlob(peerId: string, idHex: string): void
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -96,4 +103,35 @@ export function p2pReserveRelaySlot(relayAddress: string): void {
 export function addP2pEventListener(listener: (event: P2pEvent) => void): () => void {
   const subscription = NativeCryptoCore.addListener('onP2pEvent', listener)
   return () => subscription.remove()
+}
+
+/**
+ * Content-addresses a local file (its bytes are hashed, not read into JS),
+ * caches it on-device, and registers it with the P2P node so any connected
+ * peer can fetch it directly — no server, CDN, or pinning service. Returns
+ * the hex-encoded content id; persist it (e.g. as the avatar id) to look the
+ * file back up later via `blobLocalPath`.
+ */
+export function blobSaveFromFile(fileUri: string): string {
+  return NativeCryptoCore.blobSaveFromFile(fileUri)
+}
+
+/** The local cache path for `idHex`, or null if this device doesn't have it yet (fetch it first). */
+export function blobLocalPath(idHex: string): string | null {
+  return NativeCryptoCore.blobLocalPath(idHex)
+}
+
+/** Stops serving `idHex` to peers and deletes the on-disk cache entry. */
+export function blobClear(idHex: string): void {
+  NativeCryptoCore.blobClear(idHex)
+}
+
+/** Re-registers an already-cached blob with the P2P node — call once per launch for anything this device should keep serving (e.g. its own avatar). Returns false if not cached. */
+export function blobReserve(idHex: string): boolean {
+  return NativeCryptoCore.blobReserve(idHex)
+}
+
+/** Fetches blob `idHex` from `peerId` (dial first if not connected). Answered by a `blobFetched`/`blobFetchFailed` event. */
+export function p2pFetchBlob(peerId: string, idHex: string): void {
+  NativeCryptoCore.p2pFetchBlob(peerId, idHex)
 }

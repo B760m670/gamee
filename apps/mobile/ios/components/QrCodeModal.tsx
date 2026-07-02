@@ -41,9 +41,10 @@ type Props = {
 
 export function QrCodeModal({ visible, onClose }: Props) {
   const insets = useSafeAreaInsets()
-  const { displayName, fingerprint } = useProfileStore(s => ({
-    displayName: s.displayName,
-    fingerprint: s.fingerprint,
+  const { displayName, fingerprint, avatarLocalPath } = useProfileStore(s => ({
+    displayName:     s.displayName,
+    fingerprint:     s.fingerprint,
+    avatarLocalPath: s.avatarLocalPath,
   }))
   const [permission, requestPermission] = useCameraPermissions()
   const [scanning, setScanning] = useState(false)
@@ -118,7 +119,7 @@ export function QrCodeModal({ visible, onClose }: Props) {
             </View>
 
             <View style={s.content}>
-              <Avatar uri={null} size={80} username={displayName || '?'} />
+              <Avatar uri={avatarLocalPath} size={80} username={displayName || '?'} />
               <Text style={s.name}>{displayName || 'Без имени'}</Text>
               <Text style={s.handle}>{fingerprint}</Text>
 

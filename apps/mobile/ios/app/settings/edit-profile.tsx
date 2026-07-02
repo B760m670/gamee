@@ -4,10 +4,13 @@ import {
   KeyboardAvoidingView, Platform, ActivityIndicator, ScrollView, StyleSheet,
 } from 'react-native'
 import { GlassView } from 'expo-glass-effect'
+import { Ionicons } from '@expo/vector-icons'
 import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useProfileStore } from '../../store/profile'
 import { Avatar } from '../../components/Avatar'
+import { useAvatarUpload } from '../../hooks/useAvatarUpload'
+import { AvatarEditorModal } from '../../components/AvatarEditorModal'
 
 const AVATAR_SIZE = 100
 const BTN_H       = 44
@@ -15,19 +18,23 @@ const BTN_H       = 44
 export default function EditProfileScreen() {
   const insets = useSafeAreaInsets()
   const router  = useRouter()
-  const { displayName, bio, fingerprint, setDisplayName, setBio } = useProfileStore(s => ({
-    displayName: s.displayName,
-    bio:         s.bio,
-    fingerprint: s.fingerprint,
-    setDisplayName: s.setDisplayName,
-    setBio:         s.setBio,
+  const { displayName, bio, fingerprint, avatarLocalPath, setDisplayName, setBio } = useProfileStore(s => ({
+    displayName:     s.displayName,
+    bio:             s.bio,
+    fingerprint:     s.fingerprint,
+    avatarLocalPath: s.avatarLocalPath,
+    setDisplayName:  s.setDisplayName,
+    setBio:          s.setBio,
   }))
+  const { pickAndUpload, uploading: uploadingPhoto, error: uploadError, editorUri, handleEditorDone, handleEditorCancel } = useAvatarUpload()
 
   const BTN_TOP = insets.top + 10
 
   const [editName, setEditName] = useState(displayName)
   const [editBio,  setEditBio]  = useState(bio)
   const [saving,   setSaving]   = useState(false)
+
+  const displayError = uploadError
 
   async function handleSave() {
     if (saving) return
@@ -75,8 +82,28 @@ export default function EditProfileScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={s.profileSection}>
-          <Avatar uri={null} size={AVATAR_SIZE} username={editName || '?'} />
+          <Pressable onPress={pickAndUpload} disabled={uploadingPhoto}>
+            <Avatar uri={avatarLocalPath} size={AVATAR_SIZE} username={editName || '?'} />
+            <View style={s.avatarOverlay}>
+              {uploadingPhoto
+                ? <ActivityIndicator color="#fff" size="large" />
+                : <Ionicons name="camera" size={30} color="#fff" />
+              }
+            </View>
+          </Pressable>
+
+          <View style={s.profileTextWrap}>
+            <Pressable onPress={pickAndUpload}>
+              <Text style={s.choosePhoto}>Выбрать фотографию</Text>
+            </Pressable>
+          </View>
         </View>
+
+        {displayError ? (
+          <View style={s.errorBox}>
+            <Text style={s.errorText}>{displayError}</Text>
+          </View>
+        ) : null}
 
         <View style={s.group}>
           <View style={[s.fieldRow, s.fieldBorder]}>
@@ -117,6 +144,12 @@ export default function EditProfileScreen() {
         </View>
         <Text style={s.bioCount}>{editBio.length}/200</Text>
       </ScrollView>
+
+      <AvatarEditorModal
+        uri={editorUri}
+        onDone={handleEditorDone}
+        onCancel={handleEditorCancel}
+      />
     </KeyboardAvoidingView>
   )
 }
@@ -124,7 +157,19 @@ export default function EditProfileScreen() {
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#000' },
 
-  profileSection: { alignItems: 'center', paddingTop: 8, paddingBottom: 20 },
+  profileSection: { alignItems: 'center', paddingTop: 8, paddingBottom: 8 },
+  avatarOverlay: {
+    position: 'absolute',
+    width: AVATAR_SIZE, height: AVATAR_SIZE,
+    borderRadius: AVATAR_SIZE / 2,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  profileTextWrap: { alignItems: 'center', marginTop: 14, minHeight: 20 },
+  choosePhoto: { color: '#2f7bff', fontSize: 15, fontWeight: '500', textAlign: 'center' },
+
+  errorBox:  { backgroundColor: 'rgba(127,29,29,0.4)', borderRadius: 12, borderWidth: 1, borderColor: '#b91c1c', padding: 12, marginBottom: 12 },
+  errorText: { color: '#f87171', fontSize: 14 },
 
   btnOverlay: { position: 'absolute', zIndex: 10 },
   pillShape: {

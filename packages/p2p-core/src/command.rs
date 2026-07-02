@@ -32,4 +32,23 @@ pub enum Command {
     /// Success shows up as `P2pEvent::ListeningOn` with a `/p2p-circuit`
     /// address; publish it via `AnnounceAddresses` so others can reach it.
     ReserveRelaySlot { relay_address: Multiaddr },
+
+    /// Registers `bytes` as a blob this node will serve to any peer that
+    /// asks for it by `id` (e.g. this device's own current avatar,
+    /// content-addressed by its own hash) — until `ClearLocalBlob` removes
+    /// it, it's replaced by another `SetLocalBlob` with the same `id`, or
+    /// this node restarts (nothing is persisted by this crate). Peers fetch
+    /// it directly over a connection to this node; nothing is uploaded
+    /// anywhere in advance.
+    SetLocalBlob { id: Vec<u8>, bytes: Vec<u8> },
+
+    /// Stops serving the blob registered under `id`.
+    ClearLocalBlob { id: Vec<u8> },
+
+    /// Requests the blob `id` from `peer`, who must have it registered via
+    /// `SetLocalBlob` (or be a third party choosing to cache and re-serve a
+    /// copy — an app-layer policy, not something this crate arranges).
+    /// Dial first if not already connected. Answered by
+    /// `P2pEvent::BlobFetched`/`BlobFetchFailed`.
+    FetchBlob { peer: PeerId, id: Vec<u8> },
 }

@@ -11,6 +11,7 @@ use libp2p::{
     swarm::NetworkBehaviour,
     PeerId, StreamProtocol,
 };
+use serde::{Deserialize, Serialize};
 
 /// The wire protocol for delivering an already-encrypted message envelope
 /// (an X3DH initial message or a Double Ratchet ciphertext, produced by
@@ -23,6 +24,25 @@ pub const ENVELOPE_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/e
 /// depends on it; `ENVELOPE_PROTOCOL` support is what actually matters).
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "/spiritchat/1.0.0";
 
+/// The wire protocol for fetching a content-addressed blob (e.g. an avatar
+/// image) directly from the peer that registered it via
+/// `Command::SetLocalBlob`. There is nowhere else these bytes live — no
+/// pinning service, no CDN, no relay that stores a copy on this project's
+/// behalf. A peer that has fetched a blob may choose to cache and re-serve
+/// it (that's an app-layer policy, not something this crate does), which is
+/// how availability improves over "only the owner has it" without any
+/// party being a dedicated host.
+pub const BLOB_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/blob/1.0.0");
+
+/// The response half of the blob protocol. The request is just the raw
+/// content id (whatever hash the app chose to identify the blob by) —
+/// opaque to this crate either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlobResponse {
+    Found(Vec<u8>),
+    NotFound,
+}
+
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
@@ -31,6 +51,7 @@ pub struct Behaviour {
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub envelope: request_response::cbor::Behaviour<Vec<u8>, Vec<u8>>,
+    pub blob: request_response::cbor::Behaviour<Vec<u8>, BlobResponse>,
 }
 
 pub fn build(
@@ -63,6 +84,12 @@ pub fn build(
         envelope: request_response::cbor::Behaviour::new(
             [(ENVELOPE_PROTOCOL, ProtocolSupport::Full)],
             request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+        ),
+        // A blob transfer moves more data over a possibly slower/relayed
+        // path than a single envelope, so it gets a longer timeout.
+        blob: request_response::cbor::Behaviour::new(
+            [(BLOB_PROTOCOL, ProtocolSupport::Full)],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
         ),
     })
 }

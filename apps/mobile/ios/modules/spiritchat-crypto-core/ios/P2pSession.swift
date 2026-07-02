@@ -52,6 +52,15 @@ final class P2pSession {
       return ["type": "addressesAnnounced"]
     case .addressAnnouncementFailed(let reason):
       return ["type": "addressAnnouncementFailed", "reason": reason]
+    case .blobFetched(let peerId, let id, let bytes):
+      // Cache to disk here rather than shipping the raw bytes across the
+      // JS bridge a second time — JS only ever needs a file path to hand
+      // to <Image>, never the bytes themselves.
+      let idHex = id.hexEncoded
+      let url = (try? BlobStore.save(bytes, idHex: idHex)) ?? BlobStore.path(for: idHex)
+      return ["type": "blobFetched", "peerId": peerId, "id": idHex, "localPath": url.absoluteString]
+    case .blobFetchFailed(let peerId, let id, let reason):
+      return ["type": "blobFetchFailed", "peerId": peerId, "id": id.hexEncoded, "reason": reason]
     }
   }
 }

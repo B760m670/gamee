@@ -15,7 +15,7 @@ use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::behaviour::{self, Behaviour, BehaviourEvent};
+use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse};
 use crate::bootstrap;
 use crate::command::Command;
 use crate::error::{P2pError, Result};
@@ -138,6 +138,7 @@ struct Pending {
     resolve_peer: HashMap<QueryId, PeerId>,
     announce: std::collections::HashSet<QueryId>,
     envelope_send: HashMap<OutboundRequestId, PeerId>,
+    blob_fetch: HashMap<OutboundRequestId, (PeerId, Vec<u8>)>,
 }
 
 async fn run_event_loop(
@@ -146,14 +147,19 @@ async fn run_event_loop(
     events: mpsc::UnboundedSender<P2pEvent>,
 ) {
     let mut pending = Pending::default();
+    // Blobs this node currently serves (e.g. its own avatar), set via
+    // Command::SetLocalBlob. Lives only in memory for the life of this
+    // task — persisting them across restarts, if desired, is the app's
+    // job (it already has the bytes; it just re-issues SetLocalBlob).
+    let mut local_blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
     loop {
         tokio::select! {
             Some(command) = commands.recv() => {
-                handle_command(&mut swarm, &mut pending, &events, command);
+                handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
             }
             swarm_event = swarm.select_next_some() => {
-                handle_swarm_event(&mut swarm, &mut pending, &events, swarm_event);
+                handle_swarm_event(&mut swarm, &mut pending, &local_blobs, &events, swarm_event);
             }
             else => break,
         }
@@ -163,6 +169,7 @@ async fn run_event_loop(
 fn handle_command(
     swarm: &mut Swarm<Behaviour>,
     pending: &mut Pending,
+    local_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     command: Command,
 ) {
@@ -221,12 +228,26 @@ fn handle_command(
                 let _ = events.send(P2pEvent::RelayReservationFailed { reason: err.to_string() });
             }
         }
+
+        Command::SetLocalBlob { id, bytes } => {
+            local_blobs.insert(id, bytes);
+        }
+
+        Command::ClearLocalBlob { id } => {
+            local_blobs.remove(&id);
+        }
+
+        Command::FetchBlob { peer, id } => {
+            let request_id = swarm.behaviour_mut().blob.send_request(&peer, id.clone());
+            pending.blob_fetch.insert(request_id, (peer, id));
+        }
     }
 }
 
 fn handle_swarm_event(
     swarm: &mut Swarm<Behaviour>,
     pending: &mut Pending,
+    local_blobs: &HashMap<Vec<u8>, Vec<u8>>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: SwarmEvent<BehaviourEvent>,
 ) {
@@ -277,6 +298,10 @@ fn handle_swarm_event(
 
         SwarmEvent::Behaviour(BehaviourEvent::Envelope(envelope_event)) => {
             handle_envelope_event(swarm, pending, events, envelope_event);
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::Blob(blob_event)) => {
+            handle_blob_event(swarm, pending, local_blobs, events, blob_event);
         }
 
         _ => {}
@@ -363,6 +388,48 @@ fn handle_envelope_event(
                     to: peer,
                     reason: error.to_string(),
                 });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_blob_event(
+    swarm: &mut Swarm<Behaviour>,
+    pending: &mut Pending,
+    local_blobs: &HashMap<Vec<u8>, Vec<u8>>,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    event: request_response::Event<Vec<u8>, BlobResponse>,
+) {
+    match event {
+        request_response::Event::Message { message, .. } => match message {
+            request_response::Message::Request { request: id, channel, .. } => {
+                let response = match local_blobs.get(&id) {
+                    Some(bytes) => BlobResponse::Found(bytes.clone()),
+                    None => BlobResponse::NotFound,
+                };
+                let _ = swarm.behaviour_mut().blob.send_response(channel, response);
+            }
+            request_response::Message::Response { request_id, response } => {
+                if let Some((peer, id)) = pending.blob_fetch.remove(&request_id) {
+                    match response {
+                        BlobResponse::Found(bytes) => {
+                            let _ = events.send(P2pEvent::BlobFetched { peer, id, bytes });
+                        }
+                        BlobResponse::NotFound => {
+                            let _ = events.send(P2pEvent::BlobFetchFailed {
+                                peer,
+                                id,
+                                reason: "peer does not have this blob".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        },
+        request_response::Event::OutboundFailure { request_id, error, .. } => {
+            if let Some((peer, id)) = pending.blob_fetch.remove(&request_id) {
+                let _ = events.send(P2pEvent::BlobFetchFailed { peer, id, reason: error.to_string() });
             }
         }
         _ => {}

@@ -125,6 +125,30 @@ impl FfiP2pNode {
         self.send(Command::ReserveRelaySlot { relay_address })
     }
 
+    /// Registers `bytes` as a blob this node will serve to any peer that
+    /// asks for it by `id` — the content-addressed hosting mechanism for
+    /// things like this device's own avatar. There is no server or CDN:
+    /// peers fetch it directly from this device over the same connection
+    /// used for everything else. Held only in memory; call this again on
+    /// every launch (the app already has the bytes on disk).
+    pub fn set_local_blob(&self, id: Vec<u8>, bytes: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::SetLocalBlob { id, bytes })
+    }
+
+    /// Stops serving the blob registered under `id`.
+    pub fn clear_local_blob(&self, id: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::ClearLocalBlob { id })
+    }
+
+    /// Requests the blob `id` from `peer_id`, who must have registered it
+    /// via `set_local_blob` (or be caching a copy). Dial first if not
+    /// already connected. Answered by a `BlobFetched`/`BlobFetchFailed`
+    /// event from `next_event`.
+    pub fn fetch_blob(&self, peer_id: String, id: Vec<u8>) -> FfiResult<()> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.send(Command::FetchBlob { peer, id })
+    }
+
     /// Waits for the next event. Call this in a loop — it never stops on
     /// its own; it only returns `None` if the node has been shut down
     /// (dropping every `FfiP2pNode` reference stops it).
