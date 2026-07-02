@@ -11,7 +11,7 @@ import { UserListItem } from '../../components/UserListItem'
 import { ConversationRow } from '../../components/ConversationRow'
 import { useUserSearch, normalizeQuery, type PublicUser } from '../../hooks/useUserSearch'
 import { useConversations } from '../../hooks/useConversations'
-import { useAuthStore } from '../../store/auth'
+import { useProfileStore } from '../../store/profile'
 
 const SEARCH_H = 54 // height of the collapsed search trigger, hidden above the fold
 
@@ -19,7 +19,7 @@ export default function ChatsScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const { height } = useWindowDimensions()
-  const me = useAuthStore(s => s.user?.id) ?? ''
+  const me = useProfileStore(s => s.peerId)
 
   const [active, setActive] = useState(false)
   const [query,  setQuery]  = useState('')

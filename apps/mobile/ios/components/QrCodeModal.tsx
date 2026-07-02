@@ -9,7 +9,7 @@ import { Ionicons } from '@expo/vector-icons'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import Svg, { Path } from 'react-native-svg'
 import { Avatar } from './Avatar'
-import type { AppUser } from '../store/auth'
+import { useProfileStore } from '../store/profile'
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window')
 const QR_SIZE  = Math.round(SCREEN_W * 0.58)
@@ -26,20 +26,25 @@ const scanPath = [
   `M ${FRAME_X} ${FRAME_Y} H ${FRAME_X + FRAME_SIZE} V ${FRAME_Y + FRAME_SIZE} H ${FRAME_X} Z`,
 ].join(' ')
 
-// Deep link for the user's profile; replace base with a real domain once available
-function profileLink(user: AppUser) {
-  const handle = user.username ?? user.id
-  return `mysocialapp://u/${handle}`
+// This device's own contact link: the public identity fingerprint, not a
+// server-issued handle — anyone who scans it learns this node's crypto
+// identity, nothing more. Actually parsing a scanned link into a contact
+// (the X3DH prekey bundle exchange) is separate, not-yet-built work.
+function profileLink(fingerprint: string) {
+  return `spiritchat://id/${fingerprint.replace(/\s+/g, '')}`
 }
 
 type Props = {
   visible: boolean
   onClose: () => void
-  user: AppUser | null
 }
 
-export function QrCodeModal({ visible, onClose, user }: Props) {
+export function QrCodeModal({ visible, onClose }: Props) {
   const insets = useSafeAreaInsets()
+  const { displayName, fingerprint } = useProfileStore(s => ({
+    displayName: s.displayName,
+    fingerprint: s.fingerprint,
+  }))
   const [permission, requestPermission] = useCameraPermissions()
   const [scanning, setScanning] = useState(false)
   const didScan = useRef(false)
@@ -49,8 +54,7 @@ export function QrCodeModal({ visible, onClose, user }: Props) {
   }, [visible])
 
   async function handleShare() {
-    if (!user) return
-    try { await Share.share({ message: profileLink(user) }) } catch {}
+    try { await Share.share({ message: profileLink(fingerprint) }) } catch {}
   }
 
   async function handleScan() {
@@ -66,11 +70,12 @@ export function QrCodeModal({ visible, onClose, user }: Props) {
     if (didScan.current) return
     didScan.current = true
     setScanning(false)
-    // TODO: parse mysocialapp://u/<username> and navigate to that profile
+    // TODO: parse spiritchat://id/<fingerprint> into an X3DH prekey bundle
+    // exchange and add the peer as a contact.
     Alert.alert('QR отсканирован', data)
   }
 
-  const link = user ? profileLink(user) : 'mysocialapp://'
+  const link = profileLink(fingerprint)
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
@@ -113,15 +118,9 @@ export function QrCodeModal({ visible, onClose, user }: Props) {
             </View>
 
             <View style={s.content}>
-              <Avatar
-                uri={user?.avatar_url ?? null}
-                size={80}
-                username={user?.username ?? user?.display_name ?? '?'}
-              />
-              <Text style={s.name}>{user?.display_name ?? ''}</Text>
-              {user?.username ? (
-                <Text style={s.handle}>@{user.username}</Text>
-              ) : null}
+              <Avatar uri={null} size={80} username={displayName || '?'} />
+              <Text style={s.name}>{displayName || 'Без имени'}</Text>
+              <Text style={s.handle}>{fingerprint}</Text>
 
               <View style={s.qrCard}>
                 <QRCode

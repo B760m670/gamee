@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { randomUUID } from 'expo-crypto'
-import { useAuthStore } from '../store/auth'
+import { useProfileStore } from '../store/profile'
 import {
   type ChatMessage, openConversation, fetchMessages, fetchNewMessages, postMessage, markConversationRead,
 } from '../lib/chat'
@@ -27,7 +27,7 @@ function mergeOne(prev: ChatMessage[], m: ChatMessage): ChatMessage[] {
 }
 
 export function useChat(userId: string) {
-  const me = useAuthStore(s => s.user?.id) ?? ''
+  const me = useProfileStore(s => s.peerId)
 
   const [conversationId, setConversationId] = useState<string | null>(null)
   const [other, setOther]                   = useState<PublicUser | null>(null)
