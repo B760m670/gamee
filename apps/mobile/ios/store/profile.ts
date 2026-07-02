@@ -14,10 +14,17 @@ import {
   signOut as nativeSignOut,
 } from '../modules/spiritchat-crypto-core'
 
-const DISPLAY_NAME_KEY = 'profile.displayName'
-const BIO_KEY          = 'profile.bio'
-const AVATAR_ID_KEY    = 'profile.avatarId'
-const USERNAME_KEY     = 'profile.username'
+// Namespaced by fingerprint rather than fixed keys: this device's Keychain
+// identity is recoverable via its phrase, so signing out and restoring the
+// *same* identity later should bring these local labels back with it, not
+// wipe them the way a genuinely different identity's data must never leak
+// into. Namespacing gets both for free — a different identity simply reads
+// under a different, empty namespace — without `signOut` needing to
+// actively delete anything (see `signOut`'s own doc comment below).
+const displayNameKey = (fingerprint: string) => `profile.${fingerprint}.displayName`
+const bioKey         = (fingerprint: string) => `profile.${fingerprint}.bio`
+const avatarIdKey    = (fingerprint: string) => `profile.${fingerprint}.avatarId`
+const usernameKey    = (fingerprint: string) => `profile.${fingerprint}.username`
 
 // There is no account server: this device's identity is the Keychain-backed
 // key pair from IdentitySession (see the native module), not a row in a
@@ -92,11 +99,16 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
   username:        null,
 
   bootstrap: async () => {
+    // Read first — the identity is already real the moment this runs
+    // (bootstrap only ever follows `hasIdentity()`/`setIdentityFromWords`
+    // succeeding), and every local key below is namespaced by it.
+    const fingerprint = cryptoCoreFingerprint()
+
     const [storedName, storedBio, storedAvatarId, storedUsername] = await Promise.all([
-      AsyncStorage.getItem(DISPLAY_NAME_KEY),
-      AsyncStorage.getItem(BIO_KEY),
-      AsyncStorage.getItem(AVATAR_ID_KEY),
-      AsyncStorage.getItem(USERNAME_KEY),
+      AsyncStorage.getItem(displayNameKey(fingerprint)),
+      AsyncStorage.getItem(bioKey(fingerprint)),
+      AsyncStorage.getItem(avatarIdKey(fingerprint)),
+      AsyncStorage.getItem(usernameKey(fingerprint)),
     ])
 
     const avatarId = storedAvatarId && blobReserve(storedAvatarId) ? storedAvatarId : null
@@ -116,7 +128,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
 
     set({
       isReady:         true,
-      fingerprint:     cryptoCoreFingerprint(),
+      fingerprint,
       publicKey:       publicKeyBase64(),
       peerId,
       p2pStartupError,
@@ -167,7 +179,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
         .then((owner) => {
           if (owner.status === 'found' && owner.ownerPublicKeyBase64 === get().publicKey) return
           if (owner.status === 'found') {
-            AsyncStorage.removeItem(USERNAME_KEY).catch(() => {})
+            AsyncStorage.removeItem(usernameKey(fingerprint)).catch(() => {})
             set({ username: null })
             return
           }
@@ -179,13 +191,13 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
 
   setDisplayName: async (name) => {
     const trimmed = name.trim()
-    await AsyncStorage.setItem(DISPLAY_NAME_KEY, trimmed)
+    await AsyncStorage.setItem(displayNameKey(get().fingerprint), trimmed)
     set({ displayName: trimmed })
   },
 
   setBio: async (bio) => {
     const trimmed = bio.trim()
-    await AsyncStorage.setItem(BIO_KEY, trimmed)
+    await AsyncStorage.setItem(bioKey(get().fingerprint), trimmed)
     set({ bio: trimmed })
   },
 
@@ -193,14 +205,14 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     const previousId = get().avatarId
     const id = blobSaveFromFile(fileUri)
     if (previousId && previousId !== id) blobClear(previousId)
-    await AsyncStorage.setItem(AVATAR_ID_KEY, id)
+    await AsyncStorage.setItem(avatarIdKey(get().fingerprint), id)
     set({ avatarId: id, avatarLocalPath: blobLocalPath(id) })
   },
 
   clearAvatar: async () => {
     const previousId = get().avatarId
     if (previousId) blobClear(previousId)
-    await AsyncStorage.removeItem(AVATAR_ID_KEY)
+    await AsyncStorage.removeItem(avatarIdKey(get().fingerprint))
     set({ avatarId: null, avatarLocalPath: null })
   },
 
@@ -209,23 +221,24 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
   // owns the actual submit/confirm flow, since it needs to show
   // fine-grained progress this store doesn't track.
   persistUsername: async (username) => {
+    const key = usernameKey(get().fingerprint)
     if (username) {
-      await AsyncStorage.setItem(USERNAME_KEY, username)
+      await AsyncStorage.setItem(key, username)
     } else {
-      await AsyncStorage.removeItem(USERNAME_KEY)
+      await AsyncStorage.removeItem(key)
     }
     set({ username: username || null })
   },
 
-  // There is no server session to invalidate — this wipes the local
-  // identity (see IdentitySession.signOut) and every local label attached
-  // to it, so a *different* identity later created/restored on this same
-  // device doesn't inherit a stranger's old display name, avatar, or
-  // username. The only way back into *this* account afterward is its
-  // recovery phrase.
+  // There is no server session to invalidate — this just forgets the
+  // Keychain identity (see IdentitySession.signOut) this device currently
+  // has loaded. The local labels above are namespaced by fingerprint, not
+  // wiped here: if the *same* identity is restored later (its own
+  // recovery phrase is the only way back in), its display name/bio/avatar/
+  // username come back with it, while a genuinely *different* identity
+  // simply reads under its own, empty namespace and never sees them.
   signOut: async () => {
     nativeSignOut()
-    await AsyncStorage.multiRemove([DISPLAY_NAME_KEY, BIO_KEY, AVATAR_ID_KEY, USERNAME_KEY])
     set({
       isReady:         false,
       fingerprint:     '',

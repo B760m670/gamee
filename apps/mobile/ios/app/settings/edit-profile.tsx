@@ -60,6 +60,14 @@ export default function EditProfileScreen() {
           style: 'destructive',
           onPress: async () => {
             await signOut()
+            // `replace` alone only swaps the current screen — this route
+            // was reached via `push` from somewhere inside `(tabs)`, which
+            // stays buried underneath in the stack's history. Without
+            // `dismissAll` first, a later back-navigation (even from deep
+            // inside onboarding, e.g. a swipe-back on create/restore) can
+            // pop past onboarding into that stale authenticated screen
+            // instead of actually returning to it fresh.
+            router.dismissAll()
             router.replace('/(onboarding)/welcome')
           },
         },
