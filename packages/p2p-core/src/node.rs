@@ -93,6 +93,14 @@ impl P2pNode {
         self.command_tx.send(command).map_err(|_| P2pError::NodeShutDown)
     }
 
+    /// A cheaply cloneable, `Send + Sync` handle for issuing commands
+    /// without needing `&self` (or any lock) at all — useful for callers
+    /// that hold `next_event`'s `&mut self` behind a mutex (e.g. an async
+    /// FFI boundary) and don't want command sends to contend with it.
+    pub fn command_sender(&self) -> mpsc::UnboundedSender<Command> {
+        self.command_tx.clone()
+    }
+
     /// Waits for the next event. Returns `None` once the event loop task
     /// has stopped (it never stops on its own — only if the whole node is
     /// dropped, taking the channel with it).

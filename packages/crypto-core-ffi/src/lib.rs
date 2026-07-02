@@ -10,6 +10,8 @@ mod contact_card;
 mod error;
 mod handshake;
 mod identity;
+mod p2p_event;
+mod p2p_node;
 mod prekeys;
 mod ratchet;
 
@@ -18,6 +20,8 @@ pub use contact_card::FfiContactCard;
 pub use error::FfiError;
 pub use handshake::{x3dh_initiate, x3dh_respond, FfiHandshakeResult};
 pub use identity::FfiIdentity;
+pub use p2p_event::FfiP2pEvent;
+pub use p2p_node::FfiP2pNode;
 pub use prekeys::FfiPrekeyStore;
 pub use ratchet::FfiRatchet;
 

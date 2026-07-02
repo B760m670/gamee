@@ -6,7 +6,11 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar'
 import { useFonts, Nunito_700Bold, Nunito_800ExtraBold } from '@expo-google-fonts/nunito'
-import { fingerprint as cryptoCoreFingerprint } from '../modules/spiritchat-crypto-core'
+import {
+  fingerprint as cryptoCoreFingerprint,
+  p2pLocalPeerId,
+  addP2pEventListener,
+} from '../modules/spiritchat-crypto-core'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -43,6 +47,20 @@ export default function RootLayout() {
     } catch (err) {
       console.error('[CryptoCore] failed to load/create identity', err)
     }
+
+    // The P2P node is started natively as soon as the module loads (see
+    // P2pSession.swift); this just confirms it's alive and starts
+    // forwarding its events. There is no server — `p2pLocalPeerId()` is
+    // this device's address on the public IPFS DHT it joined directly.
+    try {
+      console.log('[P2P] local peer id: ' + p2pLocalPeerId())
+    } catch (err) {
+      console.error('[P2P] failed to read local peer id', err)
+    }
+    const unsubscribe = addP2pEventListener((event) => {
+      console.log('[P2P] event: ' + JSON.stringify(event))
+    })
+    return unsubscribe
   }, [])
 
   return (
