@@ -25,6 +25,10 @@ pub enum FfiP2pEvent {
     AddressAnnouncementFailed { reason: String },
     BlobFetched { peer_id: String, id: Vec<u8>, bytes: Vec<u8> },
     BlobFetchFailed { peer_id: String, id: Vec<u8>, reason: String },
+    UsernameResolved { username: String, claim: Vec<u8> },
+    UsernameResolutionFailed { username: String },
+    UsernameAnnounced { username: String },
+    UsernameAnnouncementFailed { username: String, reason: String },
 }
 
 impl From<P2pEvent> for FfiP2pEvent {
@@ -62,6 +66,16 @@ impl From<P2pEvent> for FfiP2pEvent {
             }
             P2pEvent::BlobFetchFailed { peer, id, reason } => {
                 Self::BlobFetchFailed { peer_id: peer.to_string(), id, reason }
+            }
+            P2pEvent::UsernameResolved { username, claim } => {
+                Self::UsernameResolved { username, claim }
+            }
+            P2pEvent::UsernameResolutionFailed { username } => {
+                Self::UsernameResolutionFailed { username }
+            }
+            P2pEvent::UsernameAnnounced { username } => Self::UsernameAnnounced { username },
+            P2pEvent::UsernameAnnouncementFailed { username, reason } => {
+                Self::UsernameAnnouncementFailed { username, reason }
             }
         }
     }

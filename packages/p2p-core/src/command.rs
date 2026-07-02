@@ -51,4 +51,32 @@ pub enum Command {
     /// Dial first if not already connected. Answered by
     /// `P2pEvent::BlobFetched`/`BlobFetchFailed`.
     FetchBlob { peer: PeerId, id: Vec<u8> },
+
+    /// Publishes `claim` under the DHT key derived from `username` (see
+    /// `username::record_key_for`). `claim` is opaque to this crate — the
+    /// app layer is responsible for making it self-certifying (e.g. a
+    /// public key plus a signature over the username, so nobody but the
+    /// key's owner can publish a claim for it), since this crate has no
+    /// cryptographic verification of its own. A DHT alone cannot arbitrate
+    /// *who claimed a name first* the way a blockchain or a server could —
+    /// publishing here does not reserve the name against a determined
+    /// second claimant, only against accidental or casual collisions.
+    /// Callers that care should `ResolveUsername` first and treat a
+    /// different existing claim as "taken".
+    AnnounceUsername { username: String, claim: Vec<u8> },
+
+    /// Looks up whatever claim is currently published for `username`.
+    /// Answered by `P2pEvent::UsernameResolved`/`UsernameResolutionFailed`.
+    ResolveUsername { username: String },
+
+    /// Cleanly stops the event loop — after this, `next_event` returns
+    /// `None` and the node can no longer be used; a new identity needs a
+    /// new `P2pNode::spawn`, not a reused one. For an app-level "sign out":
+    /// dropping every `P2pNode`/`FfiP2pNode` reference alone doesn't stop a
+    /// node whose event loop is still being actively polled by something
+    /// (e.g. a background task awaiting `next_event`) — that task holds its
+    /// own reference alive for as long as it keeps looping. This command
+    /// breaks that loop explicitly instead of relying on reference counting
+    /// to happen to reach zero.
+    Shutdown,
 }

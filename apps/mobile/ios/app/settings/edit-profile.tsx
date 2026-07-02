@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import {
-  View, Text, TextInput, Pressable,
+  View, Text, TextInput, Pressable, Alert,
   KeyboardAvoidingView, Platform, ActivityIndicator, ScrollView, StyleSheet,
 } from 'react-native'
 import { GlassView } from 'expo-glass-effect'
@@ -18,13 +18,15 @@ const BTN_H       = 44
 export default function EditProfileScreen() {
   const insets = useSafeAreaInsets()
   const router  = useRouter()
-  const { displayName, bio, fingerprint, avatarLocalPath, setDisplayName, setBio } = useProfileStore(s => ({
+  const { displayName, bio, fingerprint, avatarLocalPath, username, setDisplayName, setBio, signOut } = useProfileStore(s => ({
     displayName:     s.displayName,
     bio:             s.bio,
     fingerprint:     s.fingerprint,
     avatarLocalPath: s.avatarLocalPath,
+    username:        s.username,
     setDisplayName:  s.setDisplayName,
     setBio:          s.setBio,
+    signOut:         s.signOut,
   }))
   const { pickAndUpload, uploading: uploadingPhoto, error: uploadError, editorUri, handleEditorDone, handleEditorCancel } = useAvatarUpload()
 
@@ -45,6 +47,24 @@ export default function EditProfileScreen() {
     ])
     setSaving(false)
     router.back()
+  }
+
+  function handleSignOutPress() {
+    Alert.alert(
+      'Выйти из аккаунта?',
+      'Здесь нет сервера — вернуться обратно можно только по фразе восстановления. Убедись, что сохранил её (Настройки → Фраза восстановления), иначе аккаунт будет утерян навсегда.',
+      [
+        { text: 'Отмена', style: 'cancel' },
+        {
+          text: 'Выйти',
+          style: 'destructive',
+          onPress: async () => {
+            await signOut()
+            router.replace('/(onboarding)/welcome')
+          },
+        },
+      ]
+    )
   }
 
   return (
@@ -129,6 +149,19 @@ export default function EditProfileScreen() {
 
         <Pressable
           style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
+          onPress={() => router.push('/settings/username')}
+        >
+          <View style={s.fieldRow}>
+            <Text style={s.fieldLabel}>Имя пользователя</Text>
+            <Text style={s.usernameValue}>{username ? `@${username}` : 'Не задано'}</Text>
+          </View>
+        </Pressable>
+        <Text style={s.fingerprintHint}>
+          Необязательно — если задать, тебя можно будет найти по точному @имени. Публикуется в открытой P2P-сети без сервера, поэтому уникальность не гарантирована железно.
+        </Text>
+
+        <Pressable
+          style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
           onPress={() => router.push('/settings/recovery-phrase')}
         >
           <View style={s.fieldRow}>
@@ -152,6 +185,10 @@ export default function EditProfileScreen() {
           </View>
         </View>
         <Text style={s.bioCount}>{editBio.length}/200</Text>
+
+        <Pressable onPress={handleSignOutPress} style={s.signOutBtn}>
+          <Text style={s.signOutText}>Выйти из аккаунта</Text>
+        </Pressable>
       </ScrollView>
 
       <AvatarEditorModal
@@ -200,6 +237,10 @@ const s = StyleSheet.create({
   recoveryRow:        {},
   recoveryRowPressed: { backgroundColor: '#1a1a1e' },
   recoveryLabel:       { color: '#2f7bff', fontSize: 16, fontWeight: '500' },
+  usernameValue:       { color: '#fff', fontSize: 15, marginTop: 2 },
 
   bioCount: { color: '#3f3f46', fontSize: 12, textAlign: 'right', marginTop: 4, marginRight: 4 },
+
+  signOutBtn:  { marginTop: 36, alignItems: 'center', paddingVertical: 14 },
+  signOutText: { color: '#ef4444', fontSize: 16, fontWeight: '500', textAlign: 'center' },
 })

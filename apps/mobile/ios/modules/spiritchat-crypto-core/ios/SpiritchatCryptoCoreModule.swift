@@ -68,23 +68,40 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireIdentity().publicKeyBytes.base64EncodedString()
     }
 
+    // Wipes this device's identity — the only way back in afterward is the
+    // recovery phrase (see IdentitySession.signOut). Also stops the P2P
+    // node built from it, so `p2pSession.shared` starts a genuinely fresh
+    // one for whatever identity gets created/restored next, rather than
+    // reusing this one's now-meaningless connections. There is no server
+    // session to invalidate; this local wipe is the entire effect.
+    Function("signOut") { () in
+      P2pSession.signOut()
+      IdentitySession.signOut()
+    }
+
     Events("onP2pEvent")
 
     // Starts pumping the P2P node's event loop as soon as an identity
     // exists — immediately on launch if one was already on this device,
-    // or the moment onboarding finishes creating/restoring one. Polls
-    // rather than being notified because this is a one-time state
-    // transition (nil -> non-nil, never back), not a recurring condition;
-    // a callback/notification mechanism for something that happens at most
-    // once per app launch would be more machinery than the problem needs.
+    // or the moment onboarding finishes creating/restoring one — and goes
+    // back to waiting whenever a node stops (sign out), so a subsequent
+    // sign-in/restore within the same running app still gets its events
+    // pumped without needing a relaunch. Polls for readiness rather than
+    // being notified since "an identity now exists" is a simple, low-
+    // frequency state change; a callback/notification mechanism for it
+    // would be more machinery than the problem needs.
     OnCreate {
       Task {
-        while P2pSession.shared == nil {
-          try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        guard let session = P2pSession.shared else { return }
-        while let event = await session.node.nextEvent() {
-          self.sendEvent("onP2pEvent", P2pSession.encode(event))
+        while true {
+          while P2pSession.shared == nil {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+          }
+          guard let session = P2pSession.shared else { continue }
+          while let event = await session.node.nextEvent() {
+            self.sendEvent("onP2pEvent", P2pSession.encode(event))
+          }
+          // The node shut down (sign out) — loop back and wait for the
+          // next one instead of letting this task end.
         }
       }
     }
@@ -111,6 +128,35 @@ public class SpiritchatCryptoCoreModule: Module {
 
     Function("p2pReserveRelaySlot") { (relayAddress: String) throws in
       try requireP2pSession().node.reserveRelaySlot(relayAddress: relayAddress)
+    }
+
+    // Signs `username` with this identity's key and publishes the claim to
+    // the public DHT — nobody else can produce a valid claim for it
+    // without this key. This does *not* reserve the name against a
+    // determined second claimant (a plain DHT has no way to arbitrate who
+    // claimed a name first, the way a blockchain or a server could) —
+    // `p2pResolveUsername` it first and treat an existing claim from a
+    // *different* key as taken. Re-run periodically (DHT records expire,
+    // same as address/blob announcements) and whenever the username
+    // changes. Answered by `usernameAnnounced`/`usernameAnnouncementFailed`
+    // on `onP2pEvent`.
+    Function("p2pAnnounceUsername") { (username: String) throws in
+      let session = try requireIdentity()
+      let claim = UsernameClaim.build(for: username, identity: session.identity)
+      try requireP2pSession().node.announceUsername(username: username, claim: claim)
+    }
+
+    // Looks up whatever is currently published for `username`. The
+    // resulting event is already verified before it reaches JS (see
+    // P2pSession.encode) — `usernameResolved` only fires for a claim whose
+    // signature actually checks out; a present-but-invalid claim (tampered
+    // or malformed) surfaces as `usernameClaimInvalid`, and nothing
+    // published at all as `usernameResolutionFailed`. Search by @username
+    // only ever works as an exact lookup — a DHT has no notion of
+    // "starts with", so there's no live-search-as-you-type here, only
+    // "resolve this exact handle".
+    Function("p2pResolveUsername") { (username: String) throws in
+      try requireP2pSession().node.resolveUsername(username: username)
     }
 
     // Reads `fileUri` (a local file already on disk, e.g. from

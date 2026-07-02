@@ -31,6 +31,16 @@ final class P2pSession {
     return session
   }
 
+  /// Stops the node and forgets it — for "sign out", where the identity
+  /// this node was built from is going away. A subsequent `shared` access
+  /// (once a new identity exists) then starts a genuinely fresh node
+  /// instead of reusing this one's now-meaningless connections/DHT state.
+  /// Safe to call even if no node was ever started.
+  static func signOut() {
+    try? cached?.node.shutdown()
+    cached = nil
+  }
+
   /// Encodes an event as a plain dictionary for the JS bridge, tagged by
   /// `type` so the TS side can discriminate without a second binding layer.
   static func encode(_ event: FfiP2pEvent) -> [String: Any?] {
@@ -72,6 +82,32 @@ final class P2pSession {
       return ["type": "blobFetched", "peerId": peerId, "id": idHex, "localPath": url.absoluteString]
     case .blobFetchFailed(let peerId, let id, let reason):
       return ["type": "blobFetchFailed", "peerId": peerId, "id": id.hexEncoded, "reason": reason]
+    case .usernameResolved(let username, let claim):
+      // Verify here, not in JS — the DHT is a public, untrusted store, so
+      // an unverified claim must never reach the app as if it were
+      // trustworthy. A claim that doesn't check out (wrong signature,
+      // malformed bytes) is reported the same as "nothing published",
+      // since neither is safe to act on.
+      guard
+        let publicKey = UsernameClaim.verify(username: username, claim: claim),
+        let fingerprint = try? identityFingerprintOfPublicKey(publicKey: publicKey),
+        let peerId = try? p2pPeerIdFromPublicKey(publicKey: publicKey)
+      else {
+        return ["type": "usernameClaimInvalid", "username": username]
+      }
+      return [
+        "type": "usernameResolved",
+        "username": username,
+        "publicKeyBase64": publicKey.base64EncodedString(),
+        "fingerprint": fingerprint,
+        "peerId": peerId,
+      ]
+    case .usernameResolutionFailed(let username):
+      return ["type": "usernameResolutionFailed", "username": username]
+    case .usernameAnnounced(let username):
+      return ["type": "usernameAnnounced", "username": username]
+    case .usernameAnnouncementFailed(let username, let reason):
+      return ["type": "usernameAnnouncementFailed", "username": username, "reason": reason]
     }
   }
 }

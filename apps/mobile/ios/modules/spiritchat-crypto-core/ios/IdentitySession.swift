@@ -137,4 +137,20 @@ final class IdentitySession {
   var publicKeyBytes: Data {
     identity.publicKeyBytes()
   }
+
+  /// Wipes this device's identity/agreement/prekeys/recovery-phrase from
+  /// the Keychain and forgets the cached session — after this,
+  /// `hasStoredIdentity()` is false again, the same state as a fresh
+  /// install, and the app is expected to route back to onboarding. There
+  /// is no server this could also sign out of; this local wipe is the
+  /// entire effect. The only way back in is the recovery phrase — if it
+  /// wasn't written down (or isn't still cached on some other device that
+  /// still has this identity), this is permanent.
+  static func signOut() {
+    KeychainStore.delete(account: identityAccount)
+    KeychainStore.delete(account: agreementAccount)
+    KeychainStore.delete(account: prekeysAccount)
+    KeychainStore.delete(account: recoveryPhraseAccount)
+    cached = nil
+  }
 }

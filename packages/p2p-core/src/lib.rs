@@ -26,12 +26,13 @@ mod event;
 mod identity;
 mod node;
 mod rendezvous;
+mod username;
 
 pub use bootstrap::public_dht_bootstrap_addresses;
 pub use command::Command;
 pub use error::{P2pError, Result};
 pub use event::P2pEvent;
-pub use identity::{keypair_from_seed, peer_id_from_seed};
+pub use identity::{keypair_from_seed, peer_id_from_public_key, peer_id_from_seed};
 pub use node::P2pNode;
 
 pub use libp2p::{Multiaddr, PeerId};

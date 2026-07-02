@@ -67,4 +67,16 @@ pub enum P2pEvent {
     /// `peer` doesn't have `id` registered (or is unreachable / the
     /// request otherwise failed outright).
     BlobFetchFailed { peer: PeerId, id: Vec<u8>, reason: String },
+
+    /// A DHT lookup for `username` finished with a currently-published
+    /// claim (which may or may not be this node's own — the caller is
+    /// responsible for verifying it before trusting it).
+    UsernameResolved { username: String, claim: Vec<u8> },
+    /// Nobody has published a claim for `username` right now (or the
+    /// lookup otherwise failed).
+    UsernameResolutionFailed { username: String },
+
+    /// `Command::AnnounceUsername` finished publishing to the DHT.
+    UsernameAnnounced { username: String },
+    UsernameAnnouncementFailed { username: String, reason: String },
 }

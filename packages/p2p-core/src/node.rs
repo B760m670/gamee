@@ -22,6 +22,7 @@ use crate::error::{P2pError, Result};
 use crate::event::P2pEvent;
 use crate::identity;
 use crate::rendezvous;
+use crate::username;
 
 pub struct P2pNode {
     local_peer_id: PeerId,
@@ -139,6 +140,8 @@ struct Pending {
     announce: std::collections::HashSet<QueryId>,
     envelope_send: HashMap<OutboundRequestId, PeerId>,
     blob_fetch: HashMap<OutboundRequestId, (PeerId, Vec<u8>)>,
+    resolve_username: HashMap<QueryId, String>,
+    announce_username: HashMap<QueryId, String>,
 }
 
 async fn run_event_loop(
@@ -156,6 +159,15 @@ async fn run_event_loop(
     loop {
         tokio::select! {
             Some(command) = commands.recv() => {
+                // Intercepted here rather than inside handle_command since
+                // shutting down means *stopping the loop*, not something
+                // handle_command's per-command effects can express — once
+                // this breaks, `events` (and therefore event_tx) drops at
+                // the end of this function, which is what makes
+                // `P2pNode::next_event` start returning `None`.
+                if matches!(command, Command::Shutdown) {
+                    break;
+                }
                 handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
             }
             swarm_event = swarm.select_next_some() => {
@@ -241,6 +253,24 @@ fn handle_command(
             let request_id = swarm.behaviour_mut().blob.send_request(&peer, id.clone());
             pending.blob_fetch.insert(request_id, (peer, id));
         }
+
+        Command::AnnounceUsername { username, claim } => {
+            let key = username::record_key_for(&username);
+            let record = Record::new(key, claim);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_username.insert(query_id, username);
+            }
+        }
+
+        Command::ResolveUsername { username } => {
+            let key = username::record_key_for(&username);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_username.insert(query_id, username);
+        }
+
+        // Handled in run_event_loop before this function is ever called —
+        // present only because Command's match must stay exhaustive.
+        Command::Shutdown => {}
     }
 }
 
@@ -338,21 +368,35 @@ fn handle_kad_event(
             if let Some(peer) = pending.resolve_peer.remove(&id) {
                 let addresses = rendezvous::decode_addresses(&found.record.value);
                 let _ = events.send(P2pEvent::PeerAddressesResolved { peer, addresses });
+            } else if let Some(username) = pending.resolve_username.remove(&id) {
+                let _ = events.send(P2pEvent::UsernameResolved {
+                    username,
+                    claim: found.record.value,
+                });
             }
         }
         QueryResult::GetRecord(Err(_)) => {
             if let Some(peer) = pending.resolve_peer.remove(&id) {
                 let _ = events.send(P2pEvent::PeerAddressResolutionFailed { peer });
+            } else if let Some(username) = pending.resolve_username.remove(&id) {
+                let _ = events.send(P2pEvent::UsernameResolutionFailed { username });
             }
         }
         QueryResult::PutRecord(Ok(PutRecordOk { .. })) => {
             if pending.announce.remove(&id) {
                 let _ = events.send(P2pEvent::AddressesAnnounced);
+            } else if let Some(username) = pending.announce_username.remove(&id) {
+                let _ = events.send(P2pEvent::UsernameAnnounced { username });
             }
         }
         QueryResult::PutRecord(Err(err)) => {
             if pending.announce.remove(&id) {
                 let _ = events.send(P2pEvent::AddressAnnouncementFailed { reason: err.to_string() });
+            } else if let Some(username) = pending.announce_username.remove(&id) {
+                let _ = events.send(P2pEvent::UsernameAnnouncementFailed {
+                    username,
+                    reason: err.to_string(),
+                });
             }
         }
         _ => {}

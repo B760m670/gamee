@@ -6,8 +6,8 @@
 //! contact cards → handshake → ratchet → persist → resume.
 
 use spiritchat_crypto_core_ffi::{
-    x3dh_initiate, x3dh_respond, FfiAgreementKey, FfiContactCard, FfiIdentity, FfiPrekeyStore,
-    FfiRatchet, FfiRecoveryPhrase,
+    identity_verify, x3dh_initiate, x3dh_respond, FfiAgreementKey, FfiContactCard, FfiIdentity,
+    FfiPrekeyStore, FfiRatchet, FfiRecoveryPhrase,
 };
 
 struct Party {
@@ -149,6 +149,25 @@ fn a_typo_in_the_recovery_phrase_is_rejected_before_it_can_derive_a_wrong_identi
     split[0] = "zzzznotarealbip39word";
     let mangled = split.join(" ");
     assert!(FfiRecoveryPhrase::from_words(mangled).is_err());
+}
+
+#[test]
+fn a_username_claim_signed_by_one_identity_does_not_verify_against_another() {
+    // This is the exact shape a @username DHT claim uses: sign the
+    // username itself, so the claim can't be replayed under a different
+    // name, and bind it to a specific public key nobody else can produce a
+    // valid signature for.
+    let alice = FfiIdentity::generate();
+    let bob = FfiIdentity::generate();
+
+    let username = b"alice".to_vec();
+    let signature = alice.sign(username.clone());
+
+    assert!(identity_verify(alice.public_key_bytes(), username.clone(), signature.clone()));
+    assert!(!identity_verify(bob.public_key_bytes(), username.clone(), signature.clone()));
+
+    // Signed for "alice" — must not verify as a claim for a different name.
+    assert!(!identity_verify(alice.public_key_bytes(), b"bob".to_vec(), signature));
 }
 
 #[test]

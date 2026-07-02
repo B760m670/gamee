@@ -22,6 +22,11 @@ export type P2pEvent =
   | { type: 'addressAnnouncementFailed'; reason: string }
   | { type: 'blobFetched'; peerId: string; id: string; localPath: string }
   | { type: 'blobFetchFailed'; peerId: string; id: string; reason: string }
+  | { type: 'usernameResolved'; username: string; publicKeyBase64: string; fingerprint: string; peerId: string }
+  | { type: 'usernameClaimInvalid'; username: string }
+  | { type: 'usernameResolutionFailed'; username: string }
+  | { type: 'usernameAnnounced'; username: string }
+  | { type: 'usernameAnnouncementFailed'; username: string; reason: string }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -35,12 +40,15 @@ const NativeCryptoCore = requireNativeModule<
     recoveryPhraseWords(): string | null
     fingerprint(): string
     publicKeyBase64(): string
+    signOut(): void
     p2pLocalPeerId(): string
     p2pDial(peerId: string, knownAddresses: string[]): void
     p2pResolvePeerAddresses(peerId: string): void
     p2pAnnounceAddresses(addresses: string[]): void
     p2pSendEnvelope(peerId: string, bytes: Uint8Array): void
     p2pReserveRelaySlot(relayAddress: string): void
+    p2pAnnounceUsername(username: string): void
+    p2pResolveUsername(username: string): void
     blobSaveFromFile(fileUri: string): string
     blobLocalPath(idHex: string): string | null
     blobClear(idHex: string): void
@@ -120,6 +128,19 @@ export function publicKeyBase64(): string {
 }
 
 /**
+ * Wipes this device's identity, agreement key, prekeys, and cached
+ * recovery phrase, and stops the P2P node built from them. There is no
+ * server session to invalidate — this local wipe is the entire effect.
+ * The only way back in afterward is `setIdentityFromWords` with the
+ * recovery phrase; if it wasn't saved, this is permanent. Caller is
+ * responsible for routing back to onboarding afterward — `hasIdentity()`
+ * is false again immediately after this returns.
+ */
+export function signOut(): void {
+  NativeCryptoCore.signOut()
+}
+
+/**
  * This device's libp2p PeerId, base58-encoded. The node behind it is
  * started once per app run (see P2pSession.swift) using the same identity
  * seed as `fingerprint()`/`publicKeyBase64()` above, and joins the public
@@ -189,4 +210,83 @@ export function blobReserve(idHex: string): boolean {
 /** Fetches blob `idHex` from `peerId` (dial first if not connected). Answered by a `blobFetched`/`blobFetchFailed` event. */
 export function p2pFetchBlob(peerId: string, idHex: string): void {
   NativeCryptoCore.p2pFetchBlob(peerId, idHex)
+}
+
+export type UsernameLookup =
+  | { status: 'resolved'; publicKeyBase64: string; fingerprint: string; peerId: string }
+  | { status: 'invalid' }
+  | { status: 'available' }
+
+/**
+ * Looks up `username` on the public DHT and waits for the answer — unlike
+ * the raw `p2pResolveUsername`/`onP2pEvent` pair everything else here
+ * uses, this one is worth wrapping in a promise because both "check
+ * before claiming" and "search for a contact by handle" want to await a
+ * single result rather than manage a listener themselves.
+ *
+ * This can only ever be an *exact* lookup: a DHT has no notion of "starts
+ * with", so there is no live-search-as-you-type or partial-match here —
+ * only "does this exact @handle currently resolve to someone verifiable".
+ *
+ * `'available'` means nothing verifiable is currently published — either
+ * genuinely nobody has claimed it, or whoever last claimed it let their
+ * DHT record expire without re-publishing. A plain DHT can't tell those
+ * apart, and can't stop a different identity from claiming the name out
+ * from under an inactive holder — this is advisory, not a reservation.
+ */
+export function lookupUsername(username: string, timeoutMs = 10_000): Promise<UsernameLookup> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe()
+      reject(new Error('Username lookup timed out'))
+    }, timeoutMs)
+
+    const unsubscribe = addP2pEventListener((event) => {
+      if (event.type === 'usernameResolved' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({ status: 'resolved', publicKeyBase64: event.publicKeyBase64, fingerprint: event.fingerprint, peerId: event.peerId })
+      } else if (event.type === 'usernameClaimInvalid' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({ status: 'invalid' })
+      } else if (event.type === 'usernameResolutionFailed' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve({ status: 'available' })
+      }
+    })
+
+    NativeCryptoCore.p2pResolveUsername(username)
+  })
+}
+
+/**
+ * Signs `username` with this device's identity and publishes the claim,
+ * waiting for confirmation. Callers should `lookupUsername` first and
+ * treat a `resolved` result from a *different* fingerprint as taken —
+ * this call itself doesn't check, and publishing here doesn't reserve the
+ * name against a determined second claimant (see `lookupUsername`'s doc).
+ */
+export function announceUsername(username: string, timeoutMs = 10_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe()
+      reject(new Error('Username announcement timed out'))
+    }, timeoutMs)
+
+    const unsubscribe = addP2pEventListener((event) => {
+      if (event.type === 'usernameAnnounced' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        resolve()
+      } else if (event.type === 'usernameAnnouncementFailed' && event.username === username) {
+        clearTimeout(timer)
+        unsubscribe()
+        reject(new Error(event.reason))
+      }
+    })
+
+    NativeCryptoCore.p2pAnnounceUsername(username)
+  })
 }

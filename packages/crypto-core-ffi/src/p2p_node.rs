@@ -27,6 +27,18 @@ fn runtime() -> &'static Runtime {
     })
 }
 
+/// Derives the libp2p `PeerId` a raw 32-byte Ed25519 public key would
+/// produce as a network identity. Lets a resolved username claim (which
+/// only carries a public key, see `identity_fingerprint_of_public_key`) be
+/// turned into something dialable via `dial`, without the claim needing to
+/// separately publish its PeerId.
+#[uniffi::export]
+pub fn p2p_peer_id_from_public_key(public_key: Vec<u8>) -> FfiResult<String> {
+    spiritchat_p2p_core::peer_id_from_public_key(&public_key)
+        .map(|peer_id| peer_id.to_string())
+        .map_err(|err| FfiError::P2p { reason: err.to_string() })
+}
+
 fn parse_peer_id(text: &str) -> FfiResult<PeerId> {
     PeerId::from_str(text).map_err(|err| FfiError::P2p {
         reason: format!("invalid peer id {text:?}: {err}"),
@@ -149,9 +161,36 @@ impl FfiP2pNode {
         self.send(Command::FetchBlob { peer, id })
     }
 
+    /// Publishes `claim` under the DHT key derived from `username`.
+    /// `claim` should be self-certifying (e.g. a public key plus a
+    /// signature over the username — see `identity_verify`) since this
+    /// layer doesn't verify it; a plain DHT can't arbitrate who claimed a
+    /// name first, so this doesn't reserve it against a determined second
+    /// claimant, only against accidental collisions. Answered by
+    /// `UsernameAnnounced`/`UsernameAnnouncementFailed`.
+    pub fn announce_username(&self, username: String, claim: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::AnnounceUsername { username, claim })
+    }
+
+    /// Looks up whatever claim is currently published for `username`.
+    /// Answered by `UsernameResolved`/`UsernameResolutionFailed` — verify
+    /// the returned claim (`identity_verify`) before trusting it; this
+    /// layer only fetches whatever bytes are stored, it doesn't check them.
+    pub fn resolve_username(&self, username: String) -> FfiResult<()> {
+        self.send(Command::ResolveUsername { username })
+    }
+
+    /// Cleanly stops this node — after this, `next_event` returns `None`.
+    /// For "sign out": the identity this node was built from is going
+    /// away, and a new one needs a new node, not a reused one. Dropping
+    /// every `FfiP2pNode` reference alone isn't enough while something
+    /// (e.g. an active `next_event` polling loop) still holds one.
+    pub fn shutdown(&self) -> FfiResult<()> {
+        self.send(Command::Shutdown)
+    }
+
     /// Waits for the next event. Call this in a loop — it never stops on
-    /// its own; it only returns `None` if the node has been shut down
-    /// (dropping every `FfiP2pNode` reference stops it).
+    /// its own; it only returns `None` after `shutdown()`.
     pub async fn next_event(&self) -> Option<FfiP2pEvent> {
         let event_loop = Arc::clone(&self.event_loop);
         runtime()
