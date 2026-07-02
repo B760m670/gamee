@@ -176,6 +176,14 @@ jobs:
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           SIZE="$(stat -f%z dist/App-unsigned.ipa)"
           BUNDLE_ID="$(node -e "console.log(require('./app.json').expo.ios.bundleIdentifier)")"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/ios-dev/App-unsigned.ipa"
+          # AltSource parsers disagree on where the download lives: older
+          # ones (and AltStore itself) read the flat version/downloadURL/size
+          # fields directly on the app object; newer ones (LiveContainer
+          # included) read a per-version entry from a nested "versions"
+          # array and error ("no IPA specified") if that array is missing or
+          # empty, even with the flat fields present. Emitting both is a
+          # pure superset, so every parser finds what it's looking for.
           cat > dist/source.json <<EOF
           {
             "name": "SpiritChat Dev",
@@ -189,8 +197,17 @@ jobs:
                 "versionDate": "$DATE",
                 "versionDescription": "${{ github.sha }}",
                 "localizedDescription": "SpiritChat — decentralized end-to-end-encrypted messenger (unsigned dev build, sideloaded via SideStore/LiveContainer).",
-                "downloadURL": "https://github.com/${{ github.repository }}/releases/download/ios-dev/App-unsigned.ipa",
-                "size": $SIZE
+                "downloadURL": "$DOWNLOAD_URL",
+                "size": $SIZE,
+                "versions": [
+                  {
+                    "version": "$VERSION",
+                    "date": "$DATE",
+                    "localizedDescription": "${{ github.sha }}",
+                    "downloadURL": "$DOWNLOAD_URL",
+                    "size": $SIZE
+                  }
+                ]
               }
             ]
           }
