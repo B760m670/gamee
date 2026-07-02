@@ -28,6 +28,10 @@ export default function RestoreAccountScreen() {
     try {
       setIdentityFromWords(normalized)
       await bootstrap()
+      // See create.tsx's identical comment: this screen is also reachable
+      // via "add account" from deep in Settings → Accounts, not just
+      // fresh onboarding.
+      router.dismissAll()
       router.replace('/(tabs)/messages')
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Неверная фраза восстановления')

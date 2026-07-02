@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import {
+  hasIdentity,
   fingerprint as cryptoCoreFingerprint,
   publicKeyBase64,
   p2pLocalPeerId,
@@ -12,6 +13,11 @@ import {
   queryLedgerUsernameOwner,
   submitLedgerUsernameClaim,
   signOut as nativeSignOut,
+  accountSlots as nativeAccountSlots,
+  activeAccountSlot,
+  switchAccount as nativeSwitchAccount,
+  removeAccount as nativeRemoveAccount,
+  type AccountSlot,
 } from '../modules/spiritchat-crypto-core'
 
 // Namespaced by fingerprint rather than fixed keys: this device's Keychain
@@ -21,7 +27,7 @@ import {
 // into. Namespacing gets both for free — a different identity simply reads
 // under a different, empty namespace — without `signOut` needing to
 // actively delete anything (see `signOut`'s own doc comment below).
-const displayNameKey = (fingerprint: string) => `profile.${fingerprint}.displayName`
+export const displayNameKey = (fingerprint: string) => `profile.${fingerprint}.displayName`
 const bioKey         = (fingerprint: string) => `profile.${fingerprint}.bio`
 const avatarIdKey    = (fingerprint: string) => `profile.${fingerprint}.avatarId`
 const usernameKey    = (fingerprint: string) => `profile.${fingerprint}.username`
@@ -69,6 +75,10 @@ interface ProfileState {
   avatarId:        string | null
   avatarLocalPath: string | null
   username:        string | null
+  /** Every account registered on this device (up to 3) — for the account switcher. */
+  accounts:        AccountSlot[]
+  /** Which entry in `accounts` this store's other fields currently reflect. */
+  activeSlot:      number
 
   bootstrap:          () => Promise<void>
   setDisplayName:     (name: string) => Promise<void>
@@ -77,6 +87,10 @@ interface ProfileState {
   clearAvatar:        () => Promise<void>
   persistUsername:    (username: string) => Promise<void>
   signOut:            () => Promise<void>
+  /** Instant — no recovery phrase needed for a slot already on this device. */
+  switchAccount:      (slot: number) => Promise<void>
+  /** Permanent — the only way back into `slot` afterward is its own recovery phrase. */
+  removeAccount:      (slot: number) => Promise<void>
 }
 
 /** How often to retry reading `peerId` while P2P hasn't come up yet. */
@@ -97,12 +111,16 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
   avatarId:        null,
   avatarLocalPath: null,
   username:        null,
+  accounts:        [],
+  activeSlot:      0,
 
   bootstrap: async () => {
     // Read first — the identity is already real the moment this runs
     // (bootstrap only ever follows `hasIdentity()`/`setIdentityFromWords`
     // succeeding), and every local key below is namespaced by it.
     const fingerprint = cryptoCoreFingerprint()
+    const accounts = nativeAccountSlots()
+    const activeSlot = activeAccountSlot()
 
     const [storedName, storedBio, storedAvatarId, storedUsername] = await Promise.all([
       AsyncStorage.getItem(displayNameKey(fingerprint)),
@@ -137,6 +155,8 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
       avatarId,
       avatarLocalPath: avatarId ? blobLocalPath(avatarId) : null,
       username:        storedUsername,
+      accounts,
+      activeSlot,
     })
 
     // P2pSession.swift retries starting the node in the background on its
@@ -230,15 +250,49 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     set({ username: username || null })
   },
 
-  // There is no server session to invalidate — this just forgets the
-  // Keychain identity (see IdentitySession.signOut) this device currently
-  // has loaded. The local labels above are namespaced by fingerprint, not
-  // wiped here: if the *same* identity is restored later (its own
-  // recovery phrase is the only way back in), its display name/bio/avatar/
-  // username come back with it, while a genuinely *different* identity
-  // simply reads under its own, empty namespace and never sees them.
+  // There is no server session to invalidate — this permanently forgets
+  // the *active* Keychain identity (see IdentitySession.removeSlot). The
+  // local labels above are namespaced by fingerprint, not wiped here: if
+  // the *same* identity is ever registered on this device again (its own
+  // recovery phrase is the only way back in), its display name/bio/
+  // avatar/username come back with it, while a genuinely *different*
+  // identity simply reads under its own, empty namespace and never sees
+  // them. If another account is also registered on this device, it
+  // becomes active automatically (see `afterAccountChange`) instead of
+  // forcing a trip through onboarding.
   signOut: async () => {
     nativeSignOut()
+    await afterAccountChange(set, get)
+  },
+
+  // Instant — every registered slot's full key material already lives in
+  // this device's Keychain, so switching never needs a recovery phrase.
+  switchAccount: async (slot) => {
+    nativeSwitchAccount(slot)
+    await afterAccountChange(set, get)
+  },
+
+  // Permanent removal of `slot`, regardless of whether it's active — see
+  // `signOut`'s doc comment for the same "falls back to another account
+  // if one exists" behavior when it is.
+  removeAccount: async (slot) => {
+    nativeRemoveAccount(slot)
+    await afterAccountChange(set, get)
+  },
+}))
+
+// Shared by signOut/switchAccount/removeAccount: all three can leave this
+// device either still logged into *some* account (the new active one, or
+// a fallback the native side already switched to) or logged into none —
+// re-bootstrap in the first case, reset to the empty pre-onboarding state
+// in the second, rather than duplicating this check in three places.
+async function afterAccountChange(
+  set: (partial: Partial<ProfileState>) => void,
+  get: () => ProfileState
+) {
+  if (hasIdentity()) {
+    await get().bootstrap()
+  } else {
     set({
       isReady:         false,
       fingerprint:     '',
@@ -250,6 +304,8 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
       avatarId:        null,
       avatarLocalPath: null,
       username:        null,
+      accounts:        [],
+      activeSlot:      0,
     })
-  },
-}))
+  }
+}

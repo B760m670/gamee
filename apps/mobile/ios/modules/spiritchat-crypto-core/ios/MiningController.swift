@@ -31,7 +31,7 @@ final class MiningController {
   /// background executor, not the main actor; the `signOut` `Function`
   /// closure, whose thread this module makes no assumption about) can't be
   /// trusted to already be on it. Synchronous rather than `.async`: `stop()`
-  /// is called right before `P2pSession.signOut()`/`IdentitySession.signOut()`
+  /// is called right before `P2pSession.signOut()`/`IdentitySession.removeSlot`
   /// wipe the very session it needs to send `stopMining` to — an async hop
   /// would race that wipe and could silently no-op, leaving a mining
   /// attempt to keep grinding after sign-out instead of actually stopping.

@@ -55,6 +55,10 @@ const NativeCryptoCore = requireNativeModule<
     fingerprint(): string
     publicKeyBase64(): string
     signOut(): void
+    accountSlots(): { slot: number; fingerprint: string }[]
+    activeAccountSlot(): number
+    switchAccount(slot: number): void
+    removeAccount(slot: number): void
     p2pLocalPeerId(): string
     p2pIsReady(): boolean
     p2pLastStartupErrorDescription(): string | null
@@ -152,16 +156,60 @@ export function publicKeyBase64(): string {
 }
 
 /**
- * Wipes this device's identity, agreement key, prekeys, and cached
- * recovery phrase, and stops the P2P node built from them. There is no
- * server session to invalidate — this local wipe is the entire effect.
- * The only way back in afterward is `setIdentityFromWords` with the
- * recovery phrase; if it wasn't saved, this is permanent. Caller is
- * responsible for routing back to onboarding afterward — `hasIdentity()`
- * is false again immediately after this returns.
+ * Permanently wipes the *active* account's identity, agreement key,
+ * prekeys, and cached recovery phrase, and stops the P2P node built from
+ * them. There is no server session to invalidate — this local wipe is the
+ * entire effect. The only way back in afterward is `setIdentityFromWords`
+ * with its recovery phrase; if it wasn't saved, this is permanent.
+ *
+ * If another account is also registered on this device (see
+ * `accountSlots`), it becomes active automatically — `hasIdentity()` only
+ * goes false if this was the last one, so the caller should check it
+ * afterward rather than assuming a trip back to onboarding is always
+ * needed.
  */
 export function signOut(): void {
   NativeCryptoCore.signOut()
+}
+
+export type AccountSlot = { slot: number; fingerprint: string }
+
+/**
+ * Every account currently registered on this device (up to 3), each with
+ * its own Keychain-backed identity — for an account-switcher UI. Order is
+ * by slot index, not recency.
+ */
+export function accountSlots(): AccountSlot[] {
+  return NativeCryptoCore.accountSlots()
+}
+
+/** Which slot `fingerprint()`/`publicKeyBase64()`/the P2P node currently reflect. */
+export function activeAccountSlot(): number {
+  return NativeCryptoCore.activeAccountSlot()
+}
+
+/**
+ * Switches to an already-registered `slot` — instant, no recovery phrase
+ * needed, since every registered slot's full key material already lives
+ * in this device's Keychain (the phrase is only needed again to add a
+ * slot this device has never seen before, via `setIdentityFromWords`).
+ * Throws if `slot` has nothing stored in it. Tears down and restarts the
+ * P2P node for the new identity — callers should treat this like a fresh
+ * `bootstrap()`, not an in-place update.
+ */
+export function switchAccount(slot: number): void {
+  NativeCryptoCore.switchAccount(slot)
+}
+
+/**
+ * Permanently removes `slot` regardless of whether it's currently active
+ * — the only way back in afterward is that slot's own recovery phrase. If
+ * it was active, another registered slot (if any) becomes active
+ * automatically; see `signOut`'s doc comment for the same fallback
+ * behavior.
+ */
+export function removeAccount(slot: number): void {
+  NativeCryptoCore.removeAccount(slot)
 }
 
 /**

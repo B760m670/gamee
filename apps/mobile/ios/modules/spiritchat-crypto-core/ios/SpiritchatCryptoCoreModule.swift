@@ -19,6 +19,24 @@ private func requireP2pSession() throws -> P2pSession {
   return session
 }
 
+/// Shared by `signOut` (always the active slot) and `removeAccount` (an
+/// explicit slot, which may or may not be active) — permanently deletes
+/// `slot`'s Keychain data, tearing down the running P2P node/mining first
+/// if `slot` was the one they belonged to, then falls back to whichever
+/// other account slot comes first (if any) so removing one account you're
+/// still signed into others doesn't force a trip through onboarding.
+private func removeAccountSlot(_ slot: Int) throws {
+  let wasActive = slot == IdentitySession.activeSlot
+  if wasActive {
+    MiningController.shared.stop()
+    P2pSession.signOut()
+  }
+  IdentitySession.removeSlot(slot)
+  if wasActive, let fallback = IdentitySession.occupiedSlots().first {
+    try IdentitySession.switchTo(slot: fallback)
+  }
+}
+
 public class SpiritchatCryptoCoreModule: Module {
   public func definition() -> ModuleDefinition {
     Name("SpiritchatCryptoCore")
@@ -72,16 +90,48 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireIdentity().publicKeyBytes.base64EncodedString()
     }
 
-    // Wipes this device's identity — the only way back in afterward is the
-    // recovery phrase (see IdentitySession.signOut). Also stops the P2P
-    // node built from it, so `p2pSession.shared` starts a genuinely fresh
-    // one for whatever identity gets created/restored next, rather than
-    // reusing this one's now-meaningless connections. There is no server
+    // Permanently removes the *active* account — the only way back in
+    // afterward is its recovery phrase. If another account is also
+    // registered on this device (see `accountSlots`), it becomes active
+    // automatically instead of dropping into onboarding; `hasIdentity()`
+    // only goes false if this was the last one. There is no server
     // session to invalidate; this local wipe is the entire effect.
-    Function("signOut") { () in
+    Function("signOut") { () throws in
+      try removeAccountSlot(IdentitySession.activeSlot)
+    }
+
+    // Every account currently registered on this device (up to
+    // `IdentitySession.maxSlots`), each in its own Keychain namespace —
+    // for an account-switcher UI. Switching (`switchAccount`) is instant
+    // and needs no re-authentication, since every slot's full key material
+    // already lives in this device's Keychain; the recovery phrase is only
+    // needed again to add a slot this device has never seen before.
+    Function("accountSlots") { () -> [[String: Any]] in
+      IdentitySession.occupiedSlots().map { slot in
+        ["slot": slot, "fingerprint": IdentitySession.peekFingerprint(slot: slot) ?? ""]
+      }
+    }
+
+    Function("activeAccountSlot") { () -> Int in
+      IdentitySession.activeSlot
+    }
+
+    // Switches to an already-registered `slot` — throws if it's empty.
+    // Tears down the current account's P2P node/mining first (each
+    // account has its own PeerId, so the swarm can't just be relabeled in
+    // place) and lets it lazily restart for the new identity, the same way
+    // it does on a normal launch.
+    Function("switchAccount") { (slot: Int) throws in
       MiningController.shared.stop()
       P2pSession.signOut()
-      IdentitySession.signOut()
+      try IdentitySession.switchTo(slot: slot)
+    }
+
+    // Permanently removes `slot` regardless of whether it's the active
+    // account — see `removeAccountSlot`'s doc comment for the fallback
+    // behavior when it is.
+    Function("removeAccount") { (slot: Int) throws in
+      try removeAccountSlot(slot)
     }
 
     Events("onP2pEvent")

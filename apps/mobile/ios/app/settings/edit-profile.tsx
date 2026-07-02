@@ -11,6 +11,7 @@ import { useProfileStore } from '../../store/profile'
 import { Avatar } from '../../components/Avatar'
 import { useAvatarUpload } from '../../hooks/useAvatarUpload'
 import { AvatarEditorModal } from '../../components/AvatarEditorModal'
+import { navigateAfterAccountChange } from '../../utils/navigation'
 
 const AVATAR_SIZE = 100
 const BTN_H       = 44
@@ -18,12 +19,13 @@ const BTN_H       = 44
 export default function EditProfileScreen() {
   const insets = useSafeAreaInsets()
   const router  = useRouter()
-  const { displayName, bio, fingerprint, avatarLocalPath, username, setDisplayName, setBio, signOut } = useProfileStore(s => ({
+  const { displayName, bio, fingerprint, avatarLocalPath, username, accounts, setDisplayName, setBio, signOut } = useProfileStore(s => ({
     displayName:     s.displayName,
     bio:             s.bio,
     fingerprint:     s.fingerprint,
     avatarLocalPath: s.avatarLocalPath,
     username:        s.username,
+    accounts:        s.accounts,
     setDisplayName:  s.setDisplayName,
     setBio:          s.setBio,
     signOut:         s.signOut,
@@ -50,9 +52,12 @@ export default function EditProfileScreen() {
   }
 
   function handleSignOutPress() {
+    const otherAccountRemains = accounts.length > 1
     Alert.alert(
       'Выйти из аккаунта?',
-      'Здесь нет сервера — вернуться обратно можно только по фразе восстановления. Убедись, что сохранил её (Настройки → Фраза восстановления), иначе аккаунт будет утерян навсегда.',
+      otherAccountRemains
+        ? 'Вернуться обратно можно только по фразе восстановления этого аккаунта. Другой зарегистрированный на устройстве аккаунт станет активным.'
+        : 'Здесь нет сервера — вернуться обратно можно только по фразе восстановления. Убедись, что сохранил её (Настройки → Фраза восстановления), иначе аккаунт будет утерян навсегда.',
       [
         { text: 'Отмена', style: 'cancel' },
         {
@@ -60,15 +65,7 @@ export default function EditProfileScreen() {
           style: 'destructive',
           onPress: async () => {
             await signOut()
-            // `replace` alone only swaps the current screen — this route
-            // was reached via `push` from somewhere inside `(tabs)`, which
-            // stays buried underneath in the stack's history. Without
-            // `dismissAll` first, a later back-navigation (even from deep
-            // inside onboarding, e.g. a swipe-back on create/restore) can
-            // pop past onboarding into that stale authenticated screen
-            // instead of actually returning to it fresh.
-            router.dismissAll()
-            router.replace('/(onboarding)/welcome')
+            navigateAfterAccountChange(router)
           },
         },
       ]
@@ -174,6 +171,16 @@ export default function EditProfileScreen() {
         >
           <View style={s.fieldRow}>
             <Text style={s.recoveryLabel}>Фраза восстановления</Text>
+          </View>
+        </Pressable>
+
+        <Pressable
+          style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
+          onPress={() => router.push('/settings/accounts')}
+        >
+          <View style={s.fieldRow}>
+            <Text style={s.fieldLabel}>Аккаунты</Text>
+            <Text style={s.usernameValue}>{`${accounts.length} из 3`}</Text>
           </View>
         </Pressable>
 

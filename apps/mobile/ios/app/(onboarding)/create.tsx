@@ -29,6 +29,12 @@ export default function CreateAccountScreen() {
     try {
       setIdentityFromWords(words.join(' '))
       await bootstrap()
+      // This screen is reachable two ways: fresh onboarding (nothing else
+      // in the stack, dismissAll is a no-op) and "add account" from deep
+      // in Settings → Accounts (where it isn't) — dismissAll before
+      // replacing keeps a later back-navigation from popping into a
+      // stale, pre-switch settings screen either way.
+      router.dismissAll()
       router.replace('/(tabs)/messages')
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Не удалось создать аккаунт')
