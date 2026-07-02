@@ -1,4 +1,5 @@
 use libp2p::{Multiaddr, PeerId};
+use spiritchat_ledger_core::{Block, Transaction};
 
 /// What the app asks this crate's event loop to do. Sent over a channel
 /// rather than called directly, since the `Swarm` only exists inside the
@@ -67,7 +68,43 @@ pub enum Command {
 
     /// Looks up whatever claim is currently published for `username`.
     /// Answered by `P2pEvent::UsernameResolved`/`UsernameResolutionFailed`.
+    ///
+    /// Deprecated: this is the DHT-based best-effort claim system (see
+    /// `username.rs`'s own doc comment for exactly what it can't
+    /// guarantee). It's being replaced by the `@username` ledger below
+    /// (`SubmitUsernameClaim`/`QueryUsernameOwner`), which gives a real
+    /// first-claim-wins guarantee instead of an advisory one — kept for
+    /// now only so the already-shipped DHT-based feature keeps working
+    /// until the app layer cuts over to the ledger.
     ResolveUsername { username: String },
+
+    /// Broadcasts an already-signed `@username` claim to the ledger's
+    /// mempool topic, so *any* connected peer's miner (not just this
+    /// node's own, if it mines at all) can pick it up and include it in a
+    /// block. This alone does not reserve or confirm the name — it only
+    /// gets the claim in front of the network; watch for
+    /// `P2pEvent::ChainTipChanged` to see whether/when it actually lands.
+    SubmitUsernameClaim { transaction: Transaction },
+
+    /// Submits an already-mined, already-valid `@username` ledger block —
+    /// validates and applies it locally exactly like one received over
+    /// gossip, then gossips it onward. This is the primitive both the
+    /// real mining loop (Phase 5) and multi-node tests use; it does not
+    /// mine anything itself.
+    SubmitMinedBlock { block: Block },
+
+    /// Answers from this node's own local materialized ledger state only
+    /// — no network round trip, since once synced this node's view of the
+    /// chain *is* the answer, not something to ask a peer for on every
+    /// lookup. Answered by
+    /// `P2pEvent::UsernameOwnerResolved`/`UsernameOwnerNotFound`.
+    QueryUsernameOwner { username: String },
+
+    /// Asks `peer` for its current chain tip and, if it's heavier than
+    /// this node's own, fetches and applies whatever blocks are missing.
+    /// Answered by `P2pEvent::ChainSyncCompleted`/`ChainSyncFailed`. Dial
+    /// first if not already connected.
+    RequestChainSync { peer: PeerId },
 
     /// Cleanly stops the event loop — after this, `next_event` returns
     /// `None` and the node can no longer be used; a new identity needs a

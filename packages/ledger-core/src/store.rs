@@ -161,6 +161,25 @@ impl ChainStore {
         self.chain.username_owner(username)
     }
 
+    pub fn tip_cumulative_work(&self) -> f64 {
+        self.chain.get_meta(&self.chain.tip_hash()).expect("tip is always known").cumulative_work
+    }
+
+    /// The full block at canonical `height`, if this node still has its
+    /// body (i.e. `height` is at or above the current floor) — used to
+    /// answer a peer's `GetBlocks` sync request.
+    pub fn canonical_block_at(&self, height: u64) -> Option<&Block> {
+        self.chain.canonical_block_at(height)
+    }
+
+    /// A checkpoint at the current tip, for answering a peer's
+    /// `GetUsernameOwnerSnapshot` sync request — the requester treats this
+    /// as an untrusted candidate until independently corroborated, never
+    /// trusted outright (see `ledger.rs`'s doc comment in `p2p-core`).
+    pub fn checkpoint_at_tip(&self) -> Checkpoint {
+        self.chain.checkpoint_at_tip()
+    }
+
     /// Validates and durably accepts `block`. Returns the same
     /// `ApplyOutcome` `Chain::try_apply` would, and only touches disk at
     /// all if the outcome isn't `AlreadyKnown`.

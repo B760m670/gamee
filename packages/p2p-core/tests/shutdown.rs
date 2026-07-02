@@ -6,7 +6,8 @@ use spiritchat_p2p_core::{Command, P2pNode};
 
 #[tokio::test]
 async fn shutdown_makes_next_event_return_none() {
-    let mut node = P2pNode::spawn_with_bootstrap([13u8; 32], vec![]).unwrap();
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let mut node = P2pNode::spawn_with_bootstrap([13u8; 32], vec![], ledger_dir.path().join("ledger.redb")).unwrap();
 
     node.command(Command::Shutdown).unwrap();
 

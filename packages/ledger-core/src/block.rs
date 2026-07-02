@@ -16,8 +16,14 @@ pub const MAX_BLOCK_BYTES: usize = 16 * 1024;
 
 /// Fixed at compile time — every node agrees on this out of band, the same
 /// way every Bitcoin client has genesis hardcoded. Never validated, only
-/// matched against.
-pub const GENESIS_TIMESTAMP: u64 = 1_800_000_000; // 2027-01-15T08:00:00Z, arbitrary fixed epoch for this chain
+/// matched against. Deliberately set safely in the *past* relative to
+/// this chain's real launch, not just "some round number" — a genesis
+/// timestamp that turns out to be in the future relative to a real
+/// device's clock would make every block's median-time-past check
+/// (`timestamp > median of last 11 ancestors`) reject any honestly-timed
+/// first block, since a real "now" would then be *earlier* than genesis
+/// itself.
+pub const GENESIS_TIMESTAMP: u64 = 1_750_000_000; // 2025-06-15T08:40:00Z
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {

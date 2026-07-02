@@ -6,12 +6,14 @@
 use std::time::Duration;
 
 use libp2p::{
-    dcutr, identify, kad, mdns, relay,
+    dcutr, gossipsub, identify, kad, mdns, relay,
     request_response::{self, ProtocolSupport},
     swarm::NetworkBehaviour,
     PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 
 /// The wire protocol for delivering an already-encrypted message envelope
 /// (an X3DH initial message or a Double Ratchet ciphertext, produced by
@@ -52,6 +54,13 @@ pub struct Behaviour {
     pub dcutr: dcutr::Behaviour,
     pub envelope: request_response::cbor::Behaviour<Vec<u8>, Vec<u8>>,
     pub blob: request_response::cbor::Behaviour<Vec<u8>, BlobResponse>,
+    /// Propagates new `@username` ledger blocks and not-yet-mined claims
+    /// (see `ledger.rs`) — gossip, not the DHT, since these need to reach
+    /// every node eventually, not be looked up on demand by key.
+    pub ledger_gossip: gossipsub::Behaviour,
+    /// Catches a lagging or brand-new peer up on the ledger — gossip
+    /// alone only ever delivers new blocks going forward.
+    pub ledger_sync: request_response::cbor::Behaviour<ChainSyncRequest, ChainSyncResponse>,
 }
 
 pub fn build(
@@ -83,6 +92,18 @@ pub fn build(
     let mut kad = kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), kad_config);
     kad.set_mode(Some(kad::Mode::Server));
 
+    // Signed (not Anonymous) message authenticity: `propagation_source` on
+    // a received `Message` is still just "who forwarded it to us" either
+    // way, but signing lets misbehaving-peer scoring attribute a message
+    // to the peer that actually authored it, not just whoever relayed it
+    // last — a real (if partial) mitigation for the ledger's own honest
+    // early-network 51%-hashrate exposure, since it at least makes
+    // spamming implausible blocks/claims attributable.
+    let mut ledger_gossip = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(key.clone()), gossipsub::Config::default())
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
+    ledger_gossip.subscribe(&ledger::blocks_topic())?;
+    ledger_gossip.subscribe(&ledger::txs_topic())?;
+
     Ok(Behaviour {
         kad,
         mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
@@ -101,6 +122,11 @@ pub fn build(
         blob: request_response::cbor::Behaviour::new(
             [(BLOB_PROTOCOL, ProtocolSupport::Full)],
             request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
+        ),
+        ledger_gossip,
+        ledger_sync: request_response::cbor::Behaviour::new(
+            [(ledger::CHAIN_SYNC_PROTOCOL, ProtocolSupport::Full)],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         ),
     })
 }

@@ -29,6 +29,12 @@ pub enum FfiP2pEvent {
     UsernameResolutionFailed { username: String },
     UsernameAnnounced { username: String },
     UsernameAnnouncementFailed { username: String, reason: String },
+    ChainTipChanged { height: u64, hash: String },
+    LedgerSubmissionRejected { reason: String },
+    UsernameOwnerResolved { username: String, owner_public_key: Vec<u8>, claimed_at_height: u64 },
+    UsernameOwnerNotFound { username: String },
+    ChainSyncCompleted { height: u64 },
+    ChainSyncFailed { peer_id: String, reason: String },
 }
 
 impl From<P2pEvent> for FfiP2pEvent {
@@ -76,6 +82,16 @@ impl From<P2pEvent> for FfiP2pEvent {
             P2pEvent::UsernameAnnounced { username } => Self::UsernameAnnounced { username },
             P2pEvent::UsernameAnnouncementFailed { username, reason } => {
                 Self::UsernameAnnouncementFailed { username, reason }
+            }
+            P2pEvent::ChainTipChanged { height, hash } => Self::ChainTipChanged { height, hash },
+            P2pEvent::LedgerSubmissionRejected { reason } => Self::LedgerSubmissionRejected { reason },
+            P2pEvent::UsernameOwnerResolved { username, owner_public_key, claimed_at_height } => {
+                Self::UsernameOwnerResolved { username, owner_public_key, claimed_at_height }
+            }
+            P2pEvent::UsernameOwnerNotFound { username } => Self::UsernameOwnerNotFound { username },
+            P2pEvent::ChainSyncCompleted { height } => Self::ChainSyncCompleted { height },
+            P2pEvent::ChainSyncFailed { peer, reason } => {
+                Self::ChainSyncFailed { peer_id: peer.to_string(), reason }
             }
         }
     }

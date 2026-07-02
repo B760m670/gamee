@@ -11,13 +11,27 @@ final class P2pSession {
 
   private init(identitySeed: Data) {
     do {
-      node = try FfiP2pNode.spawn(identitySeed: identitySeed)
+      node = try FfiP2pNode.spawn(identitySeed: identitySeed, ledgerDataDir: Self.ledgerDatabasePath.path)
     } catch {
       // Mirrors IdentitySession's fatalError: a node that silently failed
       // to start would leave the app looking connected while never sending
       // or receiving anything.
       fatalError("Failed to start the P2P node: \(error)")
     }
+  }
+
+  /// Where the `@username` ledger's on-disk `redb` database file lives —
+  /// mirrors `BlobStore.swift`'s own `applicationSupportDirectory`
+  /// convention, but points at a single file, not a directory (`redb`
+  /// creates/opens one file, the same as any other embedded database).
+  /// One shared file (not per-identity): the ledger is a single public
+  /// chain everyone eventually converges on, not per-account state the
+  /// way Keychain-stored secrets are.
+  private static var ledgerDatabasePath: URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    let dir = base.appendingPathComponent("Ledger", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("ledger.redb")
   }
 
   /// `nil` until `IdentitySession.shared` exists — the node's identity
@@ -108,6 +122,23 @@ final class P2pSession {
       return ["type": "usernameAnnounced", "username": username]
     case .usernameAnnouncementFailed(let username, let reason):
       return ["type": "usernameAnnouncementFailed", "username": username, "reason": reason]
+    case .chainTipChanged(let height, let hash):
+      return ["type": "chainTipChanged", "height": height, "hash": hash]
+    case .ledgerSubmissionRejected(let reason):
+      return ["type": "ledgerSubmissionRejected", "reason": reason]
+    case .usernameOwnerResolved(let username, let ownerPublicKey, let claimedAtHeight):
+      return [
+        "type": "usernameOwnerResolved",
+        "username": username,
+        "ownerPublicKeyBase64": ownerPublicKey.base64EncodedString(),
+        "claimedAtHeight": claimedAtHeight,
+      ]
+    case .usernameOwnerNotFound(let username):
+      return ["type": "usernameOwnerNotFound", "username": username]
+    case .chainSyncCompleted(let height):
+      return ["type": "chainSyncCompleted", "height": height]
+    case .chainSyncFailed(let peerId, let reason):
+      return ["type": "chainSyncFailed", "peerId": peerId, "reason": reason]
     }
   }
 }

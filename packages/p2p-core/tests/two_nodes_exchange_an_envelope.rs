@@ -9,8 +9,10 @@ use spiritchat_p2p_core::{Command, P2pEvent, P2pNode};
 
 #[tokio::test]
 async fn alice_dials_bob_directly_and_they_exchange_an_envelope() {
-    let mut alice = P2pNode::spawn_with_bootstrap([1u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([2u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([1u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([2u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let bob_peer_id = bob.local_peer_id();
 
     // Wait for bob to report a concrete listen address (skip the 0.0.0.0
@@ -74,8 +76,10 @@ async fn a_peer_can_announce_and_resolve_its_own_addresses_via_the_dht() {
     // Two directly-connected nodes act as each other's DHT peers for this
     // test — no public bootstrap network involved, but it exercises the
     // exact put_record/get_record path a real global lookup would use.
-    let mut alice = P2pNode::spawn_with_bootstrap([3u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([4u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([3u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([4u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let alice_peer_id = alice.local_peer_id();
     let bob_peer_id = bob.local_peer_id();
 

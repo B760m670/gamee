@@ -79,4 +79,30 @@ pub enum P2pEvent {
     /// `Command::AnnounceUsername` finished publishing to the DHT.
     UsernameAnnounced { username: String },
     UsernameAnnouncementFailed { username: String, reason: String },
+
+    /// This node's `@username` ledger chain tip changed — either extended
+    /// normally or via a reorg onto a heavier branch. The app layer
+    /// derives pending/confirming/confirmed UI state for any claim it's
+    /// tracking by comparing `height` against the height that claim
+    /// landed at, rather than this crate needing to know which usernames
+    /// the app cares about.
+    ChainTipChanged { height: u64, hash: String },
+
+    /// `Command::SubmitUsernameClaim` or `Command::SubmitMinedBlock`
+    /// failed local validation (e.g. the username's already claimed, or
+    /// the block's proof-of-work doesn't check out) — never broadcast.
+    LedgerSubmissionRejected { reason: String },
+
+    /// `Command::QueryUsernameOwner` found a current owner in this node's
+    /// local materialized ledger state.
+    UsernameOwnerResolved { username: String, owner_public_key: Vec<u8>, claimed_at_height: u64 },
+    /// Nobody has a winning claim for `username` on this node's current
+    /// view of the chain.
+    UsernameOwnerNotFound { username: String },
+
+    /// `Command::RequestChainSync` finished catching up to `peer`'s tip
+    /// (or confirmed this node's own tip was already at least as heavy —
+    /// also a success).
+    ChainSyncCompleted { height: u64 },
+    ChainSyncFailed { peer: PeerId, reason: String },
 }

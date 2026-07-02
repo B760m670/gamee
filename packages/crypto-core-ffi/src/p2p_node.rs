@@ -71,8 +71,14 @@ impl FfiP2pNode {
     /// Starts a node using `identity_seed` — the same 32-byte seed as
     /// `FfiIdentity::secret_bytes()` — and joins the public IPFS DHT for
     /// global reachability (see `spiritchat_p2p_core::bootstrap`).
+    /// `ledger_data_dir` is a real, writable, per-identity directory for
+    /// the `@username` ledger's on-disk database — the first state this
+    /// crate persists directly rather than leaving to the app (see
+    /// `spiritchat_p2p_core::P2pNode::spawn`'s doc comment); the caller
+    /// (Swift on iOS) is responsible for picking it, the same way
+    /// `BlobStore.swift` already picks its own cache directory.
     #[uniffi::constructor]
-    pub fn spawn(identity_seed: Vec<u8>) -> FfiResult<Arc<Self>> {
+    pub fn spawn(identity_seed: Vec<u8>, ledger_data_dir: String) -> FfiResult<Arc<Self>> {
         let seed: [u8; 32] = identity_seed.try_into().map_err(|bytes: Vec<u8>| FfiError::P2p {
             reason: format!("identity seed must be exactly 32 bytes, got {}", bytes.len()),
         })?;
@@ -82,7 +88,7 @@ impl FfiP2pNode {
         // without needing a full `block_on` since the call itself is
         // synchronous.
         let _guard = runtime().enter();
-        let node = P2pNode::spawn(seed)?;
+        let node = P2pNode::spawn(seed, ledger_data_dir.into())?;
 
         Ok(Arc::new(Self {
             command_tx: node.command_sender(),

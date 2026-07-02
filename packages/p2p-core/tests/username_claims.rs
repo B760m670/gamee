@@ -7,8 +7,10 @@ use spiritchat_p2p_core::{Command, P2pEvent, P2pNode};
 
 #[tokio::test]
 async fn bob_resolves_a_username_alice_announced() {
-    let mut alice = P2pNode::spawn_with_bootstrap([9u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([10u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([9u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([10u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let alice_peer_id = alice.local_peer_id();
 
     let alice_addr = loop {
@@ -95,8 +97,10 @@ async fn bob_resolves_a_username_alice_announced() {
 /// "you asked before bootstrapping finished."
 #[tokio::test]
 async fn a_username_announced_before_any_connection_is_deferred_until_one_exists() {
-    let mut alice = P2pNode::spawn_with_bootstrap([13u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([14u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([13u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([14u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let bob_peer_id = bob.local_peer_id();
 
     // Announce before alice has connected to anyone at all — this is the
@@ -139,8 +143,10 @@ async fn a_username_announced_before_any_connection_is_deferred_until_one_exists
 
 #[tokio::test]
 async fn resolving_an_unclaimed_username_fails_cleanly() {
-    let mut alice = P2pNode::spawn_with_bootstrap([11u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([12u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([11u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([12u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let alice_peer_id = alice.local_peer_id();
 
     let alice_addr = loop {

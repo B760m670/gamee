@@ -7,8 +7,10 @@ use spiritchat_p2p_core::{Command, P2pEvent, P2pNode};
 
 #[tokio::test]
 async fn bob_fetches_a_blob_alice_is_serving() {
-    let mut alice = P2pNode::spawn_with_bootstrap([5u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([6u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([5u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([6u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let alice_peer_id = alice.local_peer_id();
 
     let alice_addr = loop {
@@ -57,8 +59,10 @@ async fn bob_fetches_a_blob_alice_is_serving() {
 
 #[tokio::test]
 async fn fetching_a_blob_nobody_registered_fails_cleanly() {
-    let mut alice = P2pNode::spawn_with_bootstrap([7u8; 32], vec![]).unwrap();
-    let mut bob = P2pNode::spawn_with_bootstrap([8u8; 32], vec![]).unwrap();
+    let alice_ledger_dir = tempfile::tempdir().unwrap();
+    let bob_ledger_dir = tempfile::tempdir().unwrap();
+    let mut alice = P2pNode::spawn_with_bootstrap([7u8; 32], vec![], alice_ledger_dir.path().join("ledger.redb")).unwrap();
+    let mut bob = P2pNode::spawn_with_bootstrap([8u8; 32], vec![], bob_ledger_dir.path().join("ledger.redb")).unwrap();
     let alice_peer_id = alice.local_peer_id();
 
     let alice_addr = loop {

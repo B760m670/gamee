@@ -22,6 +22,15 @@ pub enum P2pError {
 
     #[error("the P2P event loop task is no longer running")]
     NodeShutDown,
+
+    #[error("@username ledger storage error: {0}")]
+    Ledger(String),
+}
+
+impl From<spiritchat_ledger_core::LedgerError> for P2pError {
+    fn from(err: spiritchat_ledger_core::LedgerError) -> Self {
+        P2pError::Ledger(err.to_string())
+    }
 }
 
 pub type Result<T> = core::result::Result<T, P2pError>;

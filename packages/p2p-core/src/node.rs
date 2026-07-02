@@ -4,6 +4,8 @@
 //! directly — it lives entirely inside `run_event_loop`'s task.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use libp2p::identify;
@@ -11,7 +13,8 @@ use libp2p::kad::{self, GetRecordOk, PutRecordOk, QueryId, QueryResult, Quorum, 
 use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::{gossipsub, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use spiritchat_ledger_core::{ApplyOutcome, Block, ChainStore, Hash32, Transaction};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -21,6 +24,7 @@ use crate::command::Command;
 use crate::error::{P2pError, Result};
 use crate::event::P2pEvent;
 use crate::identity;
+use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 use crate::rendezvous;
 use crate::username;
 
@@ -37,9 +41,14 @@ impl P2pNode {
     /// `bootstrap::public_dht_bootstrap_addresses`). `identity_seed` is the
     /// same 32-byte seed `spiritchat_crypto_core::identity::IdentityKeyPair`
     /// uses, so the network identity and the messaging identity are the
-    /// same key.
-    pub fn spawn(identity_seed: [u8; 32]) -> Result<Self> {
-        Self::spawn_with_bootstrap(identity_seed, bootstrap::public_dht_bootstrap_addresses())
+    /// same key. `ledger_data_dir` is where the `@username` ledger's redb
+    /// database lives — the first on-disk state this crate owns directly
+    /// (everything else stays app-managed); the caller (Swift on iOS) is
+    /// responsible for pointing this at a real, writable, per-identity
+    /// directory, mirroring how `BlobStore.swift` already picks its own
+    /// cache directory under `applicationSupportDirectory`.
+    pub fn spawn(identity_seed: [u8; 32], ledger_data_dir: PathBuf) -> Result<Self> {
+        Self::spawn_with_bootstrap(identity_seed, bootstrap::public_dht_bootstrap_addresses(), ledger_data_dir)
     }
 
     /// `spawn`, but with an explicit bootstrap set instead of the public
@@ -47,10 +56,16 @@ impl P2pNode {
     /// only within a network they've already connected it to some member
     /// of (pass `vec![]` for neither: local-network mDNS discovery still
     /// works either way).
-    pub fn spawn_with_bootstrap(identity_seed: [u8; 32], bootstrap_addresses: Vec<Multiaddr>) -> Result<Self> {
+    pub fn spawn_with_bootstrap(
+        identity_seed: [u8; 32],
+        bootstrap_addresses: Vec<Multiaddr>,
+        ledger_data_dir: PathBuf,
+    ) -> Result<Self> {
         let keypair = identity::keypair_from_seed(&identity_seed)?;
         let local_peer_id = keypair.public().to_peer_id();
         let mut swarm = build_swarm(keypair)?;
+
+        let chain_store = ChainStore::open(&ledger_data_dir)?;
 
         // Always listen, on an OS-assigned port over both transports, so
         // this node is directly dialable whenever it isn't behind a NAT
@@ -76,7 +91,7 @@ impl P2pNode {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_event_loop(swarm, command_rx, event_tx));
+        let task = tokio::spawn(run_event_loop(swarm, chain_store, command_rx, event_tx));
 
         Ok(Self {
             local_peer_id,
@@ -142,6 +157,10 @@ fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
     })
 }
 
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock is before 1970").as_secs()
+}
+
 /// Tracks which outstanding DHT query or outbound request a given app-level
 /// action corresponds to, since libp2p answers them asynchronously via
 /// `SwarmEvent`s tagged only with an opaque `QueryId`/`OutboundRequestId`.
@@ -153,10 +172,16 @@ struct Pending {
     blob_fetch: HashMap<OutboundRequestId, (PeerId, Vec<u8>)>,
     resolve_username: HashMap<QueryId, String>,
     announce_username: HashMap<QueryId, String>,
+    /// A `RequestChainSync`'s first step: waiting on `peer`'s tip.
+    chain_sync_tip: HashMap<OutboundRequestId, PeerId>,
+    /// A `RequestChainSync`'s follow-up: waiting on a batch of blocks from
+    /// `peer` after learning its tip is heavier than ours.
+    chain_sync_blocks: HashMap<OutboundRequestId, PeerId>,
 }
 
 async fn run_event_loop(
     mut swarm: Swarm<Behaviour>,
+    mut chain_store: ChainStore,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<P2pEvent>,
 ) {
@@ -166,6 +191,13 @@ async fn run_event_loop(
     // task — persisting them across restarts, if desired, is the app's
     // job (it already has the bytes; it just re-issues SetLocalBlob).
     let mut local_blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    // Not-yet-mined @username claims this node knows about (submitted
+    // locally or received over gossip) — never persisted, matching every
+    // other in-memory-only piece of state in this crate; a mempool only
+    // ever needs to survive until *someone's* miner picks it up, and if
+    // this process restarts before that happens, the claim's original
+    // submitter still has it and can resubmit.
+    let mut mempool: HashMap<Hash32, Transaction> = HashMap::new();
 
     // A put_record/get_record issued before this node has connected to
     // *anyone* fails immediately with "the quorum failed; needed 1 peers"
@@ -193,17 +225,17 @@ async fn run_event_loop(
                 if !dht_ready && needs_dht_peer(&command) {
                     deferred_commands.push(command);
                 } else {
-                    handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
+                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &events, command);
                 }
             }
             swarm_event = swarm.select_next_some() => {
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
-                        handle_command(&mut swarm, &mut pending, &mut local_blobs, &events, command);
+                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &events, command);
                     }
                 }
-                handle_swarm_event(&mut swarm, &mut pending, &local_blobs, &events, swarm_event);
+                handle_swarm_event(&mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &events, swarm_event);
             }
             else => break,
         }
@@ -226,8 +258,10 @@ fn needs_dht_peer(command: &Command) -> bool {
 
 fn handle_command(
     swarm: &mut Swarm<Behaviour>,
+    chain_store: &mut ChainStore,
     pending: &mut Pending,
     local_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
+    mempool: &mut HashMap<Hash32, Transaction>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     command: Command,
 ) {
@@ -314,16 +348,86 @@ fn handle_command(
             pending.resolve_username.insert(query_id, username);
         }
 
+        Command::SubmitUsernameClaim { transaction } => {
+            if let Err(err) = transaction.verify_self_contained() {
+                let _ = events.send(P2pEvent::LedgerSubmissionRejected { reason: err.to_string() });
+                return;
+            }
+            mempool.insert(transaction.id(), transaction.clone());
+            if let Ok(bytes) = bincode::serialize(&transaction) {
+                let _ = swarm.behaviour_mut().ledger_gossip.publish(ledger::txs_topic(), bytes);
+            }
+        }
+
+        Command::SubmitMinedBlock { block } => {
+            apply_and_broadcast_block(swarm, chain_store, mempool, events, block);
+        }
+
+        Command::QueryUsernameOwner { username } => {
+            match chain_store.username_owner(&username) {
+                Some(owner) => {
+                    let _ = events.send(P2pEvent::UsernameOwnerResolved {
+                        username,
+                        owner_public_key: owner.owner_public_key.to_vec(),
+                        claimed_at_height: owner.claimed_at_height,
+                    });
+                }
+                None => {
+                    let _ = events.send(P2pEvent::UsernameOwnerNotFound { username });
+                }
+            }
+        }
+
+        Command::RequestChainSync { peer } => {
+            let request_id = swarm.behaviour_mut().ledger_sync.send_request(&peer, ChainSyncRequest::GetTip);
+            pending.chain_sync_tip.insert(request_id, peer);
+        }
+
         // Handled in run_event_loop before this function is ever called —
         // present only because Command's match must stay exhaustive.
         Command::Shutdown => {}
     }
 }
 
+/// Shared by a locally-mined block (`Command::SubmitMinedBlock`) and one
+/// received over gossip: validate, apply, and — only for a block this node
+/// didn't already have — clear its transactions out of the mempool and
+/// tell the app the tip may have moved.
+fn apply_and_broadcast_block(
+    swarm: &mut Swarm<Behaviour>,
+    chain_store: &mut ChainStore,
+    mempool: &mut HashMap<Hash32, Transaction>,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    block: Block,
+) {
+    match chain_store.try_apply(block.clone(), now_unix()) {
+        Ok(ApplyOutcome::AlreadyKnown) => {}
+        Ok(outcome @ (ApplyOutcome::ExtendedTip | ApplyOutcome::AddedToFork | ApplyOutcome::ReorgedTo { .. })) => {
+            for tx in &block.transactions {
+                mempool.remove(&tx.id());
+            }
+            if let Ok(bytes) = bincode::serialize(&block) {
+                let _ = swarm.behaviour_mut().ledger_gossip.publish(ledger::blocks_topic(), bytes);
+            }
+            if !matches!(outcome, ApplyOutcome::AddedToFork) {
+                let _ = events.send(P2pEvent::ChainTipChanged {
+                    height: chain_store.tip_height(),
+                    hash: format!("{}", chain_store.tip_hash()),
+                });
+            }
+        }
+        Err(err) => {
+            let _ = events.send(P2pEvent::LedgerSubmissionRejected { reason: err.to_string() });
+        }
+    }
+}
+
 fn handle_swarm_event(
     swarm: &mut Swarm<Behaviour>,
+    chain_store: &mut ChainStore,
     pending: &mut Pending,
     local_blobs: &HashMap<Vec<u8>, Vec<u8>>,
+    mempool: &mut HashMap<Hash32, Transaction>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: SwarmEvent<BehaviourEvent>,
 ) {
@@ -378,6 +482,14 @@ fn handle_swarm_event(
 
         SwarmEvent::Behaviour(BehaviourEvent::Blob(blob_event)) => {
             handle_blob_event(swarm, pending, local_blobs, events, blob_event);
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::LedgerGossip(gossip_event)) => {
+            handle_ledger_gossip_event(swarm, chain_store, mempool, events, gossip_event);
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::LedgerSync(sync_event)) => {
+            handle_ledger_sync_event(swarm, chain_store, pending, events, sync_event);
         }
 
         _ => {}
@@ -523,5 +635,161 @@ fn handle_blob_event(
             }
         }
         _ => {}
+    }
+}
+
+/// New blocks/claims arriving over gossip. Deliberately does **not**
+/// distinguish "valid" from "invalid" at the gossip layer itself (no
+/// custom `report_message_validation_result` hookup) — every receiving
+/// node still independently validates through the exact same
+/// `ChainStore::try_apply`/`verify_self_contained` any locally-submitted
+/// block or claim goes through before accepting it, so a bad message
+/// propagating a hop further than strictly necessary wastes a little
+/// bandwidth but can never corrupt anyone's actual chain state. Rejecting
+/// invalid messages at the gossip layer itself (so they stop propagating
+/// immediately, rather than merely being ignored on arrival) is a real
+/// hardening opportunity, deferred to Phase 5.
+fn handle_ledger_gossip_event(
+    swarm: &mut Swarm<Behaviour>,
+    chain_store: &mut ChainStore,
+    mempool: &mut HashMap<Hash32, Transaction>,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    event: gossipsub::Event,
+) {
+    let gossipsub::Event::Message { message, .. } = event else {
+        return;
+    };
+
+    if message.topic == ledger::blocks_topic().hash() {
+        if let Ok(block) = bincode::deserialize::<Block>(&message.data) {
+            apply_and_broadcast_block(swarm, chain_store, mempool, events, block);
+        }
+    } else if message.topic == ledger::txs_topic().hash() {
+        if let Ok(transaction) = bincode::deserialize::<Transaction>(&message.data) {
+            if transaction.verify_self_contained().is_ok() {
+                mempool.insert(transaction.id(), transaction);
+            }
+        }
+    }
+}
+
+fn handle_ledger_sync_event(
+    swarm: &mut Swarm<Behaviour>,
+    chain_store: &mut ChainStore,
+    pending: &mut Pending,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    event: request_response::Event<ChainSyncRequest, ChainSyncResponse>,
+) {
+    match event {
+        request_response::Event::Message { message, .. } => match message {
+            request_response::Message::Request { request, channel, .. } => {
+                let response = build_chain_sync_response(chain_store, request);
+                let _ = swarm.behaviour_mut().ledger_sync.send_response(channel, response);
+            }
+            request_response::Message::Response { request_id, response } => {
+                handle_chain_sync_response(swarm, chain_store, pending, events, request_id, response);
+            }
+        },
+        request_response::Event::OutboundFailure { request_id, error, .. } => {
+            if let Some(peer) = pending.chain_sync_tip.remove(&request_id).or_else(|| pending.chain_sync_blocks.remove(&request_id)) {
+                let _ = events.send(P2pEvent::ChainSyncFailed { peer, reason: error.to_string() });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_chain_sync_response(chain_store: &ChainStore, request: ChainSyncRequest) -> ChainSyncResponse {
+    match request {
+        ChainSyncRequest::GetTip => ChainSyncResponse::Tip {
+            height: chain_store.tip_height(),
+            hash: *chain_store.tip_hash().as_bytes(),
+            cumulative_work: chain_store.tip_cumulative_work(),
+        },
+        ChainSyncRequest::GetBlocks { from_height, count } => {
+            let count = count.min(ledger::MAX_SYNC_BATCH);
+            let mut blocks = Vec::with_capacity(count as usize);
+            for height in from_height..from_height.saturating_add(count as u64) {
+                match chain_store.canonical_block_at(height) {
+                    Some(block) => blocks.push(block.clone()),
+                    // A gap (already pruned, or past our own tip) means
+                    // this batch can't be served in full — the requester
+                    // falls back to `GetUsernameOwnerSnapshot` for
+                    // anything this old instead of getting a silently
+                    // incomplete answer.
+                    None => return ChainSyncResponse::NotAvailable,
+                }
+            }
+            ChainSyncResponse::Blocks(blocks)
+        }
+        // Full independent header-chain reverification arbitrarily far
+        // back (beyond what any peer's retained block bodies cover) is a
+        // real, deliberate Phase 3 boundary — this crate's own metadata
+        // doesn't yet retain every header field a from-scratch PoW replay
+        // would need (see `spiritchat_ledger_core::chain_state::BlockMeta`).
+        // A brand-new node instead trusts `GetUsernameOwnerSnapshot` for
+        // history older than what `GetBlocks` can serve, and fully
+        // verifies everything within the retained window — the same
+        // trust-on-first-use model already documented for bootstrapping.
+        ChainSyncRequest::GetHeaders { .. } => ChainSyncResponse::NotAvailable,
+        ChainSyncRequest::GetUsernameOwnerSnapshot => {
+            ChainSyncResponse::UsernameOwnerSnapshot(chain_store.checkpoint_at_tip())
+        }
+    }
+}
+
+fn handle_chain_sync_response(
+    swarm: &mut Swarm<Behaviour>,
+    chain_store: &mut ChainStore,
+    pending: &mut Pending,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    request_id: OutboundRequestId,
+    response: ChainSyncResponse,
+) {
+    if let Some(peer) = pending.chain_sync_tip.remove(&request_id) {
+        let ChainSyncResponse::Tip { height, cumulative_work, .. } = response else {
+            let _ = events.send(P2pEvent::ChainSyncFailed { peer, reason: "peer gave a malformed tip response".to_string() });
+            return;
+        };
+        if cumulative_work <= chain_store.tip_cumulative_work() {
+            // Our own chain is already at least as heavy — nothing to
+            // catch up on.
+            let _ = events.send(P2pEvent::ChainSyncCompleted { height: chain_store.tip_height() });
+            return;
+        }
+        let from_height = chain_store.tip_height() + 1;
+        let count = (height - chain_store.tip_height()).min(ledger::MAX_SYNC_BATCH as u64) as u32;
+        let request_id = swarm.behaviour_mut().ledger_sync.send_request(&peer, ChainSyncRequest::GetBlocks { from_height, count });
+        pending.chain_sync_blocks.insert(request_id, peer);
+        return;
+    }
+
+    if let Some(peer) = pending.chain_sync_blocks.remove(&request_id) {
+        match response {
+            ChainSyncResponse::Blocks(blocks) => {
+                for block in blocks {
+                    // Applied one at a time, in the order the peer sent
+                    // them (ascending height) — `try_apply` rejects a
+                    // block whose parent it hasn't seen yet, so an
+                    // out-of-order or gappy batch simply stops making
+                    // progress rather than corrupting anything.
+                    if let Err(err) = chain_store.try_apply(block, now_unix()) {
+                        let _ = events.send(P2pEvent::ChainSyncFailed { peer, reason: err.to_string() });
+                        return;
+                    }
+                }
+                let _ = events.send(P2pEvent::ChainTipChanged {
+                    height: chain_store.tip_height(),
+                    hash: format!("{}", chain_store.tip_hash()),
+                });
+                let _ = events.send(P2pEvent::ChainSyncCompleted { height: chain_store.tip_height() });
+            }
+            _ => {
+                let _ = events.send(P2pEvent::ChainSyncFailed {
+                    peer,
+                    reason: "peer had no blocks available for this range".to_string(),
+                });
+            }
+        }
     }
 }
