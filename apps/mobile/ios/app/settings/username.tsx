@@ -8,11 +8,20 @@ import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useProfileStore } from '../../store/profile'
 import { validateUsername } from '../../utils/username'
-import { lookupUsername } from '../../modules/spiritchat-crypto-core'
+import {
+  queryLedgerUsernameOwner,
+  submitLedgerUsernameClaim,
+  queryLedgerChainTip,
+  addP2pEventListener,
+  LEDGER_CONFIRMATION_DEPTH,
+} from '../../modules/spiritchat-crypto-core'
 
 const BTN_H = 44
 
-type Status =
+// Whether this exact @handle currently resolves to someone on the ledger —
+// separate from `SubmitStatus` below, which only exists once the user has
+// actually pressed "Готово" for a *new* name.
+type CheckStatus =
   | { kind: 'idle' }
   | { kind: 'checking' }
   | { kind: 'available' }
@@ -21,75 +30,140 @@ type Status =
   | { kind: 'invalid'; message: string }
   | { kind: 'error'; message: string }
 
+// The claim's own lifecycle after submission — a block's worth of
+// probabilistic finality (see the project's ledger design) means this can't
+// resolve instantly, so the screen stays open and shows real progress
+// instead of an optimistic instant `router.back()`.
+type SubmitStatus =
+  | { kind: 'idle' }
+  | { kind: 'submitting' }
+  | { kind: 'pending' }
+  | { kind: 'confirming'; depth: number }
+  | { kind: 'confirmed' }
+  | { kind: 'rejected'; reason: string }
+
 export default function UsernameScreen() {
   const router = useRouter()
   const insets = useSafeAreaInsets()
-  const { username: savedUsername, fingerprint, setUsername } = useProfileStore(s => ({
-    username:    s.username,
-    fingerprint: s.fingerprint,
-    setUsername: s.setUsername,
+  const { username: savedUsername, publicKey, persistUsername } = useProfileStore(s => ({
+    username:        s.username,
+    publicKey:        s.publicKey,
+    persistUsername: s.persistUsername,
   }))
 
   const [text, setText]     = useState(savedUsername ?? '')
-  const [status, setStatus] = useState<Status>({ kind: 'idle' })
-  const [saving, setSaving] = useState(false)
+  const [check, setCheck]   = useState<CheckStatus>({ kind: 'idle' })
+  const [submit, setSubmit] = useState<SubmitStatus>({ kind: 'idle' })
   const checkToken = useRef(0)
 
+  const normalized = text.trim().toLowerCase()
+
+  // Checks whether the typed name is available — paused once a submission
+  // is in flight, since editing the input is hidden then anyway.
   useEffect(() => {
-    const normalized = text.trim().toLowerCase()
+    if (submit.kind !== 'idle') return
 
     if (normalized === (savedUsername ?? '')) {
-      setStatus({ kind: 'idle' })
+      setCheck({ kind: 'idle' })
       return
     }
     if (normalized.length === 0) {
-      setStatus({ kind: 'idle' })
+      setCheck({ kind: 'idle' })
       return
     }
     const validationError = validateUsername(normalized)
     if (validationError) {
-      setStatus({ kind: 'invalid', message: validationError })
+      setCheck({ kind: 'invalid', message: validationError })
       return
     }
 
     const token = ++checkToken.current
-    setStatus({ kind: 'checking' })
+    setCheck({ kind: 'checking' })
     const timer = setTimeout(async () => {
       try {
-        const lookup = await lookupUsername(normalized)
+        const owner = await queryLedgerUsernameOwner(normalized)
         if (checkToken.current !== token) return
-        if (lookup.status === 'available') {
-          setStatus({ kind: 'available' })
-        } else if (lookup.status === 'resolved' && lookup.fingerprint === fingerprint) {
-          setStatus({ kind: 'mine' })
+        if (owner.status === 'not_found') {
+          setCheck({ kind: 'available' })
+        } else if (owner.ownerPublicKeyBase64 === publicKey) {
+          setCheck({ kind: 'mine' })
         } else {
-          setStatus({ kind: 'taken' })
+          setCheck({ kind: 'taken' })
         }
       } catch {
         if (checkToken.current !== token) return
-        setStatus({ kind: 'error', message: 'Не удалось проверить — проверь соединение и попробуй ещё раз' })
+        setCheck({ kind: 'error', message: 'Не удалось проверить — проверь соединение и попробуй ещё раз' })
       }
     }, 500)
 
     return () => clearTimeout(timer)
-  }, [text, savedUsername, fingerprint])
+  }, [text, savedUsername, publicKey, submit.kind])
 
-  const normalized = text.trim().toLowerCase()
+  // Once a claim is submitted, tracks it toward confirmation: checks
+  // immediately, then again on every chain tip change, until it's either
+  // confirmed, lost to a competing claim, or this screen unmounts (the
+  // claim itself keeps going either way — this is only local UI state).
+  useEffect(() => {
+    if (submit.kind !== 'pending' && submit.kind !== 'confirming') return
+    let cancelled = false
+
+    const check = async () => {
+      try {
+        const owner = await queryLedgerUsernameOwner(normalized)
+        if (cancelled || owner.status !== 'found') return
+        if (owner.ownerPublicKeyBase64 !== publicKey) {
+          setSubmit({ kind: 'rejected', reason: 'Кто-то другой закрепил это имя раньше' })
+          return
+        }
+        const tip = await queryLedgerChainTip()
+        if (cancelled) return
+        const depth = tip.height - owner.claimedAtHeight + 1
+        setSubmit(depth >= LEDGER_CONFIRMATION_DEPTH ? { kind: 'confirmed' } : { kind: 'confirming', depth })
+      } catch {
+        // A transient query failure isn't a rejection — just wait for the
+        // next tip change to try again.
+      }
+    }
+
+    check()
+    const unsubscribe = addP2pEventListener((event) => {
+      if (event.type === 'chainTipChanged') check()
+    })
+    return () => {
+      cancelled = true
+      unsubscribe()
+    }
+  }, [submit.kind, normalized, publicKey])
+
+  const editing = submit.kind === 'idle'
   const canSave =
-    !saving &&
+    editing &&
     normalized !== (savedUsername ?? '') &&
-    (normalized.length === 0 || status.kind === 'available' || status.kind === 'mine')
+    (normalized.length === 0 || check.kind === 'available' || check.kind === 'mine')
 
   async function handleSave() {
     if (!canSave) return
-    setSaving(true)
-    try {
-      await setUsername(normalized)
+
+    if (normalized.length === 0) {
+      await persistUsername('')
       router.back()
+      return
+    }
+    if (check.kind === 'mine') {
+      // Already confirmed and owned by this device — nothing to
+      // (re)submit, just make sure the locally saved label matches.
+      await persistUsername(normalized)
+      router.back()
+      return
+    }
+
+    setSubmit({ kind: 'submitting' })
+    try {
+      await submitLedgerUsernameClaim(normalized)
+      await persistUsername(normalized)
+      setSubmit({ kind: 'pending' })
     } catch (e) {
-      setStatus({ kind: 'error', message: e instanceof Error ? e.message : 'Не удалось сохранить' })
-    } finally {
-      setSaving(false)
+      setSubmit({ kind: 'rejected', reason: e instanceof Error ? e.message : 'Не удалось отправить заявку' })
     }
   }
 
@@ -103,16 +177,15 @@ export default function UsernameScreen() {
         </Pressable>
       </View>
 
-      <View style={[s.btnOverlay, { top: insets.top + 10, right: 16 }]}>
-        <Pressable onPress={handleSave} disabled={!canSave}>
-          <GlassView style={[s.saveBtn, !canSave && s.saveBtnDisabled]} glassEffectStyle="regular" isInteractive colorScheme="dark">
-            {saving
-              ? <ActivityIndicator color="#fff" size="small" />
-              : <Text style={[s.saveText, !canSave && s.saveTextDisabled]}>Готово</Text>
-            }
-          </GlassView>
-        </Pressable>
-      </View>
+      {editing ? (
+        <View style={[s.btnOverlay, { top: insets.top + 10, right: 16 }]}>
+          <Pressable onPress={handleSave} disabled={!canSave}>
+            <GlassView style={[s.saveBtn, !canSave && s.saveBtnDisabled]} glassEffectStyle="regular" isInteractive colorScheme="dark">
+              <Text style={[s.saveText, !canSave && s.saveTextDisabled]}>Готово</Text>
+            </GlassView>
+          </Pressable>
+        </View>
+      ) : null}
 
       <ScrollView
         keyboardShouldPersistTaps="handled"
@@ -120,48 +193,57 @@ export default function UsernameScreen() {
         showsVerticalScrollIndicator={false}
       >
         <Text style={s.title}>Имя пользователя</Text>
-        <Text style={s.subtitle}>
-          Необязательно. Если задать, тебя можно будет найти по точному @имени. Оно публикуется в открытой P2P-сети (DHT) без сервера — уникальность не гарантирована железно, только тем, что имя подписано твоим ключом.
-        </Text>
 
-        <View style={s.inputRow}>
-          <Text style={s.at}>@</Text>
-          <TextInput
-            style={s.input}
-            value={text}
-            onChangeText={(t) => setText(t.replace(/\s/g, ''))}
-            placeholder="username"
-            placeholderTextColor="#3f3f46"
-            autoCapitalize="none"
-            autoCorrect={false}
-            maxLength={32}
-            returnKeyType="done"
-            onSubmitEditing={handleSave}
-          />
-          {status.kind === 'checking' && <ActivityIndicator size="small" color="#52525b" />}
-        </View>
+        {editing ? (
+          <>
+            <Text style={s.subtitle}>
+              Необязательно. Имя закрепляется в собственном децентрализованном реестре — небольшом
+              proof-of-work блокчейне, который майнят телефоны участников сети, без единого сервера. После
+              подтверждения (~30 минут, {LEDGER_CONFIRMATION_DEPTH} блоков) имя гарантированно закреплено только за
+              тобой. Пока сеть небольшая, у более мощного участника есть теоретическая возможность ненадолго
+              переписать последние блоки — этот риск снижается по мере роста сети, а имя всегда можно сменить.
+            </Text>
 
-        <StatusLine status={status} />
+            <View style={s.inputRow}>
+              <Text style={s.at}>@</Text>
+              <TextInput
+                style={s.input}
+                value={text}
+                onChangeText={(t) => setText(t.replace(/\s/g, ''))}
+                placeholder="username"
+                placeholderTextColor="#3f3f46"
+                autoCapitalize="none"
+                autoCorrect={false}
+                maxLength={32}
+                returnKeyType="done"
+                onSubmitEditing={handleSave}
+              />
+              {check.kind === 'checking' && <ActivityIndicator size="small" color="#52525b" />}
+            </View>
 
-        {savedUsername ? (
-          <Pressable
-            style={({ pressed }) => [s.clearBtn, pressed && s.clearBtnPressed]}
-            onPress={() => setText('')}
-          >
-            <Text style={s.clearText}>Убрать имя пользователя</Text>
-          </Pressable>
-        ) : null}
+            <CheckStatusLine status={check} />
+
+            {savedUsername ? (
+              <Pressable
+                style={({ pressed }) => [s.clearBtn, pressed && s.clearBtnPressed]}
+                onPress={() => setText('')}
+              >
+                <Text style={s.clearText}>Убрать имя пользователя</Text>
+              </Pressable>
+            ) : null}
+          </>
+        ) : (
+          <SubmitProgress username={normalized} status={submit} onRetry={() => setSubmit({ kind: 'idle' })} onDone={() => router.back()} />
+        )}
       </ScrollView>
     </KeyboardAvoidingView>
   )
 }
 
-function StatusLine({ status }: { status: Status }) {
+function CheckStatusLine({ status }: { status: CheckStatus }) {
   switch (status.kind) {
     case 'checking':
-      // A DHT lookup walks the network to answer, so this can take a
-      // while — say so, rather than leave a bare spinner that looks stuck.
-      return <Text style={s.statusHint}>Ищём в сети — может занять до 30 секунд</Text>
+      return <Text style={s.statusHint}>Проверяем в локальном состоянии сети…</Text>
     case 'available':
       return <Text style={s.statusOk}>Свободно</Text>
     case 'mine':
@@ -175,6 +257,54 @@ function StatusLine({ status }: { status: Status }) {
     default:
       return null
   }
+}
+
+function SubmitProgress({
+  username, status, onRetry, onDone,
+}: {
+  username: string
+  status: Exclude<SubmitStatus, { kind: 'idle' }>
+  onRetry: () => void
+  onDone: () => void
+}) {
+  return (
+    <View style={s.progress}>
+      <Text style={s.progressHandle}>{`@${username}`}</Text>
+
+      {status.kind === 'submitting' ? (
+        <>
+          <ActivityIndicator color="#71717a" style={s.progressSpinner} />
+          <Text style={s.progressHint}>Отправляем заявку в сеть…</Text>
+        </>
+      ) : status.kind === 'pending' ? (
+        <>
+          <ActivityIndicator color="#71717a" style={s.progressSpinner} />
+          <Text style={s.progressHint}>Заявка в сети — ждём, пока кто-то из участников её замайнит</Text>
+        </>
+      ) : status.kind === 'confirming' ? (
+        <>
+          <ActivityIndicator color="#71717a" style={s.progressSpinner} />
+          <Text style={s.progressHint}>{`Подтверждений: ${status.depth} из ${LEDGER_CONFIRMATION_DEPTH}`}</Text>
+        </>
+      ) : status.kind === 'confirmed' ? (
+        <>
+          <Ionicons name="checkmark-circle" size={40} color="#4ade80" style={s.progressSpinner} />
+          <Text style={s.progressOk}>Имя подтверждено и закреплено за тобой</Text>
+          <Pressable style={({ pressed }) => [s.doneBtn, pressed && s.doneBtnPressed]} onPress={onDone}>
+            <Text style={s.doneText}>Готово</Text>
+          </Pressable>
+        </>
+      ) : (
+        <>
+          <Ionicons name="close-circle" size={40} color="#f87171" style={s.progressSpinner} />
+          <Text style={s.progressErr}>{status.reason}</Text>
+          <Pressable style={({ pressed }) => [s.doneBtn, pressed && s.doneBtnPressed]} onPress={onRetry}>
+            <Text style={s.doneText}>Попробовать снова</Text>
+          </Pressable>
+        </>
+      )}
+    </View>
+  )
 }
 
 const s = StyleSheet.create({
@@ -198,6 +328,20 @@ const s = StyleSheet.create({
   clearBtn:        { marginTop: 28, alignItems: 'center', paddingVertical: 12 },
   clearBtnPressed: { opacity: 0.7 },
   clearText:       { color: '#ef4444', fontSize: 15, fontWeight: '500' },
+
+  progress: { alignItems: 'center', paddingTop: 40, gap: 4 },
+  progressHandle: { color: '#fff', fontSize: 22, fontWeight: '700', marginBottom: 16 },
+  progressSpinner: { marginBottom: 12 },
+  progressHint: { color: '#a1a1aa', fontSize: 14, textAlign: 'center', lineHeight: 20 },
+  progressOk:   { color: '#4ade80', fontSize: 15, textAlign: 'center', lineHeight: 20 },
+  progressErr:  { color: '#f87171', fontSize: 15, textAlign: 'center', lineHeight: 20 },
+
+  doneBtn: {
+    marginTop: 24, backgroundColor: '#2f7bff', borderRadius: 12,
+    paddingVertical: 12, paddingHorizontal: 24,
+  },
+  doneBtnPressed: { opacity: 0.8 },
+  doneText:       { color: '#fff', fontSize: 15, fontWeight: '600' },
 
   btnOverlay: { position: 'absolute', zIndex: 10 },
   backBtn: {

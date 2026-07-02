@@ -5,22 +5,25 @@ import {
 import { Ionicons } from '@expo/vector-icons'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { Avatar } from '../../components/Avatar'
-import { lookupUsername, p2pDial, addP2pEventListener, type UsernameLookup } from '../../modules/spiritchat-crypto-core'
+import { queryLedgerUsernameOwner, p2pDial, addP2pEventListener, type LedgerUsernameOwner } from '../../modules/spiritchat-crypto-core'
 
 type Result =
   | { kind: 'idle' }
   | { kind: 'checking' }
   | { kind: 'invalid'; message: string }
   | { kind: 'notFound' }
-  | { kind: 'found'; username: string; lookup: Extract<UsernameLookup, { status: 'resolved' }> }
+  | { kind: 'found'; username: string; owner: Extract<LedgerUsernameOwner, { status: 'found' }> }
   | { kind: 'error'; message: string }
 
 type DialState = 'idle' | 'dialing' | 'connected' | 'failed'
 
-// @username search is an exact DHT lookup, not a directory listing — there
-// is no server anywhere in this project that could hold a searchable index
-// of every handle, so unlike a typical "people search" this only ever
-// answers "does this exact handle currently resolve to someone verifiable".
+// @username search is an exact lookup against this node's own materialized
+// ledger state, not a directory listing — there is no server anywhere in
+// this project that could hold a searchable index of every handle, so
+// unlike a typical "people search" this only ever answers "does this exact
+// handle currently resolve to someone on the chain". Unlike the old DHT
+// lookup this is instant (no network round trip) once this node's local
+// chain view is caught up — see app/_layout.tsx's chain-sync-on-connect.
 function normalizeQuery(raw: string): string {
   return raw.trim().toLowerCase().replace(/^@/, '')
 }
@@ -53,10 +56,10 @@ export default function ContactsScreen() {
     setResult({ kind: 'checking' })
     const timer = setTimeout(async () => {
       try {
-        const lookup = await lookupUsername(normalized)
+        const owner = await queryLedgerUsernameOwner(normalized)
         if (token.current !== myToken) return
-        if (lookup.status === 'resolved') {
-          setResult({ kind: 'found', username: normalized, lookup })
+        if (owner.status === 'found') {
+          setResult({ kind: 'found', username: normalized, owner })
         } else {
           setResult({ kind: 'notFound' })
         }
@@ -71,7 +74,7 @@ export default function ContactsScreen() {
 
   useEffect(() => {
     if (result.kind !== 'found') return
-    const peerId = result.lookup.peerId
+    const peerId = result.owner.peerId
     return addP2pEventListener((event) => {
       if (event.type === 'peerConnected' && event.peerId === peerId) {
         setDial('connected')
@@ -85,7 +88,7 @@ export default function ContactsScreen() {
     if (result.kind !== 'found' || dial === 'dialing' || dial === 'connected') return
     setDial('dialing')
     try {
-      p2pDial(result.lookup.peerId)
+      p2pDial(result.owner.peerId)
     } catch {
       setDial('failed')
     }
@@ -135,7 +138,7 @@ export default function ContactsScreen() {
       ) : result.kind === 'checking' ? (
         <View style={s.empty}>
           <ActivityIndicator color="#52525b" />
-          <Text style={s.emptyHint}>Ищём в открытой сети — может занять до 30 секунд</Text>
+          <Text style={s.emptyHint}>Проверяем локальное состояние сети…</Text>
         </View>
       ) : result.kind === 'notFound' ? (
         <View style={s.empty}>
@@ -146,7 +149,7 @@ export default function ContactsScreen() {
         <View style={s.card}>
           <Avatar size={64} uri={null} username={result.username} />
           <Text style={s.cardName}>{`@${result.username}`}</Text>
-          <Text style={s.cardFingerprint}>{result.lookup.fingerprint}</Text>
+          <Text style={s.cardFingerprint}>{result.owner.fingerprint}</Text>
 
           <Pressable
             style={({ pressed }) => [s.connectBtn, pressed && s.connectBtnPressed, dial === 'connected' && s.connectBtnDone]}

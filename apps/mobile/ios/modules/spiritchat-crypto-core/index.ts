@@ -29,7 +29,14 @@ export type P2pEvent =
   | { type: 'usernameAnnouncementFailed'; username: string; reason: string }
   | { type: 'chainTipChanged'; height: number; hash: string }
   | { type: 'ledgerSubmissionRejected'; reason: string }
-  | { type: 'usernameOwnerResolved'; username: string; ownerPublicKeyBase64: string; claimedAtHeight: number }
+  | {
+      type: 'usernameOwnerResolved'
+      username: string
+      ownerPublicKeyBase64: string
+      claimedAtHeight: number
+      fingerprint: string
+      peerId: string
+    }
   | { type: 'usernameOwnerNotFound'; username: string }
   | { type: 'chainSyncCompleted'; height: number }
   | { type: 'chainSyncFailed'; peerId: string; reason: string }
@@ -363,8 +370,18 @@ export function queryLedgerChainTip(timeoutMs = 10_000): Promise<{ height: numbe
   })
 }
 
+/**
+ * How many blocks deep a claim needs to be before treating it as settled
+ * rather than still-reorgable — an app-level UI convention, not something
+ * the chain itself enforces (`ledger-core`'s validation rules don't know
+ * about "confirmations" at all). At the ~5-minute target block time this
+ * is roughly half an hour; see the project plan for why that specific
+ * number was chosen over faster-but-riskier alternatives.
+ */
+export const LEDGER_CONFIRMATION_DEPTH = 6
+
 export type LedgerUsernameOwner =
-  | { status: 'found'; ownerPublicKeyBase64: string; claimedAtHeight: number }
+  | { status: 'found'; ownerPublicKeyBase64: string; claimedAtHeight: number; fingerprint: string; peerId: string }
   | { status: 'not_found' }
 
 /**
@@ -373,6 +390,13 @@ export type LedgerUsernameOwner =
  * replacing), this is a real first-claim-wins answer with no "advisory
  * only" caveat, and (once synced) never needs a network round trip: this
  * node's local chain view *is* the answer.
+ *
+ * That last part is also the catch: the answer is only as good as this
+ * node's own sync state. `app/_layout.tsx` opportunistically requests a
+ * chain sync from every peer it connects to so this stays accurate without
+ * the caller having to think about it, but a node that hasn't connected to
+ * anyone yet (e.g. moments after a fresh launch, offline) can report
+ * `not_found` for a name someone else already holds.
  */
 export function queryLedgerUsernameOwner(username: string, timeoutMs = 10_000): Promise<LedgerUsernameOwner> {
   return new Promise((resolve, reject) => {
@@ -385,7 +409,13 @@ export function queryLedgerUsernameOwner(username: string, timeoutMs = 10_000): 
       if (event.type === 'usernameOwnerResolved' && event.username === username) {
         clearTimeout(timer)
         unsubscribe()
-        resolve({ status: 'found', ownerPublicKeyBase64: event.ownerPublicKeyBase64, claimedAtHeight: event.claimedAtHeight })
+        resolve({
+          status: 'found',
+          ownerPublicKeyBase64: event.ownerPublicKeyBase64,
+          claimedAtHeight: event.claimedAtHeight,
+          fingerprint: event.fingerprint,
+          peerId: event.peerId,
+        })
       } else if (event.type === 'usernameOwnerNotFound' && event.username === username) {
         clearTimeout(timer)
         unsubscribe()

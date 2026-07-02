@@ -8,8 +8,8 @@ import {
   blobLocalPath,
   blobClear,
   blobReserve,
-  lookupUsername,
-  announceUsername,
+  queryLedgerUsernameOwner,
+  submitLedgerUsernameClaim,
   signOut as nativeSignOut,
 } from '../modules/spiritchat-crypto-core'
 
@@ -33,10 +33,16 @@ const USERNAME_KEY     = 'profile.username'
 // it in the first place — there is no upload step.
 //
 // `username` is the odd one out: it's the one piece of profile data that
-// *is* published somewhere else (the public DHT — see UsernameClaim.swift),
-// so unlike a display name, a stranger with no prior connection can look
-// someone up by it. Optional, since nothing else in this app depends on
-// having one.
+// *is* published somewhere else — the phone-run `@username` ledger (see
+// spiritchat-ledger-core), a small purpose-built proof-of-work chain, not a
+// server — so unlike a display name, a stranger with no prior connection
+// can look someone up by it, and (once a claim is mined and confirmed) it's
+// guaranteed to be unique, not just advisory the way the old DHT-based
+// claims were. Optional, since nothing else in this app depends on having
+// one. This store only ever persists an *already-confirmed-or-submitted*
+// username locally (`persistUsername`) — the multi-stage submit/confirm
+// flow itself lives in app/settings/username.tsx, since it needs to show
+// fine-grained progress a single store action couldn't expose.
 interface ProfileState {
   isReady:         boolean
   fingerprint:     string
@@ -53,7 +59,7 @@ interface ProfileState {
   setBio:             (bio: string) => Promise<void>
   setAvatarFromFile:  (fileUri: string) => Promise<void>
   clearAvatar:        () => Promise<void>
-  setUsername:        (username: string) => Promise<void>
+  persistUsername:    (username: string) => Promise<void>
   signOut:            () => Promise<void>
 }
 
@@ -90,13 +96,30 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
       username:        storedUsername,
     })
 
-    // DHT records expire and need periodic re-publishing to stay resolvable
-    // — re-announce on every launch, same reasoning as blobReserve above
-    // for the avatar. Doesn't block startup on a DHT round-trip; if it
-    // fails (e.g. offline), the claim just lapses until the next launch or
-    // a manual re-save, not fatal to anything else.
+    // Unlike the old DHT claims, a confirmed ledger claim never expires or
+    // needs re-publishing — it's permanent chain state. But this node's
+    // *local* mempool is never persisted (see p2p-core's node.rs), so a
+    // claim submitted just before the app last closed could easily have
+    // been lost before any miner included it. Reconcile on every launch,
+    // without blocking startup on it: if the chain already shows this
+    // device as the owner, there's nothing to do; if someone else's claim
+    // won a race that happened while this device was offline, drop the
+    // now-invalid local name instead of continuing to show one that isn't
+    // actually held; otherwise (not found yet) resubmit — safe either way,
+    // since it's the same username/owner claim regardless of how many
+    // times it's (re)signed.
     if (storedUsername) {
-      announceUsername(storedUsername).catch(() => {})
+      queryLedgerUsernameOwner(storedUsername)
+        .then((owner) => {
+          if (owner.status === 'found' && owner.ownerPublicKeyBase64 === get().publicKey) return
+          if (owner.status === 'found') {
+            AsyncStorage.removeItem(USERNAME_KEY).catch(() => {})
+            set({ username: null })
+            return
+          }
+          submitLedgerUsernameClaim(storedUsername).catch(() => {})
+        })
+        .catch(() => {})
     }
   },
 
@@ -127,21 +150,16 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     set({ avatarId: null, avatarLocalPath: null })
   },
 
-  // Assumes `username` is already validated (see utils/username.ts) and
-  // lowercased/trimmed by the caller. Checking availability and publishing
-  // are two separate DHT round-trips (not one atomic operation — nothing
-  // in a plain DHT could make it atomic), so there's an inherent, small
-  // race window between them; this is the same "advisory, not a
-  // reservation" limitation documented on lookupUsername/announceUsername.
-  setUsername: async (username) => {
+  // Purely local: writes whatever username the caller already confirmed
+  // (or cleared) with the ledger — see app/settings/username.tsx, which
+  // owns the actual submit/confirm flow, since it needs to show
+  // fine-grained progress this store doesn't track.
+  persistUsername: async (username) => {
     if (username) {
-      const lookup = await lookupUsername(username)
-      if (lookup.status === 'resolved' && lookup.fingerprint !== get().fingerprint) {
-        throw new Error('Это имя пользователя уже занято')
-      }
-      await announceUsername(username)
+      await AsyncStorage.setItem(USERNAME_KEY, username)
+    } else {
+      await AsyncStorage.removeItem(USERNAME_KEY)
     }
-    await AsyncStorage.setItem(USERNAME_KEY, username)
     set({ username: username || null })
   },
 

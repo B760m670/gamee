@@ -11,6 +11,7 @@ import {
   fingerprint as cryptoCoreFingerprint,
   p2pLocalPeerId,
   addP2pEventListener,
+  requestLedgerChainSync,
 } from '../modules/spiritchat-crypto-core'
 
 const queryClient = new QueryClient({
@@ -65,6 +66,17 @@ export default function RootLayout() {
     }
     const unsubscribe = addP2pEventListener((event) => {
       console.log('[P2P] event: ' + JSON.stringify(event))
+
+      // Opportunistically catches this node's @username ledger up to
+      // whatever a newly connected peer knows. Without this, a freshly
+      // launched (or long-idle) app only sees blocks minted *after* it
+      // happened to be listening, and a username availability check or
+      // contact search could give a wrong answer purely because this
+      // device hasn't caught up yet — a no-op once already at least as
+      // heavy as the peer, so this is safe to fire on every connection.
+      if (event.type === 'peerConnected') {
+        requestLedgerChainSync(event.peerId).catch(() => {})
+      }
     })
     return unsubscribe
   }, [])

@@ -127,11 +127,18 @@ final class P2pSession {
     case .ledgerSubmissionRejected(let reason):
       return ["type": "ledgerSubmissionRejected", "reason": reason]
     case .usernameOwnerResolved(let username, let ownerPublicKey, let claimedAtHeight):
+      // The owner key came from a block already validated by consensus
+      // (its claim signature was checked before ever being mined), unlike
+      // a raw DHT record — so deriving fingerprint/peerId here can't
+      // meaningfully fail in practice; `try?` only guards against a
+      // genuinely corrupt key length, not an untrusted one.
       return [
         "type": "usernameOwnerResolved",
         "username": username,
         "ownerPublicKeyBase64": ownerPublicKey.base64EncodedString(),
         "claimedAtHeight": claimedAtHeight,
+        "fingerprint": (try? identityFingerprintOfPublicKey(publicKey: ownerPublicKey)) ?? "",
+        "peerId": (try? p2pPeerIdFromPublicKey(publicKey: ownerPublicKey)) ?? "",
       ]
     case .usernameOwnerNotFound(let username):
       return ["type": "usernameOwnerNotFound", "username": username]
