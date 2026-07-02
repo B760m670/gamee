@@ -23,6 +23,9 @@ pub enum CryptoError {
 
     #[error("too many skipped message keys in one chain (possible replay/DoS)")]
     TooManySkippedKeys,
+
+    #[error("invalid recovery phrase: {0}")]
+    InvalidRecoveryPhrase(String),
 }
 
 pub type Result<T> = core::result::Result<T, CryptoError>;

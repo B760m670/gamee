@@ -5,19 +5,30 @@ import Foundation
 /// (see `spiritchat_p2p_core::identity::keypair_from_seed`), so a peer's
 /// `PeerId` on the wire always matches the identity in their contact card.
 final class P2pSession {
-  static let shared = P2pSession()
+  private static var cached: P2pSession?
 
   let node: FfiP2pNode
 
-  private init() {
+  private init(identitySeed: Data) {
     do {
-      node = try FfiP2pNode.spawn(identitySeed: IdentitySession.shared.identity.secretBytes())
+      node = try FfiP2pNode.spawn(identitySeed: identitySeed)
     } catch {
       // Mirrors IdentitySession's fatalError: a node that silently failed
       // to start would leave the app looking connected while never sending
       // or receiving anything.
       fatalError("Failed to start the P2P node: \(error)")
     }
+  }
+
+  /// `nil` until `IdentitySession.shared` exists — the node's identity
+  /// comes from the exact same seed, so there is nothing to start until
+  /// onboarding (create or restore) has produced one.
+  static var shared: P2pSession? {
+    if let cached { return cached }
+    guard let identitySession = IdentitySession.shared else { return nil }
+    let session = P2pSession(identitySeed: identitySession.identity.secretBytes())
+    cached = session
+    return session
   }
 
   /// Encodes an event as a plain dictionary for the JS bridge, tagged by

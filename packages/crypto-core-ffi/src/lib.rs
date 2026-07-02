@@ -15,6 +15,7 @@ mod p2p_event;
 mod p2p_node;
 mod prekeys;
 mod ratchet;
+mod recovery_phrase;
 
 pub use agreement::FfiAgreementKey;
 pub use blob::blob_content_id;
@@ -26,5 +27,6 @@ pub use p2p_event::FfiP2pEvent;
 pub use p2p_node::FfiP2pNode;
 pub use prekeys::FfiPrekeyStore;
 pub use ratchet::FfiRatchet;
+pub use recovery_phrase::FfiRecoveryPhrase;
 
 uniffi::setup_scaffolding!();

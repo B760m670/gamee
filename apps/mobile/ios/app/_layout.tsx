@@ -7,6 +7,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context'
 import { StatusBar } from 'expo-status-bar'
 import { useFonts, Nunito_700Bold, Nunito_800ExtraBold } from '@expo-google-fonts/nunito'
 import {
+  hasIdentity,
   fingerprint as cryptoCoreFingerprint,
   p2pLocalPeerId,
   addP2pEventListener,
@@ -38,14 +39,19 @@ export default function RootLayout() {
   const [fontsLoaded] = useFonts({ Nunito_700Bold, Nunito_800ExtraBold })
 
   useEffect(() => {
-    // Loads (or, on first launch, creates) this device's persistent
-    // identity from the Keychain. A stable fingerprint across restarts is
-    // the proof that persistence actually works, not just that the
-    // native library loaded.
+    // On a fresh install there's no identity yet — onboarding (create or
+    // restore, see app/(onboarding)) hasn't run, so the calls below would
+    // throw. index.tsx handles that routing; this effect only logs the
+    // already-loaded identity as a smoke test, so skip it rather than log
+    // a misleading "failed" error for what's actually the expected state.
+    if (!hasIdentity()) return
+
+    // A stable fingerprint across restarts is the proof that Keychain
+    // persistence actually works, not just that the native library loaded.
     try {
       console.log('[CryptoCore] identity fingerprint: ' + cryptoCoreFingerprint())
     } catch (err) {
-      console.error('[CryptoCore] failed to load/create identity', err)
+      console.error('[CryptoCore] failed to load identity', err)
     }
 
     // The P2P node is started natively as soon as the module loads (see

@@ -1,23 +1,30 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { View, ActivityIndicator } from 'react-native'
 import { useRouter } from 'expo-router'
 import { useProfileStore } from '../store/profile'
+import { hasIdentity } from '../modules/spiritchat-crypto-core'
 
 export default function Index() {
   const router    = useRouter()
   const bootstrap = useProfileStore(s => s.bootstrap)
   const isReady   = useProfileStore(s => s.isReady)
+  const [checkedIdentity, setCheckedIdentity] = useState(false)
 
   useEffect(() => {
-    bootstrap()
+    // There's no account to log into — this device's Keychain identity,
+    // once it exists, is always available with no session/token to expire.
+    // The only real fork is whether one has ever been created here yet.
+    if (hasIdentity()) {
+      bootstrap()
+    } else {
+      router.replace('/(onboarding)/welcome')
+    }
+    setCheckedIdentity(true)
   }, [])
 
   useEffect(() => {
-    // There's no account to log into — the device's Keychain identity
-    // (loaded above) is always available once bootstrap resolves, so the
-    // only gate is "has it loaded yet", not "is there a session token".
-    if (isReady) router.replace('/(tabs)/messages')
-  }, [isReady])
+    if (checkedIdentity && isReady) router.replace('/(tabs)/messages')
+  }, [checkedIdentity, isReady])
 
   return (
     <View style={{ flex: 1, backgroundColor: '#000000', alignItems: 'center', justifyContent: 'center' }}>

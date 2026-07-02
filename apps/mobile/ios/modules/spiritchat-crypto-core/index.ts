@@ -29,6 +29,10 @@ type NativeEvents = {
 
 const NativeCryptoCore = requireNativeModule<
   {
+    hasIdentity(): boolean
+    generateRecoveryPhrase(): string
+    setIdentityFromWords(words: string): string
+    recoveryPhraseWords(): string | null
     fingerprint(): string
     publicKeyBase64(): string
     p2pLocalPeerId(): string
@@ -50,10 +54,61 @@ const NativeCryptoCore = requireNativeModule<
 >('SpiritchatCryptoCore')
 
 /**
+ * Whether an identity already exists on this device. Check this on launch
+ * to decide between onboarding (create a new account / restore from a
+ * recovery phrase) and going straight into the app — every other function
+ * here throws until this is true.
+ */
+export function hasIdentity(): boolean {
+  return NativeCryptoCore.hasIdentity()
+}
+
+/**
+ * Generates a brand-new 12-word BIP39 recovery phrase. Pure — nothing is
+ * persisted yet. Show it to the user, have them confirm they've written it
+ * down, then call `setIdentityFromWords` with the same words to actually
+ * create the account.
+ */
+export function generateRecoveryPhrase(): string {
+  return NativeCryptoCore.generateRecoveryPhrase()
+}
+
+/**
+ * Creates (or restores) this device's identity from `words` and persists
+ * it — there is no server anywhere in this project that could offer a
+ * "reset password" link, so this phrase is the only account-recovery
+ * mechanism there will ever be, the same as a cryptocurrency wallet's seed
+ * phrase. Works identically whether `words` came from
+ * `generateRecoveryPhrase` moments ago (new account) or was typed back in
+ * on a fresh install (recovery). Throws if the words fail BIP39 checksum
+ * validation (e.g. a typo). Returns the resulting fingerprint.
+ *
+ * Recovering an account restores the same fingerprint/PeerId, not the same
+ * conversations — the agreement key and prekeys are freshly generated
+ * every time this runs (deliberately not derived from the phrase, to
+ * preserve forward secrecy), so existing contacts will need to
+ * re-handshake, the same way losing a Signal-linked device does.
+ */
+export function setIdentityFromWords(words: string): string {
+  return NativeCryptoCore.setIdentityFromWords(words)
+}
+
+/**
+ * This device's recovery phrase, if still cached from when the identity
+ * was created/restored — for a Settings screen letting the user view it
+ * again. Null only if it somehow wasn't persisted alongside the identity
+ * (not expected in normal operation).
+ */
+export function recoveryPhraseWords(): string | null {
+  return NativeCryptoCore.recoveryPhraseWords()
+}
+
+/**
  * This device's persistent identity fingerprint ("1234 5678 9012"). The
  * underlying identity/agreement keys and prekey store are generated once
  * and stored in the iOS Keychain (see IdentitySession.swift) — this value
- * is stable across app restarts, not regenerated on every call.
+ * is stable across app restarts, not regenerated on every call. Throws if
+ * `hasIdentity()` is false — call `setIdentityFromWords` first.
  */
 export function fingerprint(): string {
   return NativeCryptoCore.fingerprint()

@@ -7,7 +7,7 @@
 
 use spiritchat_crypto_core_ffi::{
     x3dh_initiate, x3dh_respond, FfiAgreementKey, FfiContactCard, FfiIdentity, FfiPrekeyStore,
-    FfiRatchet,
+    FfiRatchet, FfiRecoveryPhrase,
 };
 
 struct Party {
@@ -122,6 +122,33 @@ fn an_identity_and_agreement_key_survive_a_round_trip_through_their_secret_bytes
     let agreement = FfiAgreementKey::generate();
     let restored = FfiAgreementKey::from_secret_bytes(agreement.secret_bytes()).unwrap();
     assert_eq!(agreement.public_bytes(), restored.public_bytes());
+}
+
+#[test]
+fn an_identity_recovered_from_its_recovery_phrase_has_the_same_fingerprint() {
+    let phrase = FfiRecoveryPhrase::generate();
+    assert_eq!(phrase.words().split_whitespace().count(), 12);
+
+    let identity = FfiIdentity::from_secret_bytes(phrase.derive_identity_seed()).unwrap();
+
+    // Simulates a fresh install: only the words survive, re-typed by the
+    // user, nothing else about the original device carries over.
+    let recovered_phrase = FfiRecoveryPhrase::from_words(phrase.words()).unwrap();
+    let recovered_identity =
+        FfiIdentity::from_secret_bytes(recovered_phrase.derive_identity_seed()).unwrap();
+
+    assert_eq!(identity.fingerprint(), recovered_identity.fingerprint());
+    assert_eq!(identity.public_key_bytes(), recovered_identity.public_key_bytes());
+}
+
+#[test]
+fn a_typo_in_the_recovery_phrase_is_rejected_before_it_can_derive_a_wrong_identity() {
+    let phrase = FfiRecoveryPhrase::generate();
+    let words = phrase.words();
+    let mut split: Vec<&str> = words.split_whitespace().collect();
+    split[0] = "zzzznotarealbip39word";
+    let mangled = split.join(" ");
+    assert!(FfiRecoveryPhrase::from_words(mangled).is_err());
 }
 
 #[test]

@@ -127,6 +127,15 @@ export default function EditProfileScreen() {
           Это криптографический отпечаток твоего устройства — сравни его с собеседником лично или по другому каналу, чтобы убедиться, что переписка не подменена. Он не редактируется и не зависит от имени.
         </Text>
 
+        <Pressable
+          style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
+          onPress={() => router.push('/settings/recovery-phrase')}
+        >
+          <View style={s.fieldRow}>
+            <Text style={s.recoveryLabel}>Фраза восстановления</Text>
+          </View>
+        </Pressable>
+
         <View style={[s.group, { marginTop: 12 }]}>
           <View style={s.fieldRow}>
             <Text style={s.fieldLabel}>О себе</Text>
@@ -187,6 +196,10 @@ const s = StyleSheet.create({
 
   fingerprintValue: { color: '#fff', fontSize: 15, fontVariant: ['tabular-nums'], marginTop: 2 },
   fingerprintHint:  { color: '#52525b', fontSize: 12, lineHeight: 17, marginTop: 8, marginHorizontal: 4 },
+
+  recoveryRow:        {},
+  recoveryRowPressed: { backgroundColor: '#1a1a1e' },
+  recoveryLabel:       { color: '#2f7bff', fontSize: 16, fontWeight: '500' },
 
   bioCount: { color: '#3f3f46', fontSize: 12, textAlign: 'right', marginTop: 4, marginRight: 4 },
 })
