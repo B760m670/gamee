@@ -51,6 +51,10 @@ jobs:
           echo "Selecting: $LATEST"
           sudo xcode-select -s "$LATEST"
           xcodebuild -version
+          # Recorded for the DerivedData cache key below — restoring a build
+          # cache produced by a different Xcode version onto this one is how
+          # you get bizarre, hard-to-debug archive failures.
+          echo "XCODE_VERSION=$(xcodebuild -version | head -1 | tr ' ' '_')" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
@@ -107,9 +111,43 @@ jobs:
       - name: Prebuild native iOS project
         run: npx expo prebuild --platform ios --no-install
 
+      # `expo prebuild` regenerates ios/ from scratch every run (it isn't
+      # committed), so there's no Podfile.lock carried over between runs to
+      # key a Pods/ cache on directly — but the *inputs* that determine what
+      # pod install resolves (package.json's dependency versions, this repo's
+      # own podspec) are stable across unrelated commits, so this still hits
+      # far more often than it misses.
+      - name: Cache CocoaPods downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            apps/mobile/ios/ios/Pods
+          key: cocoapods-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/modules/**/*.podspec') }}
+          restore-keys: |
+            cocoapods-${{ runner.os }}-
+
       - name: Install CocoaPods dependencies
         working-directory: apps/mobile/ios/ios
         run: pod install --repo-update
+
+      # The actual time sink isn't the Rust cross-compile above (well under a
+      # minute) — it's `xcodebuild archive` below recompiling every pod
+      # (Hermes, React Native core, every Expo module, reanimated, ...) from
+      # a bare DerivedData every single run. Restoring it here lets Xcode's
+      # own incremental build system skip recompiling anything whose inputs
+      # haven't changed, same as a local rebuild would; only this project's
+      # own changed source and its dependents get rebuilt. Keyed on
+      # Podfile.lock (now that pod install has generated it) so a dependency
+      # version bump still forces a full, correct rebuild instead of reusing
+      # stale object files.
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData
+          key: deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ hashFiles('apps/mobile/ios/ios/Podfile.lock') }}
+          restore-keys: |
+            deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
 
       - name: Detect Xcode scheme
         working-directory: apps/mobile/ios/ios
