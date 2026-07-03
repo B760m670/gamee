@@ -129,8 +129,6 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
       AsyncStorage.getItem(usernameKey(fingerprint)),
     ])
 
-    const avatarId = storedAvatarId && blobReserve(storedAvatarId) ? storedAvatarId : null
-
     // A P2P/ledger startup failure must never block onboarding — the
     // identity itself (fingerprint/publicKey, both purely local) is
     // already real regardless of whether P2P ever comes up. `peerId` is
@@ -138,11 +136,22 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     // string and surface the real reason instead of throwing.
     let peerId = ''
     let p2pStartupError: string | null = null
+    let p2pReady = true
     try {
       peerId = p2pLocalPeerId()
     } catch {
       p2pStartupError = p2pLastStartupErrorDescription()
+      p2pReady = false
     }
+
+    // blobReserve needs the same P2P session peerId does (registering the
+    // blob with the running node), so it's just as liable to hit the same
+    // transient not-ready-yet race — most visibly right after
+    // switchAccount, which tears down the previous node synchronously and
+    // leaves this one to lazily respawn. Skip it (rather than let it throw
+    // uncaught) whenever P2P isn't up yet; the retry loop below picks the
+    // avatar back up together with peerId once it is.
+    const avatarId = (p2pReady && storedAvatarId && blobReserve(storedAvatarId)) ? storedAvatarId : null
 
     set({
       isReady:         true,
@@ -172,7 +181,22 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
         for (let attempt = 0; attempt < P2P_RETRY_ATTEMPTS; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, P2P_RETRY_INTERVAL_MS))
           try {
-            set({ peerId: p2pLocalPeerId(), p2pStartupError: null })
+            const newPeerId = p2pLocalPeerId()
+            const update: Partial<ProfileState> = { peerId: newPeerId, p2pStartupError: null }
+            // The avatar reservation deferred above for the same reason —
+            // now that P2P is confirmed up, retry it too so the avatar
+            // doesn't stay blank for the rest of the session.
+            if (storedAvatarId && !get().avatarId) {
+              try {
+                if (blobReserve(storedAvatarId)) {
+                  update.avatarId = storedAvatarId
+                  update.avatarLocalPath = blobLocalPath(storedAvatarId)
+                }
+              } catch {
+                // still not reservable — leave it for next launch rather than loop forever here
+              }
+            }
+            set(update)
             return
           } catch {
             // still not up — keep the latest error text current in case it changed
