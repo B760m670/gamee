@@ -3152,6 +3152,7 @@ dependencies = [
  "futures",
  "hkdf",
  "libp2p",
+ "rand 0.8.6",
  "redb",
  "serde",
  "sha2",

@@ -17,6 +17,7 @@ hkdf = "0.12"
 redb = "2"
 sphinx-packet = "0.6"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

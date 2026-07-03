@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use libp2p::identify;
@@ -16,16 +16,18 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
-use sphinx_packet::route::NodeAddressBytes;
+use rand::seq::IteratorRandom;
+use rand::Rng;
+use sphinx_packet::route::{DestinationAddressBytes, NodeAddressBytes};
 use sphinx_packet::SphinxPacket;
 use spiritchat_ledger_core::block::MAX_TXS_PER_BLOCK;
 use spiritchat_ledger_core::difficulty::expand_target;
 use spiritchat_ledger_core::{ApplyOutcome, Block, BlockHeader, ChainStore, Hash32, Transaction};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use x25519_dalek::StaticSecret;
+use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse};
+use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse, MixMessage};
 use crate::bootstrap;
 use crate::command::Command;
 use crate::error::{P2pError, Result};
@@ -35,6 +37,21 @@ use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 use crate::mix;
 use crate::rendezvous;
 use crate::username;
+
+/// How often this node emits one piece of Loopix-style dummy traffic
+/// (drop cover or loop, chosen at random each time) toward a randomly
+/// chosen currently-connected mix peer — deliberately modest for now.
+/// Real Loopix tuning (balancing unlinkability strength against battery/
+/// data cost) is deferred to hardening (the plan's Phase 8); this exists
+/// so cover/loop traffic exists and is exercised at all, not to hit a
+/// specific published rate yet.
+const MIX_DUMMY_TRAFFIC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The average per-hop delay this node uses for traffic *it originates*
+/// (dummy packets here; real deposits will use their own value once
+/// wired in a later phase) — mirrors `MIX_DUMMY_TRAFFIC_INTERVAL` in
+/// being a placeholder magnitude, not a tuned constant.
+const MIX_DUMMY_TRAFFIC_HOP_DELAY: Duration = Duration::from_millis(100);
 
 pub struct P2pNode {
     local_peer_id: PeerId,
@@ -72,7 +89,7 @@ impl P2pNode {
         let keypair = identity::keypair_from_seed(&identity_seed)?;
         let local_peer_id = keypair.public().to_peer_id();
         let mut swarm = build_swarm(keypair)?;
-        let (mix_secret, _mix_public) = mix::routing_keypair_from_seed(&identity_seed);
+        let (mix_secret, mix_public) = mix::routing_keypair_from_seed(&identity_seed);
 
         let chain_store = ChainStore::open(&ledger_data_dir)?;
 
@@ -100,7 +117,7 @@ impl P2pNode {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_event_loop(swarm, chain_store, mix_secret, command_rx, event_tx));
+        let task = tokio::spawn(run_event_loop(swarm, chain_store, mix_secret, mix_public, command_rx, event_tx));
 
         Ok(Self {
             local_peer_id,
@@ -353,6 +370,7 @@ async fn run_event_loop(
     mut swarm: Swarm<Behaviour>,
     mut chain_store: ChainStore,
     mix_secret: StaticSecret,
+    mix_public: PublicKey,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<P2pEvent>,
 ) {
@@ -371,6 +389,22 @@ async fn run_event_loop(
     // phase; forwarding an already-built packet only ever needs to reach
     // whichever specific peer the path already named.
     let mut known_mix_relays: HashMap<NodeAddressBytes, PeerId> = HashMap::new();
+    // Sphinx routing public keys learned from peers this node has
+    // exchanged mix traffic with (real or dummy) — see `MixMessage`'s own
+    // doc comment for why riding this alongside the packet bytes, rather
+    // than a separate directory lookup, is enough to originate loop/cover
+    // traffic through peers already reachable this way. Real deposit path
+    // *selection* through peers not yet exchanged-with is a later phase's
+    // job (a published relay directory), not this one's.
+    let mut known_mix_routing_keys: HashMap<PeerId, PublicKey> = HashMap::new();
+    // A Forward outcome's own `Delay` (chosen by whoever originated the
+    // packet, revealed to this hop only by peeling) must actually be
+    // honored before re-sending — otherwise "Poisson mixing" is just a
+    // label with no effect on real timing. Since the event loop can never
+    // block waiting on a single delay, each Forward spawns its own sleep
+    // and reports back over this channel once it's actually time to send.
+    let (mix_forward_tx, mut mix_forward_rx) = mpsc::unbounded_channel::<(PeerId, MixMessage)>();
+    let mut dummy_traffic_interval = tokio::time::interval(MIX_DUMMY_TRAFFIC_INTERVAL);
     // Not-yet-mined @username claims this node knows about (submitted
     // locally or received over gossip) — never persisted, matching every
     // other in-memory-only piece of state in this crate; a mempool only
@@ -408,17 +442,32 @@ async fn run_event_loop(
                 if !dht_ready && needs_dht_peer(&command) {
                     deferred_commands.push(command);
                 } else {
-                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &events, command);
+                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &events, command);
                 }
             }
             swarm_event = swarm.select_next_some() => {
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
-                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &events, command);
+                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &events, command);
                     }
                 }
-                handle_swarm_event(&mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining, &mut known_mix_relays, &mix_secret, &events, swarm_event);
+                handle_swarm_event(
+                    &mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining,
+                    &mut known_mix_relays, &mut known_mix_routing_keys, &mix_secret, mix_public, &mix_forward_tx,
+                    &events, swarm_event,
+                );
+            }
+            Some((next_peer, mix_message)) = mix_forward_rx.recv() => {
+                // The Poisson delay this Forward's own Sphinx header
+                // specified has now actually elapsed (see
+                // `handle_mix_event`) — only now does the re-encrypted
+                // packet actually leave this node.
+                swarm.behaviour_mut().mix.send_request(&next_peer, mix_message);
+            }
+            _ = dummy_traffic_interval.tick() => {
+                let local_peer_id = *swarm.local_peer_id();
+                emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
             }
             Some((generation, block)) = mining_result_rx.recv() => {
                 let is_current = mining.active.as_ref().map(|state| state.generation) == Some(generation);
@@ -475,6 +524,7 @@ fn handle_command(
     local_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     mempool: &mut HashMap<Hash32, Transaction>,
     mining: &mut Mining,
+    mix_public: PublicKey,
     events: &mpsc::UnboundedSender<P2pEvent>,
     command: Command,
 ) {
@@ -548,7 +598,8 @@ fn handle_command(
         }
 
         Command::SendMixPacket { first_hop, packet_bytes } => {
-            swarm.behaviour_mut().mix.send_request(&first_hop, packet_bytes);
+            let message = MixMessage { packet_bytes, sender_routing_public_key: mix_public.to_bytes() };
+            swarm.behaviour_mut().mix.send_request(&first_hop, message);
         }
 
         Command::AnnounceUsername { username, claim } => {
@@ -671,7 +722,10 @@ fn handle_swarm_event(
     mempool: &mut HashMap<Hash32, Transaction>,
     mining: &mut Mining,
     known_mix_relays: &mut HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &mut HashMap<PeerId, PublicKey>,
     mix_secret: &StaticSecret,
+    mix_public: PublicKey,
+    mix_forward_tx: &mpsc::UnboundedSender<(PeerId, MixMessage)>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: SwarmEvent<BehaviourEvent>,
 ) {
@@ -731,7 +785,7 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Mix(mix_event)) => {
-            handle_mix_event(swarm, known_mix_relays, mix_secret, events, mix_event);
+            handle_mix_event(swarm, known_mix_relays, known_mix_routing_keys, mix_secret, mix_public, mix_forward_tx, events, mix_event);
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerGossip(gossip_event)) => {
@@ -897,30 +951,59 @@ fn handle_blob_event(
 /// path. Deterministic immediate-forward for now (no Poisson/cover
 /// traffic scheduling yet — that's the next phase); this is the hop-by-hop
 /// wire mechanics being proven correct in isolation first.
+#[allow(clippy::too_many_arguments)]
 fn handle_mix_event(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &mut HashMap<PeerId, PublicKey>,
     mix_secret: &StaticSecret,
+    mix_public: PublicKey,
+    mix_forward_tx: &mpsc::UnboundedSender<(PeerId, MixMessage)>,
     events: &mpsc::UnboundedSender<P2pEvent>,
-    event: request_response::Event<Vec<u8>, Vec<u8>>,
+    event: request_response::Event<MixMessage, ()>,
 ) {
     match event {
-        request_response::Event::Message { message, .. } => match message {
-            request_response::Message::Request { request: packet_bytes, channel, .. } => {
+        request_response::Event::Message { peer, message, .. } => match message {
+            request_response::Message::Request { request, channel, .. } => {
                 // The mix protocol's "response" carries no information of
                 // its own, same as the envelope protocol's — it exists
                 // only so the sending peer's outbound request resolves.
-                let _ = swarm.behaviour_mut().mix.send_response(channel, Vec::new());
+                let _ = swarm.behaviour_mut().mix.send_response(channel, ());
 
-                let Ok(packet) = SphinxPacket::from_bytes(&packet_bytes) else {
+                // Learned organically from real traffic, not a directory
+                // lookup — see `MixMessage`'s own doc comment. Recorded
+                // even if peeling below fails: knowing this peer's routing
+                // key is still useful for future traffic regardless of
+                // whether this one packet was corrupt or not meant for us.
+                known_mix_routing_keys.insert(peer, PublicKey::from(request.sender_routing_public_key));
+
+                let Ok(packet) = SphinxPacket::from_bytes(&request.packet_bytes) else {
                     let _ = events.send(P2pEvent::MixForwardFailed { reason: "malformed Sphinx packet".into() });
                     return;
                 };
                 match mix::peel(packet, mix_secret) {
-                    Ok(mix::PeelOutcome::Forward { next_hop_packet, next_hop_address, .. }) => {
+                    Ok(mix::PeelOutcome::Forward { next_hop_packet, next_hop_address, delay }) => {
                         match known_mix_relays.get(&next_hop_address) {
-                            Some(next_peer) => {
-                                swarm.behaviour_mut().mix.send_request(next_peer, next_hop_packet.to_bytes());
+                            Some(&next_peer) => {
+                                // Loopix mixing: actually wait out the
+                                // delay this packet's own Sphinx header
+                                // specified before sending it onward,
+                                // rather than forwarding the instant it
+                                // arrives — otherwise "the header carries a
+                                // delay" would be true but meaningless. The
+                                // event loop itself must never block on
+                                // this, so the wait happens on its own
+                                // task, reporting back over a channel once
+                                // it's actually time to send.
+                                let forward_tx = mix_forward_tx.clone();
+                                let message = MixMessage {
+                                    packet_bytes: next_hop_packet.to_bytes(),
+                                    sender_routing_public_key: mix_public.to_bytes(),
+                                };
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay.to_duration()).await;
+                                    let _ = forward_tx.send((next_peer, message));
+                                });
                             }
                             None => {
                                 let _ = events.send(P2pEvent::MixForwardFailed {
@@ -930,7 +1013,14 @@ fn handle_mix_event(
                         }
                     }
                     Ok(mix::PeelOutcome::Final { payload, .. }) => {
-                        let _ = events.send(P2pEvent::MixPacketArrived { payload });
+                        // Loop/cover traffic — either this node's own,
+                        // having made it back around, or a peer's, sent
+                        // through this node as an intermediate hop earlier
+                        // in its path. Either way it was never meant to be
+                        // surfaced as a real message.
+                        if !mix::is_dummy_payload(&payload) {
+                            let _ = events.send(P2pEvent::MixPacketArrived { payload });
+                        }
                     }
                     Err(err) => {
                         let _ = events.send(P2pEvent::MixForwardFailed { reason: err.to_string() });
@@ -944,6 +1034,58 @@ fn handle_mix_event(
         }
         _ => {}
     }
+}
+
+/// Sends one piece of Loopix-style dummy traffic — indistinguishable on
+/// the wire from a real deposit/query — toward a randomly chosen
+/// currently-connected mix peer whose routing key this node has already
+/// learned (see `MixMessage`). A no-op if there isn't at least one such
+/// peer yet (e.g. right after startup, or a node with mix relaying
+/// disabled). Chooses between the two shapes Loopix itself defines:
+/// **drop cover** (a single hop, addressed directly to the chosen peer —
+/// they are the final hop and simply discard it) and **loop** (two hops,
+/// out through the chosen peer and back to this node itself as the final
+/// hop — the same self-monitoring traffic Loopix's own design describes).
+/// Failures are deliberately not surfaced as `P2pEvent::MixForwardFailed`:
+/// a dropped piece of cover traffic isn't a failure worth telling the app
+/// about, only a real deposit/query failing to route is.
+fn emit_dummy_mix_traffic(
+    swarm: &mut Swarm<Behaviour>,
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+    local_peer_id: PeerId,
+    mix_public: PublicKey,
+) {
+    let mut rng = rand::thread_rng();
+    // Only a peer whose routing key this node has actually learned (via
+    // MixMessage, not this node's own) is usable as a hop — connectivity
+    // alone (`known_mix_relays`) is enough to *forward* a hop someone else
+    // already built, but not to build a new one that routes through them.
+    let candidates: Vec<(NodeAddressBytes, PeerId, PublicKey)> = known_mix_relays
+        .iter()
+        .filter_map(|(&address, &peer)| known_mix_routing_keys.get(&peer).map(|&key| (address, peer, key)))
+        .collect();
+    let Some(&(relay_address, relay_peer, relay_public)) = candidates.iter().choose(&mut rng) else {
+        return;
+    };
+    let relay_hop = mix::MixHop { address: relay_address, public_key: relay_public };
+
+    let path = if rng.gen_bool(0.5) {
+        // Drop cover: one hop, the chosen peer is the destination.
+        vec![relay_hop]
+    } else {
+        // Loop: two hops, back to this node itself.
+        let self_hop = mix::MixHop { address: mix::node_address_for(&local_peer_id.to_bytes()), public_key: mix_public };
+        vec![relay_hop, self_hop]
+    };
+
+    let destination_address = DestinationAddressBytes::from_bytes(rng.gen());
+    let identifier = rng.gen();
+    let Ok(packet) = mix::build_dummy_packet(&path, destination_address, identifier, MIX_DUMMY_TRAFFIC_HOP_DELAY) else {
+        return;
+    };
+    let message = MixMessage { packet_bytes: packet.to_bytes(), sender_routing_public_key: mix_public.to_bytes() };
+    swarm.behaviour_mut().mix.send_request(&relay_peer, message);
 }
 
 /// New blocks/claims arriving over gossip. Deliberately does **not**

@@ -111,6 +111,38 @@ pub fn build_packet(
     SphinxPacket::new(message.to_vec(), &route, &destination, &delays).map_err(to_mix_err)
 }
 
+/// Prefixes the plaintext payload of loop/cover traffic — Sphinx packets
+/// this node (or a peer doing the same thing) generated purely to shape
+/// traffic timing/volume, never a real deposit or query. Only the packet's
+/// final hop ever sees a payload at all (an intermediate relay only ever
+/// sees a `Forward` outcome, never plaintext), so this marker never leaks
+/// to anyone the dummy packet wasn't already addressed to — which, for
+/// both loop and cover traffic, is always either this node itself or
+/// exactly the peer generating its own dummy traffic the same way, so
+/// seeing it is never surprising or evidence that a real message was
+/// suppressed.
+const DUMMY_PAYLOAD_MARKER: &[u8] = b"spiritchat-mix-dummy-v1";
+
+/// Whether a peeled final-hop payload is loop/cover traffic rather than a
+/// real deposit or query — the receiving end's cue to discard it silently
+/// instead of surfacing `P2pEvent::MixPacketArrived`.
+pub fn is_dummy_payload(payload: &[u8]) -> bool {
+    payload.starts_with(DUMMY_PAYLOAD_MARKER)
+}
+
+/// Builds a Sphinx packet carrying nothing but `DUMMY_PAYLOAD_MARKER` —
+/// bitwise indistinguishable from a real deposit/query packet to anyone
+/// but the final hop that decrypts it, which is the whole point: loop and
+/// cover traffic must cost an outside observer nothing to rule out.
+pub fn build_dummy_packet(
+    path: &[MixHop],
+    destination_address: DestinationAddressBytes,
+    destination_identifier: SURBIdentifier,
+    average_hop_delay: std::time::Duration,
+) -> Result<SphinxPacket> {
+    build_packet(DUMMY_PAYLOAD_MARKER, path, destination_address, destination_identifier, average_hop_delay)
+}
+
 /// What peeling one layer off an incoming packet, at this node, produces.
 pub enum PeelOutcome {
     /// Not the final hop — forward `next_hop_packet` to whoever answers to
@@ -235,6 +267,31 @@ mod tests {
         // The derived secret must actually match the derived public key —
         // not just be *some* deterministic value.
         assert_eq!(PublicKey::from(&secret_a).as_bytes(), public_a.as_bytes());
+    }
+
+    #[test]
+    fn a_dummy_packet_is_recognized_as_dummy_once_peeled() {
+        let hop = generate_hop(1);
+        let path = vec![MixHop { address: hop.hop.address, public_key: hop.hop.public_key }];
+
+        let packet = build_dummy_packet(
+            &path,
+            DestinationAddressBytes::from_bytes([0u8; 32]),
+            [0u8; 16],
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let PeelOutcome::Final { payload, .. } = peel(packet, &hop.secret).unwrap() else {
+            panic!("a single-hop dummy packet must peel to a Final outcome");
+        };
+        assert!(is_dummy_payload(&payload));
+    }
+
+    #[test]
+    fn a_real_message_is_never_mistaken_for_a_dummy() {
+        assert!(!is_dummy_payload(b"a message no single hop should be able to read or fully trace"));
+        assert!(!is_dummy_payload(b""));
     }
 
     #[test]
