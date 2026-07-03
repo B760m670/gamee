@@ -1,17 +1,16 @@
-import { useCallback, useState } from 'react'
+import { useState } from 'react'
 import {
   View, Text, FlatList, Pressable,
   ActivityIndicator, Keyboard, useWindowDimensions, StyleSheet,
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
-import { useRouter, useFocusEffect } from 'expo-router'
+import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { SearchBar } from '../../components/SearchBar'
 import { UserListItem } from '../../components/UserListItem'
 import { ConversationRow } from '../../components/ConversationRow'
-import { useUserSearch, normalizeQuery, type PublicUser } from '../../hooks/useUserSearch'
-import { useConversations } from '../../hooks/useConversations'
-import { useProfileStore } from '../../store/profile'
+import { useUsernameSearch, normalizeUsernameQuery, type FoundUser } from '../../hooks/useUsernameSearch'
+import { useChatStore } from '../../store/chat'
 
 const SEARCH_H = 54 // height of the collapsed search trigger, hidden above the fold
 
@@ -19,16 +18,14 @@ export default function ChatsScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const { height } = useWindowDimensions()
-  const me = useProfileStore(s => s.peerId)
+  const conversations = useChatStore(s => s.conversations)
 
   const [active, setActive] = useState(false)
   const [query,  setQuery]  = useState('')
 
-  const { results, loading: searching, error } = useUserSearch(active ? query : '')
-  const { items, loading: loadingConvs, reload } = useConversations()
-  const term = normalizeQuery(query)
-
-  useFocusEffect(useCallback(() => { reload() }, [reload]))
+  const { results, loading: searching, error } = useUsernameSearch(active ? query : '')
+  const items = Object.values(conversations).sort((a, b) => b.lastMessageAt - a.lastMessageAt)
+  const term = normalizeUsernameQuery(query)
 
   function closeSearch() {
     Keyboard.dismiss()
@@ -36,9 +33,22 @@ export default function ChatsScreen() {
     setQuery('')
   }
 
-  function openChat(userId: string) {
+  function openChat(peerId: string) {
     Keyboard.dismiss()
-    router.push({ pathname: '/chat/[userId]', params: { userId } })
+    router.push({ pathname: '/chat/[userId]', params: { userId: peerId } })
+  }
+
+  function openFoundUser(user: FoundUser) {
+    Keyboard.dismiss()
+    router.push({
+      pathname: '/chat/[userId]',
+      params: {
+        userId: user.peerId,
+        peerFingerprint: user.fingerprint,
+        peerPublicKeyBase64: user.publicKeyBase64,
+        peerUsername: user.username,
+      },
+    })
   }
 
   return (
@@ -49,27 +59,21 @@ export default function ChatsScreen() {
 
       <FlatList
         data={items}
-        keyExtractor={c => c.conversation_id}
-        renderItem={({ item }) => <ConversationRow item={item} meId={me} onPress={openChat} />}
+        keyExtractor={c => c.peerId}
+        renderItem={({ item }) => <ConversationRow item={item} onPress={openChat} />}
         contentOffset={{ x: 0, y: SEARCH_H }}
         showsVerticalScrollIndicator={false}
         ListHeaderComponent={
           <Pressable style={s.trigger} onPress={() => setActive(true)}>
-            <Ionicons name="search" size={18} color="#52525b" />
-            <Text style={s.triggerText}>Поиск</Text>
+            <Ionicons name="at" size={18} color="#52525b" />
+            <Text style={s.triggerText}>Найти по имени пользователя</Text>
           </Pressable>
         }
         ListEmptyComponent={
-          loadingConvs ? (
-            <View style={[s.empty, { minHeight: height - insets.top - 160 }]}>
-              <ActivityIndicator color="#52525b" />
-            </View>
-          ) : (
-            <View style={[s.empty, { minHeight: height - insets.top - 160 }]}>
-              <Ionicons name="chatbubbles-outline" size={56} color="#27272a" />
-              <Text style={s.emptyText}>Здесь появятся ваши чаты</Text>
-            </View>
-          )
+          <View style={[s.empty, { minHeight: height - insets.top - 160 }]}>
+            <Ionicons name="chatbubbles-outline" size={56} color="#27272a" />
+            <Text style={s.emptyText}>Здесь появятся ваши чаты</Text>
+          </View>
         }
       />
 
@@ -77,10 +81,13 @@ export default function ChatsScreen() {
         <View style={[s.overlay, { paddingTop: insets.top }]}>
           <SearchBar value={query} onChangeText={setQuery} onCancel={closeSearch} autoFocus />
 
-          {term.length < 2 ? (
+          {term.length < 5 ? (
             <View style={s.hint}>
               <Ionicons name="at" size={40} color="#27272a" />
               <Text style={s.hintText}>Введите имя пользователя для поиска</Text>
+              <Text style={s.hintSubtext}>
+                Поиск работает только по точному имени — это открытая P2P-сеть без сервера, а не каталог всех пользователей.
+              </Text>
             </View>
           ) : searching ? (
             <View style={s.hint}>
@@ -93,15 +100,13 @@ export default function ChatsScreen() {
           ) : results.length === 0 ? (
             <View style={s.hint}>
               <Ionicons name="search" size={40} color="#27272a" />
-              <Text style={s.hintText}>Ничего не найдено</Text>
+              <Text style={s.hintText}>Никто не публикует такое имя прямо сейчас</Text>
             </View>
           ) : (
             <FlatList
               data={results}
-              keyExtractor={u => u.id}
-              renderItem={({ item }: { item: PublicUser }) => (
-                <UserListItem user={item} onPress={(u) => openChat(u.id)} />
-              )}
+              keyExtractor={u => u.peerId}
+              renderItem={({ item }) => <UserListItem user={item} onPress={openFoundUser} />}
               keyboardShouldPersistTaps="handled"
               keyboardDismissMode="on-drag"
               ListHeaderComponent={<Text style={s.sectionHeader}>Пользователи</Text>}
@@ -137,7 +142,8 @@ const s = StyleSheet.create({
     textTransform: 'uppercase',
   },
 
-  hint:      { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12, paddingTop: 60 },
-  hintText:  { color: '#52525b', fontSize: 15 },
-  errorText: { color: '#f87171', fontSize: 15 },
+  hint:         { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12, paddingTop: 60, paddingHorizontal: 32 },
+  hintText:     { color: '#52525b', fontSize: 15, textAlign: 'center' },
+  hintSubtext:  { color: '#3f3f46', fontSize: 12, textAlign: 'center', lineHeight: 17 },
+  errorText:    { color: '#f87171', fontSize: 15 },
 })

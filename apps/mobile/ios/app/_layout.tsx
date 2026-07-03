@@ -11,9 +11,11 @@ import {
   fingerprint as cryptoCoreFingerprint,
   p2pLocalPeerId,
   addP2pEventListener,
+  addChatEventListener,
   requestLedgerChainSync,
 } from '../modules/spiritchat-crypto-core'
 import { useProfileStore } from '../store/profile'
+import { useChatStore } from '../store/chat'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -66,6 +68,31 @@ function P2pStartupErrorBanner() {
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({ Nunito_700Bold, Nunito_800ExtraBold })
+  const fingerprint = useProfileStore(s => s.fingerprint)
+
+  // Chat events are handled entirely in the store (see store/chat.ts) —
+  // this just wires the native event stream to it, once for the app's
+  // lifetime; ChatManager.swift already only ever emits for whichever
+  // account is currently active, so nothing here needs to change on an
+  // account switch.
+  useEffect(() => {
+    return addChatEventListener((event) => {
+      useChatStore.getState().handleChatEvent(event)
+    })
+  }, [])
+
+  // Loads the active account's own conversations whenever `fingerprint`
+  // changes — on first bootstrap, and again on every account switch, since
+  // a different fingerprint means an entirely different, namespaced set of
+  // conversations (see store/chat.ts's AsyncStorage key helpers). Resets
+  // to empty when it goes blank (signed out of every account).
+  useEffect(() => {
+    if (fingerprint) {
+      useChatStore.getState().loadForFingerprint(fingerprint)
+    } else {
+      useChatStore.getState().reset()
+    }
+  }, [fingerprint])
 
   useEffect(() => {
     // On a fresh install there's no identity yet — onboarding (create or

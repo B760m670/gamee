@@ -1,28 +1,27 @@
 import { memo } from 'react'
 import { Pressable, View, Text, StyleSheet } from 'react-native'
 import { Avatar } from './Avatar'
-import type { PublicUser } from '../hooks/useUserSearch'
+import type { FoundUser } from '../hooks/useUsernameSearch'
 
 interface Props {
-  user: PublicUser
-  onPress: (user: PublicUser) => void
+  user: FoundUser
+  onPress: (user: FoundUser) => void
 }
 
+// A single compact row — this device has no way to know a stranger's
+// display name or avatar until they choose to share it in conversation
+// (there is no server-side profile to fetch), so @username plus a
+// fingerprint-initialed placeholder avatar is all a search result can show.
 function UserListItemBase({ user, onPress }: Props) {
-  const title = user.display_name?.trim() || (user.username ? `@${user.username}` : 'Без имени')
-  const subtitle = user.username ? `@${user.username}` : null
-
   return (
     <Pressable
       style={({ pressed }) => [s.row, pressed && s.rowPressed]}
       onPress={() => onPress(user)}
     >
-      <Avatar uri={user.avatar_url} size={46} username={user.username ?? user.display_name} />
+      <Avatar uri={null} size={46} username={user.username} />
       <View style={s.text}>
-        <Text style={s.title} numberOfLines={1}>{title}</Text>
-        {subtitle && title !== subtitle ? (
-          <Text style={s.subtitle} numberOfLines={1}>{subtitle}</Text>
-        ) : null}
+        <Text style={s.title} numberOfLines={1}>{`@${user.username}`}</Text>
+        <Text style={s.subtitle} numberOfLines={1}>{user.fingerprint}</Text>
       </View>
     </Pressable>
   )
@@ -38,5 +37,5 @@ const s = StyleSheet.create({
   rowPressed: { backgroundColor: '#1a1a1e' },
   text:     { flex: 1, gap: 2 },
   title:    { color: '#fff', fontSize: 16, fontWeight: '600' },
-  subtitle: { color: '#52525b', fontSize: 14 },
+  subtitle: { color: '#52525b', fontSize: 13, fontVariant: ['tabular-nums'] },
 })

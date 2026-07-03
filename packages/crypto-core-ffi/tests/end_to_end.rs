@@ -42,9 +42,13 @@ fn establish_session(
     let bob_card = FfiContactCard::parse(bob.contact_card_bytes()).unwrap();
 
     let handshake = x3dh_initiate(&alice.identity, &alice.agreement, &bob_card).unwrap();
-    let bob_shared_secret =
+    let bob_response =
         x3dh_respond(&bob.agreement, &bob.prekeys, handshake.initial_message.clone()).unwrap();
-    assert_eq!(bob_shared_secret, handshake.shared_secret);
+    assert_eq!(bob_response.shared_secret, handshake.shared_secret);
+    assert_eq!(
+        bob_response.initiator_identity_bytes,
+        alice.identity.public_key_bytes()
+    );
 
     let alice_ratchet = FfiRatchet::init_initiator(
         handshake.shared_secret.clone(),

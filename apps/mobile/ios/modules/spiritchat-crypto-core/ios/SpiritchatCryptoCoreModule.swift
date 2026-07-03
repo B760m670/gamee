@@ -9,6 +9,11 @@ enum MiningError: Error {
   case malformedPublicKey(String)
 }
 
+enum ChatError: Error {
+  case malformedPublicKey(String)
+  case malformedPlaintext
+}
+
 private func requireIdentity() throws -> IdentitySession {
   guard let session = IdentitySession.shared else { throw IdentitySessionError.notYetInitialized }
   return session
@@ -134,7 +139,7 @@ public class SpiritchatCryptoCoreModule: Module {
       try removeAccountSlot(slot)
     }
 
-    Events("onP2pEvent")
+    Events("onP2pEvent", "onChatEvent")
 
     // Starts pumping the P2P node's event loop as soon as an identity
     // exists — immediately on launch if one was already on this device,
@@ -153,8 +158,10 @@ public class SpiritchatCryptoCoreModule: Module {
           }
           guard let session = P2pSession.shared else { continue }
           MiningController.shared.start()
+          session.chatManager.emit = { event in self.sendEvent("onChatEvent", event) }
           while let event = await session.node.nextEvent() {
             self.sendEvent("onP2pEvent", P2pSession.encode(event))
+            session.chatManager.handleP2pEvent(event)
           }
           // The node shut down (sign out) — loop back and wait for the
           // next one instead of letting this task end.
@@ -359,6 +366,26 @@ public class SpiritchatCryptoCoreModule: Module {
     // mining.
     Function("p2pStopMining") { () throws in
       try requireP2pSession().node.stopMining()
+    }
+
+    // Queues `plaintext` for `peerId` and starts delivering it immediately
+    // — durable on disk before this returns, so it's never lost even if
+    // the peer is offline or this device restarts before it goes out (see
+    // ChatManager/ChatStore). `peerPublicKeyBase64` is required the first
+    // time this device messages `peerId` (X3DH needs it to fetch/verify
+    // their contact card); once a session exists it's only used to keep
+    // the local record consistent. Returns a local id — match it against
+    // `messageSent`/`messageFailed` on `onChatEvent` to update that
+    // message's status; `messageReceived` on the same event answers
+    // incoming messages, sender-initiated or not.
+    Function("chatSendMessage") { (peerId: String, peerPublicKeyBase64: String, plaintext: String) throws -> String in
+      guard let publicKey = Data(base64Encoded: peerPublicKeyBase64) else {
+        throw ChatError.malformedPublicKey(peerPublicKeyBase64)
+      }
+      guard let plaintextBytes = plaintext.data(using: .utf8) else {
+        throw ChatError.malformedPlaintext
+      }
+      return try requireP2pSession().chatManager.sendMessage(peerId: peerId, peerPublicKey: publicKey, plaintext: plaintextBytes)
     }
   }
 }

@@ -42,8 +42,20 @@ export type P2pEvent =
   | { type: 'chainSyncFailed'; peerId: string; reason: string }
   | { type: 'newBlockMined'; height: number }
 
+/**
+ * Synthesized by `ChatManager.swift` from decrypted/queued messages — not a
+ * mirror of a Rust `P2pEvent` the way `P2pEvent` above is, since the
+ * crypto/session logic behind these lives entirely on the Swift side (JS
+ * never sees raw envelope bytes or handshake data, only these results).
+ */
+export type ChatEvent =
+  | { type: 'messageReceived'; peerId: string; peerFingerprint: string; peerPublicKeyBase64: string; plaintext: string; at: number }
+  | { type: 'messageSent'; peerId: string; localId: string }
+  | { type: 'messageFailed'; peerId: string; localId: string; reason: string }
+
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
+  onChatEvent(event: ChatEvent): void
 }
 
 const NativeCryptoCore = requireNativeModule<
@@ -82,6 +94,7 @@ const NativeCryptoCore = requireNativeModule<
     p2pQueryChainTip(): void
     p2pStartMining(publicKeyBase64: string): void
     p2pStopMining(): void
+    chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -596,4 +609,34 @@ export function startLedgerMining(publicKeyBase64Value: string = publicKeyBase64
 /** Stops mining started by `startLedgerMining`. A no-op if not currently mining. */
 export function stopLedgerMining(): void {
   NativeCryptoCore.p2pStopMining()
+}
+
+/**
+ * Queues `plaintext` for `peerId` and starts delivering it immediately —
+ * durable on this device before this call returns, so sending works the
+ * same whether `peerId` is online right now or not. `peerPublicKeyBase64`
+ * is needed the first time this device messages `peerId` (to fetch and
+ * verify their contact card, then run X3DH); pass whatever this device
+ * already knows about them (e.g. from a ledger username lookup) every time
+ * — cheap to repeat once a session already exists.
+ *
+ * Returns a local id — watch `onChatEvent` for a `messageSent`/
+ * `messageFailed` carrying the same `localId` to learn what happened to
+ * this specific message (delivery is transport-level, like
+ * `p2pSendEnvelope`'s own `envelopeDelivered` — not a read receipt).
+ *
+ * There is no relay/mailbox server anywhere in this project: if `peerId`
+ * never comes online again, this message can never be delivered — but it
+ * isn't lost either. It stays queued and is retried automatically the next
+ * time this device sees that peer reconnect (including across an app
+ * restart), for as long as this device keeps running.
+ */
+export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string {
+  return NativeCryptoCore.chatSendMessage(peerId, peerPublicKeyBase64, plaintext)
+}
+
+/** Subscribes to decrypted/queued-message events. Returns an unsubscribe function. */
+export function addChatEventListener(listener: (event: ChatEvent) => void): () => void {
+  const subscription = NativeCryptoCore.addListener('onChatEvent', listener)
+  return () => subscription.remove()
 }

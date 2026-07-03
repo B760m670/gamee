@@ -22,7 +22,7 @@ pub use agreement::FfiAgreementKey;
 pub use blob::blob_content_id;
 pub use contact_card::FfiContactCard;
 pub use error::FfiError;
-pub use handshake::{x3dh_initiate, x3dh_respond, FfiHandshakeResult};
+pub use handshake::{x3dh_initiate, x3dh_respond, FfiHandshakeResult, FfiRespondResult};
 pub use identity::{identity_fingerprint_of_public_key, identity_verify, FfiIdentity};
 pub use ledger::ledger_build_username_claim;
 pub use p2p_event::FfiP2pEvent;

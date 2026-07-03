@@ -29,9 +29,15 @@ final class P2pSession {
   private(set) static var lastStartupError: Error?
 
   let node: FfiP2pNode
+  /// Owns end-to-end-encrypted messaging for this session — created fresh
+  /// alongside `node` so it's always torn down and rebuilt together with
+  /// it (sign-out, account switch), never left pointing at a stale node or
+  /// identity. See `ChatManager`'s own doc comment for what it does.
+  let chatManager: ChatManager
 
-  private init(node: FfiP2pNode) {
+  private init(node: FfiP2pNode, chatManager: ChatManager) {
     self.node = node
+    self.chatManager = chatManager
   }
 
   /// Where the `@username` ledger's on-disk `redb` database file lives —
@@ -81,7 +87,14 @@ final class P2pSession {
         identitySeed: identitySession.identity.secretBytes(),
         ledgerDataDir: Self.ledgerDatabasePath.path
       )
-      let session = P2pSession(node: node)
+      let chatManager = ChatManager(
+        slot: identitySession.slot,
+        node: node,
+        identity: identitySession.identity,
+        agreement: identitySession.agreement,
+        prekeys: identitySession.prekeys
+      )
+      let session = P2pSession(node: node, chatManager: chatManager)
       cached = session
       lastStartupError = nil
       return session

@@ -1,35 +1,31 @@
 import { memo } from 'react'
 import { View, Text, StyleSheet } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
-import type { ChatMessage } from '../lib/chat'
+import type { ChatMessage } from '../store/chat'
 
 interface Props {
   msg: ChatMessage
-  isMine: boolean
-  readByOther: boolean
 }
 
-function formatTime(iso: string): string {
-  const d = new Date(iso)
+function formatTime(epochMs: number): string {
+  const d = new Date(epochMs)
   const hh = d.getHours().toString().padStart(2, '0')
   const mm = d.getMinutes().toString().padStart(2, '0')
   return `${hh}:${mm}`
 }
 
-function MessageBubbleBase({ msg, isMine, readByOther }: Props) {
+function MessageBubbleBase({ msg }: Props) {
   return (
-    <View style={[s.wrap, isMine ? s.wrapMine : s.wrapOther]}>
-      <View style={[s.bubble, isMine ? s.bubbleMine : s.bubbleOther]}>
-        {msg.content ? <Text style={s.text}>{msg.content}</Text> : null}
+    <View style={[s.wrap, msg.outgoing ? s.wrapMine : s.wrapOther]}>
+      <View style={[s.bubble, msg.outgoing ? s.bubbleMine : s.bubbleOther]}>
+        <Text style={s.text}>{msg.text}</Text>
         <View style={s.meta}>
-          <Text style={s.time}>{formatTime(msg.created_at)}</Text>
-          {isMine ? (
+          <Text style={s.time}>{formatTime(msg.at)}</Text>
+          {msg.outgoing ? (
             msg.status === 'sending' ? (
               <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.7)" />
             ) : msg.status === 'failed' ? (
               <Ionicons name="alert-circle" size={13} color="#fecaca" />
-            ) : readByOther ? (
-              <Ionicons name="checkmark-done" size={14} color="#9fd1ff" />
             ) : (
               <Ionicons name="checkmark" size={14} color="rgba(255,255,255,0.7)" />
             )
