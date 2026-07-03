@@ -16,11 +16,14 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use sphinx_packet::route::NodeAddressBytes;
+use sphinx_packet::SphinxPacket;
 use spiritchat_ledger_core::block::MAX_TXS_PER_BLOCK;
 use spiritchat_ledger_core::difficulty::expand_target;
 use spiritchat_ledger_core::{ApplyOutcome, Block, BlockHeader, ChainStore, Hash32, Transaction};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use x25519_dalek::StaticSecret;
 
 use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse};
 use crate::bootstrap;
@@ -29,6 +32,7 @@ use crate::error::{P2pError, Result};
 use crate::event::P2pEvent;
 use crate::identity;
 use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
+use crate::mix;
 use crate::rendezvous;
 use crate::username;
 
@@ -68,6 +72,7 @@ impl P2pNode {
         let keypair = identity::keypair_from_seed(&identity_seed)?;
         let local_peer_id = keypair.public().to_peer_id();
         let mut swarm = build_swarm(keypair)?;
+        let (mix_secret, _mix_public) = mix::routing_keypair_from_seed(&identity_seed);
 
         let chain_store = ChainStore::open(&ledger_data_dir)?;
 
@@ -95,7 +100,7 @@ impl P2pNode {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_event_loop(swarm, chain_store, command_rx, event_tx));
+        let task = tokio::spawn(run_event_loop(swarm, chain_store, mix_secret, command_rx, event_tx));
 
         Ok(Self {
             local_peer_id,
@@ -347,6 +352,7 @@ fn mine(
 async fn run_event_loop(
     mut swarm: Swarm<Behaviour>,
     mut chain_store: ChainStore,
+    mix_secret: StaticSecret,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<P2pEvent>,
 ) {
@@ -356,6 +362,15 @@ async fn run_event_loop(
     // task — persisting them across restarts, if desired, is the app's
     // job (it already has the bytes; it just re-issues SetLocalBlob).
     let mut local_blobs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    // Which currently-connected peers answer to which Sphinx routing
+    // address (`mix::node_address_for`) — how a mix hop resolves a peeled
+    // packet's `next_hop_address` back into someone it can actually dial.
+    // Deliberately just "peers we're connected to right now", not a
+    // separate discovery/directory mechanism: relay *selection* (who to
+    // route new packets through) is a sender-side concern for a later
+    // phase; forwarding an already-built packet only ever needs to reach
+    // whichever specific peer the path already named.
+    let mut known_mix_relays: HashMap<NodeAddressBytes, PeerId> = HashMap::new();
     // Not-yet-mined @username claims this node knows about (submitted
     // locally or received over gossip) — never persisted, matching every
     // other in-memory-only piece of state in this crate; a mempool only
@@ -403,7 +418,7 @@ async fn run_event_loop(
                         handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &events, command);
                     }
                 }
-                handle_swarm_event(&mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining, &events, swarm_event);
+                handle_swarm_event(&mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining, &mut known_mix_relays, &mix_secret, &events, swarm_event);
             }
             Some((generation, block)) = mining_result_rx.recv() => {
                 let is_current = mining.active.as_ref().map(|state| state.generation) == Some(generation);
@@ -532,6 +547,10 @@ fn handle_command(
             pending.blob_fetch.insert(request_id, (peer, id));
         }
 
+        Command::SendMixPacket { first_hop, packet_bytes } => {
+            swarm.behaviour_mut().mix.send_request(&first_hop, packet_bytes);
+        }
+
         Command::AnnounceUsername { username, claim } => {
             let key = username::record_key_for(&username);
             let record = Record::new(key, claim);
@@ -651,6 +670,8 @@ fn handle_swarm_event(
     local_blobs: &HashMap<Vec<u8>, Vec<u8>>,
     mempool: &mut HashMap<Hash32, Transaction>,
     mining: &mut Mining,
+    known_mix_relays: &mut HashMap<NodeAddressBytes, PeerId>,
+    mix_secret: &StaticSecret,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: SwarmEvent<BehaviourEvent>,
 ) {
@@ -660,10 +681,12 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            known_mix_relays.insert(mix::node_address_for(&peer_id.to_bytes()), peer_id);
             let _ = events.send(P2pEvent::PeerConnected(peer_id));
         }
 
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            known_mix_relays.remove(&mix::node_address_for(&peer_id.to_bytes()));
             let _ = events.send(P2pEvent::PeerDisconnected(peer_id));
         }
 
@@ -705,6 +728,10 @@ fn handle_swarm_event(
 
         SwarmEvent::Behaviour(BehaviourEvent::Blob(blob_event)) => {
             handle_blob_event(swarm, pending, local_blobs, events, blob_event);
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::Mix(mix_event)) => {
+            handle_mix_event(swarm, known_mix_relays, mix_secret, events, mix_event);
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerGossip(gossip_event)) => {
@@ -856,6 +883,64 @@ fn handle_blob_event(
             if let Some((peer, id)) = pending.blob_fetch.remove(&request_id) {
                 let _ = events.send(P2pEvent::BlobFetchFailed { peer, id, reason: error.to_string() });
             }
+        }
+        _ => {}
+    }
+}
+
+/// Received a raw Sphinx packet, whether from the original sender (this
+/// node is the first hop) or from a previous relay. Peeling with this
+/// node's own mix routing secret reveals only what this one layer was
+/// encrypted to say — either "forward this (different, re-encrypted)
+/// packet to whoever answers to this address next" or "you're the last
+/// hop, here's the payload" — never anything about hops further along the
+/// path. Deterministic immediate-forward for now (no Poisson/cover
+/// traffic scheduling yet — that's the next phase); this is the hop-by-hop
+/// wire mechanics being proven correct in isolation first.
+fn handle_mix_event(
+    swarm: &mut Swarm<Behaviour>,
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    mix_secret: &StaticSecret,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+) {
+    match event {
+        request_response::Event::Message { message, .. } => match message {
+            request_response::Message::Request { request: packet_bytes, channel, .. } => {
+                // The mix protocol's "response" carries no information of
+                // its own, same as the envelope protocol's — it exists
+                // only so the sending peer's outbound request resolves.
+                let _ = swarm.behaviour_mut().mix.send_response(channel, Vec::new());
+
+                let Ok(packet) = SphinxPacket::from_bytes(&packet_bytes) else {
+                    let _ = events.send(P2pEvent::MixForwardFailed { reason: "malformed Sphinx packet".into() });
+                    return;
+                };
+                match mix::peel(packet, mix_secret) {
+                    Ok(mix::PeelOutcome::Forward { next_hop_packet, next_hop_address, .. }) => {
+                        match known_mix_relays.get(&next_hop_address) {
+                            Some(next_peer) => {
+                                swarm.behaviour_mut().mix.send_request(next_peer, next_hop_packet.to_bytes());
+                            }
+                            None => {
+                                let _ = events.send(P2pEvent::MixForwardFailed {
+                                    reason: "next hop is not a currently reachable peer".into(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(mix::PeelOutcome::Final { payload, .. }) => {
+                        let _ = events.send(P2pEvent::MixPacketArrived { payload });
+                    }
+                    Err(err) => {
+                        let _ = events.send(P2pEvent::MixForwardFailed { reason: err.to_string() });
+                    }
+                }
+            }
+            request_response::Message::Response { .. } => {}
+        },
+        request_response::Event::OutboundFailure { error, .. } => {
+            let _ = events.send(P2pEvent::MixForwardFailed { reason: error.to_string() });
         }
         _ => {}
     }

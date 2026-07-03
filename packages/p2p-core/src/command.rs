@@ -53,6 +53,16 @@ pub enum Command {
     /// `P2pEvent::BlobFetched`/`BlobFetchFailed`.
     FetchBlob { peer: PeerId, id: Vec<u8> },
 
+    /// Sends an already-built Sphinx packet (`mix::build_packet`) to
+    /// `first_hop`, the first node in whatever path the caller chose.
+    /// Every hop after that is handled automatically by this crate's own
+    /// event loop, peeling and re-forwarding as `MixPacket` requests arrive
+    /// — the caller never talks to intermediate hops directly, only
+    /// receives `P2pEvent::MixPacketArrived` if and when this node itself
+    /// ends up being a path's final hop. Requires an existing connection
+    /// to `first_hop`, same as `SendEnvelope`.
+    SendMixPacket { first_hop: PeerId, packet_bytes: Vec<u8> },
+
     /// Publishes `claim` under the DHT key derived from `username` (see
     /// `username::record_key_for`). `claim` is opaque to this crate — the
     /// app layer is responsible for making it self-certifying (e.g. a

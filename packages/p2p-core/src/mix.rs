@@ -25,6 +25,8 @@
 //! actual `SendEnvelope`-style dial-and-deliver, and a `FinalHop` into
 //! `mailbox.rs`'s (soon to be tag-addressed) storage, is Phase 2's job.
 
+use hkdf::Hkdf;
+use sha2::Sha256;
 use sphinx_packet::header::delays::{self, Delay};
 use sphinx_packet::route::{Destination, DestinationAddressBytes, Node, NodeAddressBytes, SURBIdentifier};
 use sphinx_packet::{ProcessedPacket, ProcessedPacketData, SphinxPacket};
@@ -57,11 +59,29 @@ pub struct MixHop {
 /// hash," resolved back to a real dialable peer via Phase 2's mix-relay
 /// directory, not by inverting the hash.
 pub fn node_address_for(peer_id_bytes: &[u8]) -> NodeAddressBytes {
-    use sha2::{Digest, Sha256};
+    use sha2::Digest;
     let digest = Sha256::digest(peer_id_bytes);
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&digest);
     NodeAddressBytes::from_bytes(bytes)
+}
+
+/// Derives this node's mix routing keypair from the same 32-byte seed its
+/// libp2p identity already comes from (`identity::keypair_from_seed`) —
+/// domain-separated via HKDF so one raw seed produces two cryptographically
+/// independent keys for two different jobs (the signing/noise-handshake
+/// identity vs. Sphinx's own per-hop Diffie-Hellman), never reusing raw key
+/// material across purposes. Deterministic on purpose: this node needs to
+/// reconstruct the same routing secret on every restart without a separate
+/// keyfile, the same way its libp2p identity already does.
+pub fn routing_keypair_from_seed(identity_seed: &[u8; 32]) -> (StaticSecret, PublicKey) {
+    let hk = Hkdf::<Sha256>::new(None, identity_seed);
+    let mut scalar = [0u8; 32];
+    hk.expand(b"spiritchat-mix-routing-key-v1", &mut scalar)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    let secret = StaticSecret::from(scalar);
+    let public = PublicKey::from(&secret);
+    (secret, public)
 }
 
 /// Builds a Sphinx packet carrying `message` through `path` (in order),
@@ -202,6 +222,19 @@ mod tests {
             Err(other) => panic!("expected a Mix error, got a different P2pError variant: {other}"),
             Ok(_) => panic!("a path longer than MAX_PATH_LENGTH must be rejected"),
         }
+    }
+
+    #[test]
+    fn routing_keys_are_deterministic_from_seed_but_differ_from_a_different_seed() {
+        let (secret_a, public_a) = routing_keypair_from_seed(&[1u8; 32]);
+        let (_secret_a_again, public_a_again) = routing_keypair_from_seed(&[1u8; 32]);
+        let (_secret_b, public_b) = routing_keypair_from_seed(&[2u8; 32]);
+
+        assert_eq!(public_a.as_bytes(), public_a_again.as_bytes());
+        assert_ne!(public_a.as_bytes(), public_b.as_bytes());
+        // The derived secret must actually match the derived public key —
+        // not just be *some* deterministic value.
+        assert_eq!(PublicKey::from(&secret_a).as_bytes(), public_a.as_bytes());
     }
 
     #[test]

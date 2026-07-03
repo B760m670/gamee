@@ -68,6 +68,21 @@ pub enum P2pEvent {
     /// request otherwise failed outright).
     BlobFetchFailed { peer: PeerId, id: Vec<u8>, reason: String },
 
+    /// This node was a Sphinx packet's final hop (see `mix.rs`) —
+    /// `payload` is whatever bytes the original sender's `mix::build_packet`
+    /// wrapped. This layer never interprets `payload` itself, the same way
+    /// `EnvelopeReceived` never interprets its own bytes; what it means
+    /// (e.g. a mailbox deposit or a retrieval query) is decided above this
+    /// crate.
+    MixPacketArrived { payload: Vec<u8> },
+
+    /// A Sphinx packet addressed to this node (as a relay or the final
+    /// hop) could not be forwarded or delivered — a malformed/corrupted
+    /// packet, a peel that failed to decrypt (meaning this packet was never
+    /// really meant for this node), or a resolved next hop that isn't a
+    /// peer this node is currently connected to.
+    MixForwardFailed { reason: String },
+
     /// A DHT lookup for `username` finished with a currently-published
     /// claim (which may or may not be this node's own — the caller is
     /// responsible for verifying it before trusting it).
