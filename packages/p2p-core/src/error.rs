@@ -25,6 +25,9 @@ pub enum P2pError {
 
     #[error("@username ledger storage error: {0}")]
     Ledger(String),
+
+    #[error("mailbox error: {0}")]
+    Mailbox(String),
 }
 
 impl From<spiritchat_ledger_core::LedgerError> for P2pError {

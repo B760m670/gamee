@@ -25,6 +25,7 @@ mod error;
 mod event;
 mod identity;
 mod ledger;
+mod mailbox;
 mod node;
 mod rendezvous;
 mod username;
