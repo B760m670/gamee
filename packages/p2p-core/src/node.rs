@@ -416,6 +416,9 @@ async fn run_event_loop(
     // and reports back over this channel once it's actually time to send.
     let (mix_forward_tx, mut mix_forward_rx) = mpsc::unbounded_channel::<(PeerId, MixMessage)>();
     let mut dummy_traffic_interval = tokio::time::interval(MIX_DUMMY_TRAFFIC_INTERVAL);
+    // Gated by `Command::SetMixDummyTrafficActive` — off until the app
+    // layer says otherwise (see that command's own doc comment for why).
+    let mut mix_dummy_traffic_active = false;
     // `Command::DepositToMailbox`'s PoW mining runs on a blocking thread
     // (mirrors the ledger's own mining loop) and reports the finished,
     // stamped deposit back here so the event loop itself can pick a mix
@@ -459,14 +462,14 @@ async fn run_event_loop(
                 if !dht_ready && needs_dht_peer(&command) {
                     deferred_commands.push(command);
                 } else {
-                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &events, command);
+                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &mut mix_dummy_traffic_active, &events, command);
                 }
             }
             swarm_event = swarm.select_next_some() => {
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
-                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &events, command);
+                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &mut mix_dummy_traffic_active, &events, command);
                     }
                 }
                 handle_swarm_event(
@@ -483,7 +486,9 @@ async fn run_event_loop(
                 swarm.behaviour_mut().mix.send_request(&next_peer, mix_message);
             }
             _ = dummy_traffic_interval.tick() => {
-                emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
+                if mix_dummy_traffic_active {
+                    emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
+                }
             }
             Some(deposit) = deposit_rx.recv() => {
                 // The blocking PoW mining `Command::DepositToMailbox`
@@ -551,6 +556,7 @@ fn handle_command(
     local_peer_id: PeerId,
     mix_public: PublicKey,
     deposit_tx: &mpsc::UnboundedSender<mailbox::MailboxDeposit>,
+    mix_dummy_traffic_active: &mut bool,
     events: &mpsc::UnboundedSender<P2pEvent>,
     command: Command,
 ) {
@@ -714,6 +720,10 @@ fn handle_command(
 
         Command::StopMining => {
             mining.stop();
+        }
+
+        Command::SetMixDummyTrafficActive { enabled } => {
+            *mix_dummy_traffic_active = enabled;
         }
 
         // Handled in run_event_loop before this function is ever called —

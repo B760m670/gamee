@@ -300,6 +300,17 @@ impl FfiP2pNode {
         self.send(Command::AnnounceMixRelay)
     }
 
+    /// Turns this node's sustained Loopix dummy-traffic generation on or
+    /// off — off by default at spawn. Meant to be called alongside
+    /// `announce_mix_relay`, gated by the same policy (e.g.
+    /// `MixRelayController` on iOS): passive forwarding for others needs
+    /// no gate at all (cheap, only happens when asked), but continuously
+    /// originating cover/loop packets is an ongoing cost worth an explicit
+    /// on/off switch.
+    pub fn set_mix_dummy_traffic_active(&self, enabled: bool) -> FfiResult<()> {
+        self.send(Command::SetMixDummyTrafficActive { enabled })
+    }
+
     /// Cleanly stops this node — after this, `next_event` returns `None`.
     /// For "sign out": the identity this node was built from is going
     /// away, and a new one needs a new node, not a reused one. Dropping

@@ -190,6 +190,17 @@ pub enum Command {
     /// currently mining.
     StopMining,
 
+    /// Turns this node's Loopix-style dummy traffic generation (drop cover
+    /// and loop packets toward known mix relays, on `MIX_DUMMY_TRAFFIC_INTERVAL`)
+    /// on or off. Defaults to off at spawn — unlike passive per-packet mix
+    /// forwarding (always on for whoever routes traffic through this node;
+    /// cheap, event-driven, needs no gate) and `AnnounceMixRelay` (a one-shot
+    /// the app calls whenever it wants), sustained dummy traffic is an
+    /// ongoing background cost the app layer should only opt into when it's
+    /// judged worth paying — e.g. `MixRelayController` on iOS, mirroring
+    /// `StartMining`/`StopMining`'s own foreground+charging gate.
+    SetMixDummyTrafficActive { enabled: bool },
+
     /// Cleanly stops the event loop — after this, `next_event` returns
     /// `None` and the node can no longer be used; a new identity needs a
     /// new `P2pNode::spawn`, not a reused one. For an app-level "sign out":

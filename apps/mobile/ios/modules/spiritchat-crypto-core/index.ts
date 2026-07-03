@@ -100,6 +100,8 @@ const NativeCryptoCore = requireNativeModule<
     p2pQueryChainTip(): void
     p2pStartMining(publicKeyBase64: string): void
     p2pStopMining(): void
+    mixRelayParticipationEnabled(): boolean
+    setMixRelayParticipationEnabled(enabled: boolean): void
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
@@ -628,6 +630,26 @@ export function startLedgerMining(publicKeyBase64Value: string = publicKeyBase64
 /** Stops mining started by `startLedgerMining`. A no-op if not currently mining. */
 export function stopLedgerMining(): void {
   NativeCryptoCore.p2pStopMining()
+}
+
+/**
+ * Whether this device offers to relay/announce for the Sphinx/Loopix
+ * mixnet at all — the Settings toggle backing `MixRelayController.swift`.
+ * Defaults to on. Actual participation additionally requires foreground +
+ * charging (the same device-state gate `MiningController` uses for
+ * mining) — this toggle only controls whether the device is *willing* to,
+ * not whether it's doing so right this moment.
+ */
+export function mixRelayParticipationEnabled(): boolean {
+  return NativeCryptoCore.mixRelayParticipationEnabled()
+}
+
+/**
+ * Sets the Settings toggle `mixRelayParticipationEnabled` reads — takes
+ * effect immediately (no need to background/foreground the app first).
+ */
+export function setMixRelayParticipationEnabled(enabled: boolean): void {
+  NativeCryptoCore.setMixRelayParticipationEnabled(enabled)
 }
 
 /**
