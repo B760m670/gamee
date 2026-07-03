@@ -34,6 +34,7 @@ use crate::error::{P2pError, Result};
 use crate::event::P2pEvent;
 use crate::identity;
 use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
+use crate::mailbox;
 use crate::mix;
 use crate::rendezvous;
 use crate::username;
@@ -92,6 +93,13 @@ impl P2pNode {
         let (mix_secret, mix_public) = mix::routing_keypair_from_seed(&identity_seed);
 
         let chain_store = ChainStore::open(&ledger_data_dir)?;
+        // A dedicated file, sibling to the ledger's own — see
+        // `mailbox::MailboxStore::open`'s own doc comment. Deriving this
+        // from `ledger_data_dir` rather than taking a whole extra
+        // parameter keeps every existing caller (tests, the FFI layer,
+        // Swift) working unchanged.
+        let mailbox_data_dir = ledger_data_dir.with_file_name("mailbox.redb");
+        let mailbox_store = mailbox::MailboxStore::open(&mailbox_data_dir)?;
 
         // Always listen, on an OS-assigned port over both transports, so
         // this node is directly dialable whenever it isn't behind a NAT
@@ -117,7 +125,7 @@ impl P2pNode {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_event_loop(swarm, chain_store, mix_secret, mix_public, command_rx, event_tx));
+        let task = tokio::spawn(run_event_loop(swarm, chain_store, mailbox_store, mix_secret, mix_public, command_rx, event_tx));
 
         Ok(Self {
             local_peer_id,
@@ -369,6 +377,7 @@ fn mine(
 async fn run_event_loop(
     mut swarm: Swarm<Behaviour>,
     mut chain_store: ChainStore,
+    mut mailbox_store: mailbox::MailboxStore,
     mix_secret: StaticSecret,
     mix_public: PublicKey,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -405,6 +414,12 @@ async fn run_event_loop(
     // and reports back over this channel once it's actually time to send.
     let (mix_forward_tx, mut mix_forward_rx) = mpsc::unbounded_channel::<(PeerId, MixMessage)>();
     let mut dummy_traffic_interval = tokio::time::interval(MIX_DUMMY_TRAFFIC_INTERVAL);
+    // `Command::DepositToMailbox`'s PoW mining runs on a blocking thread
+    // (mirrors the ledger's own mining loop) and reports the finished,
+    // stamped deposit back here so the event loop itself can pick a mix
+    // path and send it — mining must never share a thread with the async
+    // loop driving the swarm.
+    let (deposit_tx, mut deposit_rx) = mpsc::unbounded_channel::<mailbox::MailboxDeposit>();
     // Not-yet-mined @username claims this node knows about (submitted
     // locally or received over gossip) — never persisted, matching every
     // other in-memory-only piece of state in this crate; a mempool only
@@ -442,19 +457,19 @@ async fn run_event_loop(
                 if !dht_ready && needs_dht_peer(&command) {
                     deferred_commands.push(command);
                 } else {
-                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &events, command);
+                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &deposit_tx, &events, command);
                 }
             }
             swarm_event = swarm.select_next_some() => {
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
-                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &events, command);
+                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &deposit_tx, &events, command);
                     }
                 }
                 handle_swarm_event(
                     &mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining,
-                    &mut known_mix_relays, &mut known_mix_routing_keys, &mix_secret, mix_public, &mix_forward_tx,
+                    &mut known_mix_relays, &mut known_mix_routing_keys, &mut mailbox_store, &mix_secret, mix_public, &mix_forward_tx,
                     &events, swarm_event,
                 );
             }
@@ -468,6 +483,12 @@ async fn run_event_loop(
             _ = dummy_traffic_interval.tick() => {
                 let local_peer_id = *swarm.local_peer_id();
                 emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
+            }
+            Some(deposit) = deposit_rx.recv() => {
+                // The blocking PoW mining `Command::DepositToMailbox`
+                // kicked off has finished — now pick a path and actually
+                // send it into the mix.
+                send_mailbox_deposit(&mut swarm, &known_mix_relays, &known_mix_routing_keys, mix_public, deposit, &events);
             }
             Some((generation, block)) = mining_result_rx.recv() => {
                 let is_current = mining.active.as_ref().map(|state| state.generation) == Some(generation);
@@ -525,6 +546,7 @@ fn handle_command(
     mempool: &mut HashMap<Hash32, Transaction>,
     mining: &mut Mining,
     mix_public: PublicKey,
+    deposit_tx: &mpsc::UnboundedSender<mailbox::MailboxDeposit>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     command: Command,
 ) {
@@ -607,6 +629,19 @@ fn handle_command(
             if let Ok(bytes) = bincode::serialize(&announcement) {
                 let _ = swarm.behaviour_mut().ledger_gossip.publish(behaviour::mix_relay_directory_topic(), bytes);
             }
+        }
+
+        Command::DepositToMailbox { shared_material, envelope } => {
+            let deposit_tx = deposit_tx.clone();
+            // Mining the PoW stamp is pure CPU grinding — same reasoning
+            // as the ledger's own mining loop for never running it on the
+            // thread driving the swarm.
+            tokio::task::spawn_blocking(move || {
+                let deposited_at = mailbox::now_unix();
+                let tag = mailbox::mailbox_tag(&shared_material, mailbox::epoch_for(deposited_at));
+                let pow_nonce = mailbox::mine_stamp(&tag, &envelope, deposited_at);
+                let _ = deposit_tx.send(mailbox::MailboxDeposit { tag, envelope, deposited_at, pow_nonce });
+            });
         }
 
         Command::AnnounceUsername { username, claim } => {
@@ -730,6 +765,7 @@ fn handle_swarm_event(
     mining: &mut Mining,
     known_mix_relays: &mut HashMap<NodeAddressBytes, PeerId>,
     known_mix_routing_keys: &mut HashMap<PeerId, PublicKey>,
+    mailbox_store: &mut mailbox::MailboxStore,
     mix_secret: &StaticSecret,
     mix_public: PublicKey,
     mix_forward_tx: &mpsc::UnboundedSender<(PeerId, MixMessage)>,
@@ -792,7 +828,7 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Mix(mix_event)) => {
-            handle_mix_event(swarm, known_mix_relays, known_mix_routing_keys, mix_secret, mix_public, mix_forward_tx, events, mix_event);
+            handle_mix_event(swarm, known_mix_relays, known_mix_routing_keys, mailbox_store, mix_secret, mix_public, mix_forward_tx, events, mix_event);
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerGossip(gossip_event)) => {
@@ -963,6 +999,7 @@ fn handle_mix_event(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
     known_mix_routing_keys: &mut HashMap<PeerId, PublicKey>,
+    mailbox_store: &mut mailbox::MailboxStore,
     mix_secret: &StaticSecret,
     mix_public: PublicKey,
     mix_forward_tx: &mpsc::UnboundedSender<(PeerId, MixMessage)>,
@@ -1020,12 +1057,34 @@ fn handle_mix_event(
                         }
                     }
                     Ok(mix::PeelOutcome::Final { payload, .. }) => {
-                        // Loop/cover traffic — either this node's own,
-                        // having made it back around, or a peer's, sent
-                        // through this node as an intermediate hop earlier
-                        // in its path. Either way it was never meant to be
-                        // surfaced as a real message.
-                        if !mix::is_dummy_payload(&payload) {
+                        if mix::is_dummy_payload(&payload) {
+                            // Loop/cover traffic — either this node's own,
+                            // having made it back around, or a peer's,
+                            // sent through this node as an intermediate
+                            // hop earlier in its path. Either way it was
+                            // never meant to be surfaced as a real
+                            // message.
+                        } else if let Some(deposit) = parse_mailbox_deposit(&payload) {
+                            // A mailbox deposit routed to this node as its
+                            // final hop — this node is the caching relay
+                            // now, never told (and structurally unable to
+                            // learn) who the real recipient is, only the
+                            // unlinkable tag they'll look it up under
+                            // later. Silently dropped if it fails
+                            // validation: replying with a rejection reason
+                            // would need routing a response back to an
+                            // anonymous sender, which this crate doesn't
+                            // yet support (no SURB use yet) — and would
+                            // arguably leak more than it's worth to a
+                            // sender who can already tell locally whether
+                            // their own stamp/timestamp were valid before
+                            // ever sending.
+                            if mailbox::validate(&deposit, mailbox::now_unix()).is_ok()
+                                && mailbox_store.accept(deposit).is_ok()
+                            {
+                                let _ = events.send(P2pEvent::MailboxDepositStored);
+                            }
+                        } else {
                             let _ = events.send(P2pEvent::MixPacketArrived { payload });
                         }
                     }
@@ -1041,6 +1100,79 @@ fn handle_mix_event(
         }
         _ => {}
     }
+}
+
+/// A single leading byte distinguishing a mailbox deposit's framed
+/// payload from anything else a Sphinx packet's final hop might carry —
+/// `mix.rs` itself stays agnostic of what a payload means (only
+/// `is_dummy_payload`'s prefix check is its own concern); this framing
+/// belongs here, in the one place that already knows about both `mix.rs`
+/// and `mailbox.rs`. Never collides with `DUMMY_PAYLOAD_MARKER` (an ASCII
+/// string) since this is a single non-ASCII-leading byte.
+const MIX_PAYLOAD_DEPOSIT_TAG: u8 = 0x01;
+
+fn frame_mailbox_deposit(deposit: &mailbox::MailboxDeposit) -> Option<Vec<u8>> {
+    let mut out = vec![MIX_PAYLOAD_DEPOSIT_TAG];
+    out.extend(bincode::serialize(deposit).ok()?);
+    Some(out)
+}
+
+fn parse_mailbox_deposit(payload: &[u8]) -> Option<mailbox::MailboxDeposit> {
+    let (&tag, rest) = payload.split_first()?;
+    if tag != MIX_PAYLOAD_DEPOSIT_TAG {
+        return None;
+    }
+    bincode::deserialize(rest).ok()
+}
+
+/// Routes an already-stamped `deposit` into the mix, addressed so that
+/// whichever relay ends up as the path's final hop stores it — see
+/// `Command::DepositToMailbox`'s own doc comment. Picks a path the exact
+/// same way `emit_dummy_mix_traffic` does (a peer this node is both
+/// connected to and already knows the routing key of); a real deposit
+/// deserves the same "only route through what's actually usable right
+/// now" discipline dummy traffic already follows, not a separate,
+/// laxer selection rule. A single-hop path (straight to the chosen
+/// relay) for now — multi-hop path selection through peers this node
+/// isn't itself directly connected to is deferred, same as it is for
+/// dummy traffic, to whenever a real relay-liveness story beyond
+/// direct connectivity exists.
+fn send_mailbox_deposit(
+    swarm: &mut Swarm<Behaviour>,
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+    mix_public: PublicKey,
+    deposit: mailbox::MailboxDeposit,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+) {
+    let mut rng = rand::thread_rng();
+    let candidate = known_mix_relays
+        .iter()
+        .filter_map(|(&address, &peer)| known_mix_routing_keys.get(&peer).map(|&key| (address, peer, key)))
+        .choose(&mut rng);
+    let Some((relay_address, relay_peer, relay_public)) = candidate else {
+        let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
+        return;
+    };
+
+    let Some(payload) = frame_mailbox_deposit(&deposit) else {
+        let _ = events.send(P2pEvent::MixForwardFailed { reason: "failed to encode the mailbox deposit".into() });
+        return;
+    };
+    let path = [mix::MixHop { address: relay_address, public_key: relay_public }];
+    // The destination address/identifier a Sphinx packet's final hop
+    // reports back are meaningless here — this node never asks the relay
+    // to reply, and `mailbox::MailboxDeposit` already carries its own tag
+    // for later retrieval — so both are simply random filler.
+    let destination_address = DestinationAddressBytes::from_bytes(rng.gen());
+    let identifier = rng.gen();
+    let Ok(packet) = mix::build_packet(&payload, &path, destination_address, identifier, MIX_DUMMY_TRAFFIC_HOP_DELAY) else {
+        let _ = events.send(P2pEvent::MixForwardFailed { reason: "failed to build the deposit's Sphinx packet".into() });
+        return;
+    };
+
+    let message = MixMessage { packet_bytes: packet.to_bytes(), sender_routing_public_key: mix_public.to_bytes() };
+    swarm.behaviour_mut().mix.send_request(&relay_peer, message);
 }
 
 /// Sends one piece of Loopix-style dummy traffic — indistinguishable on

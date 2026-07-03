@@ -93,6 +93,17 @@ pub enum P2pEvent {
     /// for the ledger and the mailbox cache, would want to count).
     MixRelayDiscovered { peer: PeerId },
 
+    /// This node was a Sphinx packet's final hop, and the payload parsed
+    /// and validated (PoW, size, clock — see `mailbox::validate`) as a
+    /// genuine mailbox deposit, which is now held in this node's own
+    /// mailbox cache for whoever the (unlinkable, never revealed to this
+    /// node) recipient turns out to be. No fields: this is a transparency
+    /// signal (an app-level "you're currently relaying for N deposits"
+    /// figure, in the same honesty-first spirit as the ledger's own
+    /// figures, would count these), not something a caller needs to act
+    /// on individually.
+    MailboxDepositStored,
+
     /// A DHT lookup for `username` finished with a currently-published
     /// claim (which may or may not be this node's own — the caller is
     /// responsible for verifying it before trusting it).

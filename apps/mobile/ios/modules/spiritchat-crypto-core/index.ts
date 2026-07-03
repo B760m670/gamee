@@ -44,6 +44,7 @@ export type P2pEvent =
   | { type: 'mixPacketArrived'; payload: Uint8Array }
   | { type: 'mixForwardFailed'; reason: string }
   | { type: 'mixRelayDiscovered'; peerId: string }
+  | { type: 'mailboxDepositStored' }
 
 /**
  * Synthesized by `ChatManager.swift` from decrypted/queued messages — not a

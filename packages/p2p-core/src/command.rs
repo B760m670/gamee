@@ -74,6 +74,25 @@ pub enum Command {
     /// all (mix-relay participation is opt-in).
     AnnounceMixRelay,
 
+    /// Deposits `envelope` (an already-encrypted message, same bytes
+    /// `SendEnvelope` would carry directly) into the mailbox cache of
+    /// whichever mix relay ends up as the Sphinx path's final hop —
+    /// serverless offline delivery for when the recipient isn't reachable
+    /// right now. `shared_material` must be a value both sender and
+    /// recipient can compute independently and identically (an X3DH
+    /// shared secret if a session already exists, or else a stable,
+    /// order-independent combination of both peers' known long-term
+    /// public keys) — it never leaves this device; only
+    /// `mailbox::mailbox_tag(shared_material, epoch)`'s output, an opaque
+    /// tag, ever crosses the network. The proof-of-work stamp this
+    /// requires is mined on a blocking thread, mirroring the ledger's own
+    /// mining loop, so this command returns immediately; delivery is
+    /// fire-and-forget from the sender's point of view (mirroring
+    /// `SendMixPacket`'s own ack-only wire semantics) — a chosen relay
+    /// being unreachable at all surfaces as `P2pEvent::MixForwardFailed`,
+    /// same as any other mix send failure.
+    DepositToMailbox { shared_material: Vec<u8>, envelope: Vec<u8> },
+
     /// Publishes `claim` under the DHT key derived from `username` (see
     /// `username::record_key_for`). `claim` is opaque to this crate — the
     /// app layer is responsible for making it self-certifying (e.g. a

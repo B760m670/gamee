@@ -42,19 +42,11 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hkdf::Hkdf;
-use libp2p::gossipsub::IdentTopic;
 use redb::{Database, MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{P2pError, Result};
-
-/// Every node subscribes — accepting (or rejecting) a deposit is a purely
-/// local decision each node makes from its own validation, not something
-/// that needs a request/response round trip.
-pub fn deposit_topic() -> IdentTopic {
-    IdentTopic::new("/spiritchat/mailbox/1")
-}
 
 /// How many leading zero bits a deposit's PoW hash must have. Tuned like
 /// the `@username` ledger's own initial difficulty was: enough that a
