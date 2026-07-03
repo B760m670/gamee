@@ -1,6 +1,6 @@
 import Foundation
 
-enum IdentitySessionError: Error {
+enum IdentitySessionError: Error, LocalizedError {
   /// Thrown by anything that needs an identity (fingerprint, the P2P node,
   /// blob storage, ...) before one has been created or restored yet. The JS
   /// onboarding flow is responsible for calling `hasIdentity`/
@@ -10,9 +10,27 @@ enum IdentitySessionError: Error {
   /// Thrown by account creation/restore once every slot already holds an
   /// identity — the user-facing message is "remove an account first."
   case noFreeSlot
-  /// Thrown by `switchTo`/`removeSlot` for a slot index with nothing
-  /// stored in it.
+  /// Thrown by `switchTo`/`removeSlot` for a slot index with nothing (or
+  /// only partially, see `isSlotComplete`) stored in it.
   case slotEmpty(Int)
+
+  /// Native errors bridge to JS as an opaque `"...error <N>."` string with no
+  /// reliable, stable mapping back to a specific case — confirmed the hard
+  /// way while diagnosing a switcher bug where the numeric code pointed at
+  /// the wrong case entirely. Spelling out real text here means every future
+  /// error is legible in the UI instead of a code that has to be guessed at
+  /// from source, which matters on this LiveContainer setup with no other
+  /// diagnostic channel.
+  var errorDescription: String? {
+    switch self {
+    case .notYetInitialized:
+      return "Аккаунт ещё не создан на этом устройстве."
+    case .noFreeSlot:
+      return "На этом устройстве уже зарегистрировано максимум аккаунтов — сначала удали один."
+    case .slotEmpty(let slot):
+      return "Слот \(slot) пуст или повреждён."
+    }
+  }
 }
 
 /// The device's local account: a long-term signing identity, a separate
@@ -108,18 +126,41 @@ final class IdentitySession {
     (try? KeychainStore.load(account: identityAccount(slot))) != nil
   }
 
-  /// Whether the *active* slot has a stored identity — check this on
-  /// launch to decide whether to show onboarding (create/restore) or go
-  /// straight to the app. Does not materialize `shared`.
+  /// Whether the *active* slot has a fully-usable stored identity — check
+  /// this on launch to decide whether to show onboarding (create/restore) or
+  /// go straight to the app. Deliberately checks `isSlotComplete`, not just
+  /// `hasStoredIdentity(slot:)`: an active slot left partially written (see
+  /// `isSlotComplete`'s doc comment) must send the user back through
+  /// onboarding to repair it via `begin(withPhrase:)`, not into an app that
+  /// can never load `IdentitySession.shared` for it. Does not materialize
+  /// `shared`.
   static func hasStoredIdentity() -> Bool {
-    hasStoredIdentity(slot: activeSlot)
+    isSlotComplete(activeSlot)
   }
 
-  /// Every currently-occupied slot, in slot order — what an account
-  /// switcher UI lists. Each entry is peeked independently of `shared`/
-  /// `activeSlot`, so listing accounts never disturbs which one is active.
+  /// Whether `slot` holds a fully-written identity — identity *and*
+  /// agreement key *and* prekey store all present, i.e. exactly what
+  /// `loadExisting` needs to succeed. `hasStoredIdentity` alone isn't enough
+  /// to answer this: `begin(withPhrase:)` writes those three Keychain items
+  /// sequentially with no transaction wrapping them, so a slot can end up
+  /// with an identity but no agreement key/prekeys if that sequence was ever
+  /// interrupted (e.g. the app was killed mid-write). A slot in that state
+  /// must never be offered as switchable — see `occupiedSlots` and `begin`.
+  private static func isSlotComplete(_ slot: Int) -> Bool {
+    hasStoredIdentity(slot: slot)
+      && (try? KeychainStore.load(account: agreementAccount(slot))) != nil
+      && (try? KeychainStore.load(account: prekeysAccount(slot))) != nil
+  }
+
+  /// Every currently-occupied, fully-written slot, in slot order — what an
+  /// account switcher UI lists. Each entry is peeked independently of
+  /// `shared`/`activeSlot`, so listing accounts never disturbs which one is
+  /// active. A slot with a partially-written identity (see
+  /// `isSlotComplete`) is deliberately excluded rather than listed and left
+  /// to fail when switched to; re-entering its recovery phrase repairs it
+  /// (see `begin(withPhrase:)`).
   static func occupiedSlots() -> [Int] {
-    (0..<maxSlots).filter { hasStoredIdentity(slot: $0) }
+    (0..<maxSlots).filter { isSlotComplete($0) }
   }
 
   /// The fingerprint stored in `slot`, without activating it — only reads
@@ -180,32 +221,60 @@ final class IdentitySession {
     let targetFingerprint = identity.fingerprint()
 
     for slot in 0..<maxSlots where hasStoredIdentity(slot: slot) {
-      if peekFingerprint(slot: slot) == targetFingerprint {
+      guard peekFingerprint(slot: slot) == targetFingerprint else { continue }
+      if isSlotComplete(slot) {
         return try switchTo(slot: slot)
       }
+      // Same identity, but a previous write into this slot was interrupted
+      // before the agreement key/prekeys landed (see `isSlotComplete`'s doc
+      // comment). Typing the phrase back in is the only recovery path a user
+      // has here, so treat it as a repair rather than either forking a
+      // second slot for the same fingerprint or leaving this one stuck
+      // forever: regenerate what's missing and rewrite the whole slot.
+      let session = try writeSlot(slot, identity: identity, phrase: phrase)
+      setActiveSlot(slot)
+      cached = session
+      return session
     }
 
     guard let freeSlot = (0..<maxSlots).first(where: { !hasStoredIdentity(slot: $0) }) else {
       throw IdentitySessionError.noFreeSlot
     }
 
+    let session = try writeSlot(freeSlot, identity: identity, phrase: phrase)
+    setActiveSlot(freeSlot)
+    cached = session
+    return session
+  }
+
+  /// Generates a fresh agreement key/prekey store for `identity` and writes
+  /// the full four-item Keychain record for `slot` — shared by both the
+  /// brand-new-slot path and the repair-an-incomplete-slot path in `begin`,
+  /// since both need to end up in the same fully-written state. Not
+  /// transactional (Keychain has no cross-item transaction primitive), but
+  /// idempotent: re-running it again for the same slot (e.g. if it's
+  /// interrupted again) just regenerates the agreement key/prekeys once
+  /// more, which `isSlotComplete` will still correctly report as incomplete
+  /// until every item lands.
+  private static func writeSlot(
+    _ slot: Int,
+    identity: FfiIdentity,
+    phrase: FfiRecoveryPhrase
+  ) throws -> IdentitySession {
     let agreement = FfiAgreementKey.generate()
     let prekeys = FfiPrekeyStore.generate(
       identity: identity,
       oneTimeCount: initialOneTimePrekeyCount
     )
 
-    try KeychainStore.save(identity.secretBytes(), account: identityAccount(freeSlot))
-    try KeychainStore.save(agreement.secretBytes(), account: agreementAccount(freeSlot))
-    try KeychainStore.save(prekeys.toBytes(), account: prekeysAccount(freeSlot))
+    try KeychainStore.save(identity.secretBytes(), account: identityAccount(slot))
+    try KeychainStore.save(agreement.secretBytes(), account: agreementAccount(slot))
+    try KeychainStore.save(prekeys.toBytes(), account: prekeysAccount(slot))
     if let wordsData = phrase.words().data(using: .utf8) {
-      try KeychainStore.save(wordsData, account: recoveryPhraseAccount(freeSlot))
+      try KeychainStore.save(wordsData, account: recoveryPhraseAccount(slot))
     }
 
-    setActiveSlot(freeSlot)
-    let session = IdentitySession(slot: freeSlot, identity: identity, agreement: agreement, prekeys: prekeys)
-    cached = session
-    return session
+    return IdentitySession(slot: slot, identity: identity, agreement: agreement, prekeys: prekeys)
   }
 
   /// Switches `activeSlot` to `slot` and reloads `shared` from it —
