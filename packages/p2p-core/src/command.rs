@@ -93,6 +93,26 @@ pub enum Command {
     /// same as any other mix send failure.
     DepositToMailbox { shared_material: Vec<u8>, envelope: Vec<u8> },
 
+    /// Asks whichever mix relay ends up as the query's Sphinx path final
+    /// hop whether anything is currently queued under
+    /// `mailbox::mailbox_tag(shared_material, current_epoch)` — the exact
+    /// tag a sender's `DepositToMailbox` for this same `shared_material`
+    /// would have deposited under. The query carries a SURB (Single Use
+    /// Reply Block) so a relay holding a match can route the answer back
+    /// without ever learning who asked; a match surfaces as
+    /// `P2pEvent::MailboxEnvelopeRetrieved`. Silence (no reply within
+    /// however long the caller chooses to wait) means nothing is
+    /// currently queued — there is no explicit "not found" reply, since
+    /// that would need answering *every* query, real or empty, which
+    /// defeats the point of a relay only spending effort on real matches.
+    /// A single query answers with at most one envelope (a SURB is
+    /// single-use by design); if more than one message is queued, a
+    /// caller wanting all of them needs to issue this again once it's
+    /// received (or given up waiting for) the previous reply — the same
+    /// "one at a time" shape `ChatManager`'s own outbox already uses on
+    /// the sending side.
+    RetrieveFromMailbox { shared_material: Vec<u8> },
+
     /// Publishes `claim` under the DHT key derived from `username` (see
     /// `username::record_key_for`). `claim` is opaque to this crate — the
     /// app layer is responsible for making it self-certifying (e.g. a

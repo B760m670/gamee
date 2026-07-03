@@ -104,6 +104,15 @@ pub enum P2pEvent {
     /// on individually.
     MailboxDepositStored,
 
+    /// `Command::RetrieveFromMailbox` got an answer: a relay holding a
+    /// match for the queried tag routed `envelope` back through this
+    /// node's own SURB. `envelope` is exactly what `DepositToMailbox`
+    /// was originally given — this layer never inspects it, the same way
+    /// `EnvelopeReceived` never does. If more than one message was
+    /// queued, only the oldest comes back; issue the same
+    /// `RetrieveFromMailbox` again to check for another.
+    MailboxEnvelopeRetrieved { envelope: Vec<u8> },
+
     /// A DHT lookup for `username` finished with a currently-published
     /// claim (which may or may not be this node's own — the caller is
     /// responsible for verifying it before trusting it).

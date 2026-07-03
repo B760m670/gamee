@@ -28,7 +28,9 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 use sphinx_packet::header::delays::{self, Delay};
+use sphinx_packet::packet::builder::DEFAULT_PAYLOAD_SIZE;
 use sphinx_packet::route::{Destination, DestinationAddressBytes, Node, NodeAddressBytes, SURBIdentifier};
+use sphinx_packet::surb::{SURBMaterial, SURB};
 use sphinx_packet::{ProcessedPacket, ProcessedPacketData, SphinxPacket};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -141,6 +143,50 @@ pub fn build_dummy_packet(
     average_hop_delay: std::time::Duration,
 ) -> Result<SphinxPacket> {
     build_packet(DUMMY_PAYLOAD_MARKER, path, destination_address, destination_identifier, average_hop_delay)
+}
+
+/// Builds a **Single Use Reply Block**: a pre-computed return path,
+/// opaque to whoever ends up holding it, that lets a responder send
+/// exactly one reply back to `path`'s originator without ever learning
+/// what that path is (its own hop addresses/keys are already layered
+/// into the SURB's header, the same way a forward packet's are — the
+/// responder only ever learns "send the resulting bytes to this first
+/// hop," never anything past it). This is what makes anonymous
+/// *retrieval* possible: a mailbox query can embed one of these so the
+/// relay answering it can route the result back without the query ever
+/// having revealed who's asking. `path`'s last hop is where the reply
+/// ultimately arrives — building a SURB whose own path ends at this
+/// node's own address (see `node_address_for`) is how a node gets a
+/// reply routed back to itself, mirroring exactly how a normal outbound
+/// packet's last hop is its final destination.
+pub fn build_surb(
+    path: &[MixHop],
+    destination_address: DestinationAddressBytes,
+    destination_identifier: SURBIdentifier,
+    average_hop_delay: std::time::Duration,
+) -> Result<SURB> {
+    if path.is_empty() || path.len() > MAX_PATH_LENGTH {
+        return Err(P2pError::Mix(format!(
+            "SURB path must have between 1 and {MAX_PATH_LENGTH} hops, got {}",
+            path.len()
+        )));
+    }
+
+    let route: Vec<Node> = path.iter().map(|hop| Node::new(hop.address, hop.public_key)).collect();
+    let delays = delays::generate_from_average_duration(path.len(), average_hop_delay);
+    let destination = Destination::new(destination_address, destination_identifier);
+
+    SURBMaterial::new(route, delays, destination).construct_SURB().map_err(to_mix_err)
+}
+
+/// Consumes a SURB (received inside some earlier query's payload, never
+/// built by this node itself) to wrap `reply_message` for delivery back
+/// along its pre-computed path — returns the resulting packet and the
+/// first hop to send it to. Always the same fixed payload size a normal
+/// packet uses (`DEFAULT_PAYLOAD_SIZE`), so a reply is bitwise
+/// indistinguishable in size from any other packet on the wire.
+pub fn use_surb(surb: SURB, reply_message: &[u8]) -> Result<(SphinxPacket, NodeAddressBytes)> {
+    surb.use_surb(reply_message, DEFAULT_PAYLOAD_SIZE).map_err(to_mix_err)
 }
 
 /// What peeling one layer off an incoming packet, at this node, produces.
@@ -286,6 +332,47 @@ mod tests {
             panic!("a single-hop dummy packet must peel to a Final outcome");
         };
         assert!(is_dummy_payload(&payload));
+    }
+
+    #[test]
+    fn a_surb_carries_a_reply_back_through_its_own_prebuilt_path_to_the_querier() {
+        // hops[0] plays the relay that will end up answering a query;
+        // hops[1] plays the querier's own node, at the end of the return
+        // path it built for itself.
+        let hops = [generate_hop(1), generate_hop(2)];
+        let path: Vec<MixHop> = hops.iter().map(|h| MixHop { address: h.hop.address, public_key: h.hop.public_key }).collect();
+        let destination_address = DestinationAddressBytes::from_bytes([9u8; 32]);
+        let identifier: SURBIdentifier = [3u8; 16];
+
+        let surb = build_surb(&path, destination_address, identifier, std::time::Duration::from_millis(10)).unwrap();
+
+        // The querier ships `surb.to_bytes()` off inside a query payload;
+        // the relay that ends up answering reconstructs it from those
+        // bytes — never having built the SURB, or known the path inside
+        // it, itself.
+        let surb_bytes = surb.to_bytes();
+        let responders_surb = SURB::from_bytes(&surb_bytes).unwrap();
+        assert_eq!(responders_surb.first_hop(), hops[0].hop.address);
+
+        let reply_message = b"the deposit's envelope bytes, or whatever else the query answers";
+        let (reply_packet, next_hop_address) = use_surb(responders_surb, reply_message).unwrap();
+        assert_eq!(next_hop_address, hops[0].hop.address);
+
+        // Hop 1 (a relay along the return path) peels and forwards, same
+        // as it would for any other packet — a SURB-originated reply is
+        // structurally indistinguishable from a fresh outbound packet at
+        // every hop but the last.
+        let after_hop1 = peel(reply_packet, &hops[0].secret).unwrap();
+        let PeelOutcome::Forward { next_hop_packet, next_hop_address, .. } = after_hop1 else {
+            panic!("the first hop of a 2-hop SURB reply must be a Forward outcome");
+        };
+        assert_eq!(next_hop_address, hops[1].hop.address);
+
+        // Hop 2 — the querier's own node — recovers the reply.
+        let PeelOutcome::Final { payload, .. } = peel(next_hop_packet, &hops[1].secret).unwrap() else {
+            panic!("the SURB's own final hop must be a Final outcome");
+        };
+        assert_eq!(&payload[..reply_message.len()], reply_message);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use libp2p::{gossipsub, noise, tcp, yamux, Multiaddr, PeerId, Swarm};
 use rand::seq::IteratorRandom;
 use rand::Rng;
 use sphinx_packet::route::{DestinationAddressBytes, NodeAddressBytes};
+use sphinx_packet::surb::SURB;
 use sphinx_packet::SphinxPacket;
 use spiritchat_ledger_core::block::MAX_TXS_PER_BLOCK;
 use spiritchat_ledger_core::difficulty::expand_target;
@@ -383,6 +384,7 @@ async fn run_event_loop(
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<P2pEvent>,
 ) {
+    let local_peer_id = *swarm.local_peer_id();
     let mut pending = Pending::default();
     // Blobs this node currently serves (e.g. its own avatar), set via
     // Command::SetLocalBlob. Lives only in memory for the life of this
@@ -457,14 +459,14 @@ async fn run_event_loop(
                 if !dht_ready && needs_dht_peer(&command) {
                     deferred_commands.push(command);
                 } else {
-                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &deposit_tx, &events, command);
+                    handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &events, command);
                 }
             }
             swarm_event = swarm.select_next_some() => {
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
-                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, mix_public, &deposit_tx, &events, command);
+                        handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &events, command);
                     }
                 }
                 handle_swarm_event(
@@ -481,7 +483,6 @@ async fn run_event_loop(
                 swarm.behaviour_mut().mix.send_request(&next_peer, mix_message);
             }
             _ = dummy_traffic_interval.tick() => {
-                let local_peer_id = *swarm.local_peer_id();
                 emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
             }
             Some(deposit) = deposit_rx.recv() => {
@@ -545,6 +546,9 @@ fn handle_command(
     local_blobs: &mut HashMap<Vec<u8>, Vec<u8>>,
     mempool: &mut HashMap<Hash32, Transaction>,
     mining: &mut Mining,
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+    local_peer_id: PeerId,
     mix_public: PublicKey,
     deposit_tx: &mpsc::UnboundedSender<mailbox::MailboxDeposit>,
     events: &mpsc::UnboundedSender<P2pEvent>,
@@ -642,6 +646,10 @@ fn handle_command(
                 let pow_nonce = mailbox::mine_stamp(&tag, &envelope, deposited_at);
                 let _ = deposit_tx.send(mailbox::MailboxDeposit { tag, envelope, deposited_at, pow_nonce });
             });
+        }
+
+        Command::RetrieveFromMailbox { shared_material } => {
+            send_mailbox_retrieval_query(swarm, known_mix_relays, known_mix_routing_keys, local_peer_id, mix_public, shared_material, events);
         }
 
         Command::AnnounceUsername { username, claim } => {
@@ -1084,6 +1092,38 @@ fn handle_mix_event(
                             {
                                 let _ = events.send(P2pEvent::MailboxDepositStored);
                             }
+                        } else if let Some((tag, surb)) = parse_mailbox_query(&payload) {
+                            // This node is being asked, as an anonymous
+                            // mix relay, whether it's holding anything
+                            // for `tag` — never anything about who's
+                            // asking, only the SURB needed to answer them.
+                            // Silence (not answering at all) is the
+                            // correct response to "nothing queued," the
+                            // same way a piece of dummy traffic gets no
+                            // reply either — answering only real matches
+                            // is what keeps a query cheap for the network
+                            // regardless of whether it turns anything up.
+                            if let Ok(deposits) = mailbox_store.for_tag(&tag) {
+                                if let Some(oldest) = deposits.into_iter().next() {
+                                    if let Ok((reply_packet, next_hop_address)) =
+                                        mix::use_surb(surb, &frame_mailbox_reply(&oldest.envelope))
+                                    {
+                                        if let Some(&next_peer) = known_mix_relays.get(&next_hop_address) {
+                                            let message = MixMessage {
+                                                packet_bytes: reply_packet.to_bytes(),
+                                                sender_routing_public_key: mix_public.to_bytes(),
+                                            };
+                                            swarm.behaviour_mut().mix.send_request(&next_peer, message);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(envelope) = parse_mailbox_reply(&payload) {
+                            // This node was the one asking — a relay
+                            // routed a queued envelope back through the
+                            // SURB this node itself built and sent out
+                            // with its own query.
+                            let _ = events.send(P2pEvent::MailboxEnvelopeRetrieved { envelope });
                         } else {
                             let _ = events.send(P2pEvent::MixPacketArrived { payload });
                         }
@@ -1125,18 +1165,86 @@ fn parse_mailbox_deposit(payload: &[u8]) -> Option<mailbox::MailboxDeposit> {
     bincode::deserialize(rest).ok()
 }
 
+/// A mailbox *retrieval query* — "does anyone have anything queued under
+/// this tag, and if so, please send it back via this SURB." Distinguished
+/// from `MIX_PAYLOAD_DEPOSIT_TAG` the same way that is from
+/// `DUMMY_PAYLOAD_MARKER`.
+const MIX_PAYLOAD_QUERY_TAG: u8 = 0x02;
+
+fn frame_mailbox_query(tag: &[u8; mailbox::MAILBOX_TAG_LEN], surb: &SURB) -> Vec<u8> {
+    let mut out = vec![MIX_PAYLOAD_QUERY_TAG];
+    out.extend_from_slice(tag);
+    out.extend(surb.to_bytes());
+    out
+}
+
+fn parse_mailbox_query(payload: &[u8]) -> Option<([u8; mailbox::MAILBOX_TAG_LEN], SURB)> {
+    let (&marker, rest) = payload.split_first()?;
+    if marker != MIX_PAYLOAD_QUERY_TAG {
+        return None;
+    }
+    if rest.len() <= mailbox::MAILBOX_TAG_LEN {
+        return None;
+    }
+    let (tag_bytes, surb_bytes) = rest.split_at(mailbox::MAILBOX_TAG_LEN);
+    let tag: [u8; mailbox::MAILBOX_TAG_LEN] = tag_bytes.try_into().ok()?;
+    let surb = SURB::from_bytes(surb_bytes).ok()?;
+    Some((tag, surb))
+}
+
+/// A mailbox query's *answer* — one queued envelope, routed back through
+/// the querier's own SURB. Framed the same way a deposit or a query is,
+/// so the querier's own final-hop parsing (which sees exactly the same
+/// kind of raw payload any other final hop does — a reply arrives as an
+/// ordinary Sphinx packet, not through some separate channel) can tell it
+/// apart from a fresh deposit/query someone is sending *to* this node.
+const MIX_PAYLOAD_REPLY_TAG: u8 = 0x03;
+
+fn frame_mailbox_reply(envelope: &[u8]) -> Vec<u8> {
+    let mut out = vec![MIX_PAYLOAD_REPLY_TAG];
+    out.extend_from_slice(envelope);
+    out
+}
+
+fn parse_mailbox_reply(payload: &[u8]) -> Option<Vec<u8>> {
+    let (&tag, rest) = payload.split_first()?;
+    if tag != MIX_PAYLOAD_REPLY_TAG {
+        return None;
+    }
+    Some(rest.to_vec())
+}
+
+/// Picks a peer usable as a mix hop *this node itself is originating a
+/// packet through* — meaning both currently connected (`known_mix_relays`,
+/// so a hop can actually be dialed) and a peer whose routing key this node
+/// has actually learned (`known_mix_routing_keys`, needed to build the
+/// packet's Diffie-Hellman layer at all). Shared by every place this node
+/// builds a brand new packet (deposits, retrieval queries, dummy traffic)
+/// — forwarding an already-built packet is a different, simpler lookup
+/// (`known_mix_relays` alone; see `handle_mix_event`'s `Forward` arm).
+fn pick_mix_relay(
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+    rng: &mut impl Rng,
+) -> Option<(NodeAddressBytes, PeerId, PublicKey)> {
+    known_mix_relays
+        .iter()
+        .filter_map(|(&address, &peer)| known_mix_routing_keys.get(&peer).map(|&key| (address, peer, key)))
+        .choose(rng)
+}
+
 /// Routes an already-stamped `deposit` into the mix, addressed so that
 /// whichever relay ends up as the path's final hop stores it — see
-/// `Command::DepositToMailbox`'s own doc comment. Picks a path the exact
-/// same way `emit_dummy_mix_traffic` does (a peer this node is both
-/// connected to and already knows the routing key of); a real deposit
-/// deserves the same "only route through what's actually usable right
-/// now" discipline dummy traffic already follows, not a separate,
-/// laxer selection rule. A single-hop path (straight to the chosen
-/// relay) for now — multi-hop path selection through peers this node
-/// isn't itself directly connected to is deferred, same as it is for
-/// dummy traffic, to whenever a real relay-liveness story beyond
-/// direct connectivity exists.
+/// `Command::DepositToMailbox`'s own doc comment. Picks a relay via
+/// `pick_mix_relay`, the same selection `emit_dummy_mix_traffic` and
+/// `send_mailbox_retrieval_query` also use; a real deposit deserves the
+/// same "only route through what's actually usable right now" discipline
+/// dummy traffic already follows, not a separate, laxer rule. A
+/// single-hop path (straight to the chosen relay) for now — multi-hop
+/// path selection through peers this node isn't itself directly
+/// connected to is deferred, same as it is for dummy traffic, to
+/// whenever a real relay-liveness story beyond direct connectivity
+/// exists.
 fn send_mailbox_deposit(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
@@ -1146,11 +1254,7 @@ fn send_mailbox_deposit(
     events: &mpsc::UnboundedSender<P2pEvent>,
 ) {
     let mut rng = rand::thread_rng();
-    let candidate = known_mix_relays
-        .iter()
-        .filter_map(|(&address, &peer)| known_mix_routing_keys.get(&peer).map(|&key| (address, peer, key)))
-        .choose(&mut rng);
-    let Some((relay_address, relay_peer, relay_public)) = candidate else {
+    let Some((relay_address, relay_peer, relay_public)) = pick_mix_relay(known_mix_relays, known_mix_routing_keys, &mut rng) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
         return;
     };
@@ -1168,6 +1272,53 @@ fn send_mailbox_deposit(
     let identifier = rng.gen();
     let Ok(packet) = mix::build_packet(&payload, &path, destination_address, identifier, MIX_DUMMY_TRAFFIC_HOP_DELAY) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "failed to build the deposit's Sphinx packet".into() });
+        return;
+    };
+
+    let message = MixMessage { packet_bytes: packet.to_bytes(), sender_routing_public_key: mix_public.to_bytes() };
+    swarm.behaviour_mut().mix.send_request(&relay_peer, message);
+}
+
+/// Asks whichever relay `pick_mix_relay` chooses whether anything is
+/// currently queued under `shared_material`'s current-epoch tag, with a
+/// SURB attached so the relay can answer without learning who's asking.
+/// The SURB's own "route" is just this node's own address — a single hop
+/// straight back — so answering costs the relay nothing beyond one more
+/// `send_request`, the same as it already pays for a forwarded packet.
+/// See `Command::RetrieveFromMailbox`'s own doc comment for the full
+/// round trip this kicks off.
+fn send_mailbox_retrieval_query(
+    swarm: &mut Swarm<Behaviour>,
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+    local_peer_id: PeerId,
+    mix_public: PublicKey,
+    shared_material: Vec<u8>,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+) {
+    let mut rng = rand::thread_rng();
+    let Some((relay_address, relay_peer, relay_public)) = pick_mix_relay(known_mix_relays, known_mix_routing_keys, &mut rng) else {
+        let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
+        return;
+    };
+
+    let tag = mailbox::mailbox_tag(&shared_material, mailbox::epoch_for(mailbox::now_unix()));
+
+    let self_hop = mix::MixHop { address: mix::node_address_for(&local_peer_id.to_bytes()), public_key: mix_public };
+    let Ok(surb) = mix::build_surb(
+        &[self_hop],
+        DestinationAddressBytes::from_bytes(rng.gen()),
+        rng.gen(),
+        MIX_DUMMY_TRAFFIC_HOP_DELAY,
+    ) else {
+        let _ = events.send(P2pEvent::MixForwardFailed { reason: "failed to build the retrieval query's SURB".into() });
+        return;
+    };
+
+    let payload = frame_mailbox_query(&tag, &surb);
+    let path = [mix::MixHop { address: relay_address, public_key: relay_public }];
+    let Ok(packet) = mix::build_packet(&payload, &path, DestinationAddressBytes::from_bytes(rng.gen()), rng.gen(), MIX_DUMMY_TRAFFIC_HOP_DELAY) else {
+        let _ = events.send(P2pEvent::MixForwardFailed { reason: "failed to build the retrieval query's Sphinx packet".into() });
         return;
     };
 
@@ -1196,15 +1347,7 @@ fn emit_dummy_mix_traffic(
     mix_public: PublicKey,
 ) {
     let mut rng = rand::thread_rng();
-    // Only a peer whose routing key this node has actually learned (via
-    // MixMessage, not this node's own) is usable as a hop — connectivity
-    // alone (`known_mix_relays`) is enough to *forward* a hop someone else
-    // already built, but not to build a new one that routes through them.
-    let candidates: Vec<(NodeAddressBytes, PeerId, PublicKey)> = known_mix_relays
-        .iter()
-        .filter_map(|(&address, &peer)| known_mix_routing_keys.get(&peer).map(|&key| (address, peer, key)))
-        .collect();
-    let Some(&(relay_address, relay_peer, relay_public)) = candidates.iter().choose(&mut rng) else {
+    let Some((relay_address, relay_peer, relay_public)) = pick_mix_relay(known_mix_relays, known_mix_routing_keys, &mut rng) else {
         return;
     };
     let relay_hop = mix::MixHop { address: relay_address, public_key: relay_public };

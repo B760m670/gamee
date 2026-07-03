@@ -218,6 +218,8 @@ final class P2pSession {
       return ["type": "mixRelayDiscovered", "peerId": peerId]
     case .mailboxDepositStored:
       return ["type": "mailboxDepositStored"]
+    case .mailboxEnvelopeRetrieved(let envelope):
+      return ["type": "mailboxEnvelopeRetrieved", "envelope": envelope]
     }
   }
 }

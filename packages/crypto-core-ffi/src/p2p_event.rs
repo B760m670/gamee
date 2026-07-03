@@ -40,6 +40,7 @@ pub enum FfiP2pEvent {
     MixForwardFailed { reason: String },
     MixRelayDiscovered { peer_id: String },
     MailboxDepositStored,
+    MailboxEnvelopeRetrieved { envelope: Vec<u8> },
 }
 
 impl From<P2pEvent> for FfiP2pEvent {
@@ -103,6 +104,7 @@ impl From<P2pEvent> for FfiP2pEvent {
             P2pEvent::MixForwardFailed { reason } => Self::MixForwardFailed { reason },
             P2pEvent::MixRelayDiscovered { peer } => Self::MixRelayDiscovered { peer_id: peer.to_string() },
             P2pEvent::MailboxDepositStored => Self::MailboxDepositStored,
+            P2pEvent::MailboxEnvelopeRetrieved { envelope } => Self::MailboxEnvelopeRetrieved { envelope },
         }
     }
 }
