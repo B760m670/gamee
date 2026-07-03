@@ -292,6 +292,23 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().node.fetchBlob(peerId: peerId, id: id)
     }
 
+    // Registers `bytes` under a caller-chosen `idHex` without going through
+    // BlobStore's own content-addressing (unlike `blobSaveFromFile`/
+    // `blobReserve`, which always derive the id from a hash of the bytes).
+    // For small, non-secret, frequently-changing pointers this device wants
+    // every peer to be able to fetch under one fixed, well-known id — e.g.
+    // "what's my avatar's current content id right now" (see
+    // store/peerAvatars.ts) — where content-addressing the pointer itself
+    // would be pointless (its whole purpose is to be look-up-able without
+    // already knowing what it contains). Not persisted by this crate any
+    // more than any other locally-served blob is; the caller is
+    // responsible for re-registering it (e.g. on every launch and every
+    // time the underlying value changes).
+    Function("p2pSetLocalBlobRaw") { (idHex: String, bytes: Data) throws in
+      guard let id = Data(hexEncoded: idHex) else { throw BlobStoreError.malformedId(idHex) }
+      try requireP2pSession().node.setLocalBlob(id: id, bytes: bytes)
+    }
+
     // Builds and signs a new @username ledger claim — pure (nothing sent
     // anywhere yet); pass the result to `p2pSubmitUsernameClaim`. Claim-
     // building lives in Rust (not hand-encoded here, unlike the old DHT

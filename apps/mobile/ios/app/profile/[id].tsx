@@ -5,7 +5,7 @@ import { Ionicons } from '@expo/vector-icons'
 import { GlassView } from 'expo-glass-effect'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { Avatar } from '../../components/Avatar'
+import { PeerAvatar } from '../../components/PeerAvatar'
 import { useChatStore } from '../../store/chat'
 
 const AVATAR_SIZE = 100
@@ -59,7 +59,7 @@ export default function ProfileScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={s.headerSection}>
-          <Avatar uri={null} size={AVATAR_SIZE} username={peer?.peerUsername ?? undefined} />
+          <PeerAvatar peerId={id} size={AVATAR_SIZE} username={peer?.peerUsername ?? undefined} />
           <Text style={s.name} numberOfLines={1}>{title}</Text>
           {peer?.peerFingerprint ? <Text style={s.status}>{peer.peerFingerprint}</Text> : null}
         </View>

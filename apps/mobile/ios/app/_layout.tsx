@@ -16,6 +16,7 @@ import {
 } from '../modules/spiritchat-crypto-core'
 import { useProfileStore } from '../store/profile'
 import { useChatStore } from '../store/chat'
+import { handlePeerAvatarEvent } from '../store/peerAvatars'
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { staleTime: 30_000, retry: 2 } },
@@ -132,6 +133,8 @@ export default function RootLayout() {
       if (event.type === 'peerConnected') {
         requestLedgerChainSync(event.peerId).catch(() => {})
       }
+
+      handlePeerAvatarEvent(event)
     })
     return unsubscribe
   }, [])

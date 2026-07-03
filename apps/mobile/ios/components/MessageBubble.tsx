@@ -22,10 +22,8 @@ function MessageBubbleBase({ msg }: Props) {
         <View style={s.meta}>
           <Text style={s.time}>{formatTime(msg.at)}</Text>
           {msg.outgoing ? (
-            msg.status === 'sending' ? (
+            msg.status === 'sending' || msg.status === 'queued' ? (
               <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.7)" />
-            ) : msg.status === 'failed' ? (
-              <Ionicons name="alert-circle" size={13} color="#fecaca" />
             ) : (
               <Ionicons name="checkmark" size={14} color="rgba(255,255,255,0.7)" />
             )

@@ -7,7 +7,7 @@ import { Ionicons } from '@expo/vector-icons'
 import { GlassView } from 'expo-glass-effect'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { Avatar } from '../../components/Avatar'
+import { PeerAvatar } from '../../components/PeerAvatar'
 import { MessageBubble } from '../../components/MessageBubble'
 import { ChatInputBar } from '../../components/ChatInputBar'
 import { useChatStore, type ChatMessage, type PeerInfo } from '../../store/chat'
@@ -74,7 +74,7 @@ export default function ChatScreen() {
         </Pressable>
         <View style={s.headerRight}>
           <Pressable onPress={openProfile}>
-            <Avatar uri={null} size={32} username={known?.peerUsername ?? undefined} />
+            <PeerAvatar peerId={peerId} size={32} username={known?.peerUsername ?? undefined} />
           </Pressable>
         </View>
       </View>

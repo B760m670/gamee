@@ -19,6 +19,7 @@ import {
   removeAccount as nativeRemoveAccount,
   type AccountSlot,
 } from '../modules/spiritchat-crypto-core'
+import { publishOwnAvatarPointer } from './peerAvatars'
 
 // Namespaced by fingerprint rather than fixed keys: this device's Keychain
 // identity is recoverable via its phrase, so signing out and restoring the
@@ -152,6 +153,10 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     // uncaught) whenever P2P isn't up yet; the retry loop below picks the
     // avatar back up together with peerId once it is.
     const avatarId = (p2pReady && storedAvatarId && blobReserve(storedAvatarId)) ? storedAvatarId : null
+    // Lets peers who message this device find its current avatar (see
+    // store/peerAvatars.ts) — republished every launch since the P2P node
+    // itself remembers nothing between runs, same reasoning as `blobReserve`.
+    if (p2pReady) publishOwnAvatarPointer(avatarId)
 
     set({
       isReady:         true,
@@ -196,6 +201,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
                 // still not reservable — leave it for next launch rather than loop forever here
               }
             }
+            publishOwnAvatarPointer((update.avatarId as string | undefined) ?? get().avatarId)
             set(update)
             return
           } catch {
@@ -250,6 +256,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     const id = blobSaveFromFile(fileUri)
     if (previousId && previousId !== id) blobClear(previousId)
     await AsyncStorage.setItem(avatarIdKey(get().fingerprint), id)
+    publishOwnAvatarPointer(id)
     set({ avatarId: id, avatarLocalPath: blobLocalPath(id) })
   },
 
@@ -257,6 +264,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     const previousId = get().avatarId
     if (previousId) blobClear(previousId)
     await AsyncStorage.removeItem(avatarIdKey(get().fingerprint))
+    publishOwnAvatarPointer(null)
     set({ avatarId: null, avatarLocalPath: null })
   },
 

@@ -86,6 +86,7 @@ const NativeCryptoCore = requireNativeModule<
     blobClear(idHex: string): void
     blobReserve(idHex: string): boolean
     p2pFetchBlob(peerId: string, idHex: string): void
+    p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void
     ledgerBuildUsernameClaim(username: string, anchorHeight: number, anchorBlockHash: Uint8Array, nonce: Uint8Array): Uint8Array
     p2pSubmitUsernameClaim(transactionBytes: Uint8Array): void
     p2pSubmitMinedBlock(blockBytes: Uint8Array): void
@@ -318,6 +319,19 @@ export function blobReserve(idHex: string): boolean {
 /** Fetches blob `idHex` from `peerId` (dial first if not connected). Answered by a `blobFetched`/`blobFetchFailed` event. */
 export function p2pFetchBlob(peerId: string, idHex: string): void {
   NativeCryptoCore.p2pFetchBlob(peerId, idHex)
+}
+
+/**
+ * Registers `bytes` under a caller-chosen `idHex`, bypassing the content-
+ * addressing `blobSaveFromFile`/`blobReserve` always apply — for a small,
+ * non-secret value every peer should be able to look up at one fixed,
+ * well-known id without already knowing what it contains (e.g. "what's
+ * this device's avatar content id right now", see store/peerAvatars.ts).
+ * Not persisted beyond the running P2P node — call again on every launch
+ * and whenever the value changes.
+ */
+export function p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void {
+  NativeCryptoCore.p2pSetLocalBlobRaw(idHex, bytes)
 }
 
 export type UsernameLookup =

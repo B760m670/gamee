@@ -8,8 +8,16 @@ export interface ChatMessage {
   text: string
   /** Epoch milliseconds. */
   at: number
-  /** Only meaningful for `outgoing` messages — an incoming one is always `sent`. */
-  status: 'sending' | 'sent' | 'failed'
+  /**
+   * Only meaningful for `outgoing` messages — an incoming one is always
+   * `sent`. `queued` means the transport couldn't hand this off on its
+   * *last* attempt (peer unreachable right now) — not a permanent failure:
+   * there is no relay/mailbox server in this project, so "the recipient
+   * currently isn't reachable" is an expected, ordinary state, not an
+   * error. It stays queued and keeps retrying automatically (see
+   * ChatManager.swift) for as long as this device keeps running.
+   */
+  status: 'sending' | 'sent' | 'queued'
 }
 
 export interface PeerInfo {
@@ -165,10 +173,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     // messageSent / messageFailed — both just update one already-rendered
-    // outgoing message's status by localId.
+    // outgoing message's status by localId. "Failed" only ever means "not
+    // delivered on this attempt" (see the `queued` status doc above), so it
+    // maps to the same UI state as "still sending," not an error.
     const list = get().messages[event.peerId]
     if (!list) return
-    const status: ChatMessage['status'] = event.type === 'messageSent' ? 'sent' : 'failed'
+    const status: ChatMessage['status'] = event.type === 'messageSent' ? 'sent' : 'queued'
     const next = list.map(m => (m.localId === event.localId ? { ...m, status } : m))
     set(state => ({ messages: { ...state.messages, [event.peerId]: next } }))
     persistMessages(myFingerprint, event.peerId, next).catch(() => {})

@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { Pressable, View, Text, StyleSheet } from 'react-native'
-import { Avatar } from './Avatar'
+import { PeerAvatar } from './PeerAvatar'
 import type { Conversation } from '../store/chat'
 
 interface Props {
@@ -29,7 +29,7 @@ function ConversationRowBase({ item, onPress }: Props) {
       style={({ pressed }) => [s.row, pressed && s.rowPressed]}
       onPress={() => onPress(item.peerId)}
     >
-      <Avatar uri={null} size={54} username={item.peerUsername ?? undefined} />
+      <PeerAvatar peerId={item.peerId} size={54} username={item.peerUsername ?? undefined} />
       <View style={s.center}>
         <Text style={s.title} numberOfLines={1}>{title}</Text>
         <Text style={s.preview} numberOfLines={1}>{item.lastMessageText}</Text>

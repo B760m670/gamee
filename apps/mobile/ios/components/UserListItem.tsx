@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { Pressable, View, Text, StyleSheet } from 'react-native'
-import { Avatar } from './Avatar'
+import { PeerAvatar } from './PeerAvatar'
 import type { FoundUser } from '../hooks/useUsernameSearch'
 
 interface Props {
@@ -9,16 +9,17 @@ interface Props {
 }
 
 // A single compact row — this device has no way to know a stranger's
-// display name or avatar until they choose to share it in conversation
-// (there is no server-side profile to fetch), so @username plus a
-// fingerprint-initialed placeholder avatar is all a search result can show.
+// display name until they choose to share it in conversation (there is no
+// server-side profile to fetch), so @username plus their avatar (if this
+// device has already fetched it — see store/peerAvatars.ts) is all a
+// search result can show.
 function UserListItemBase({ user, onPress }: Props) {
   return (
     <Pressable
       style={({ pressed }) => [s.row, pressed && s.rowPressed]}
       onPress={() => onPress(user)}
     >
-      <Avatar uri={null} size={46} username={user.username} />
+      <PeerAvatar peerId={user.peerId} size={46} username={user.username} />
       <View style={s.text}>
         <Text style={s.title} numberOfLines={1}>{`@${user.username}`}</Text>
         <Text style={s.subtitle} numberOfLines={1}>{user.fingerprint}</Text>
