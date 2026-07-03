@@ -1,0 +1,7 @@
+{
+  "name": "spiritchat-crypto-core",
+  "version": "0.1.0",
+  "description": "Native bridge to the shared Rust crypto core (packages/crypto-core-ffi): X3DH handshake + Double Ratchet messaging.",
+  "main": "index.ts",
+  "license": "UNLICENSED"
+}

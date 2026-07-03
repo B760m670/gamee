@@ -1,29 +1,33 @@
 import { useState } from 'react'
-import { useAuthStore, type AppUser } from '../store/auth'
-import { api } from '../lib/api'
-import { showAvatarPickerSheet, uploadAvatar } from '../components/AvatarPickerSheet'
+import * as ImageManipulator from 'expo-image-manipulator'
+import { useProfileStore } from '../store/profile'
+import { showAvatarPickerSheet } from '../components/AvatarPickerSheet'
+
+// Telegram uses 640×640 JPEG at 60% quality for avatar uploads — same
+// target here, just written straight to BlobStore instead of a server.
+const AVATAR_SIZE    = 640
+const AVATAR_QUALITY = 0.6
 
 export function useAvatarUpload() {
-  const { token } = useAuthStore(s => ({ token: s.token }))
-  const user = useAuthStore(s => s.user)
+  const hasPhoto        = useProfileStore(s => s.avatarLocalPath !== null)
+  const setAvatarFromFile = useProfileStore(s => s.setAvatarFromFile)
+  const clearAvatar       = useProfileStore(s => s.clearAvatar)
 
   const [uploading,  setUploading]  = useState(false)
   const [error,      setError]      = useState<string | null>(null)
   const [editorUri,  setEditorUri]  = useState<string | null>(null)
 
   async function pickAndUpload() {
-    const result = await showAvatarPickerSheet(!!(user?.avatar_url))
+    const result = await showAvatarPickerSheet(hasPhoto)
 
     if (result.type === 'image') {
       setEditorUri(result.uri)
 
     } else if (result.type === 'remove') {
-      if (!token) return
       setUploading(true)
       setError(null)
       try {
-        const res = await api.put<{ data: AppUser }>('/api/v1/users/me', { avatar_url: null })
-        useAuthStore.setState({ user: res.data })
+        await clearAvatar()
       } catch {
         setError('Не удалось удалить фото')
       } finally {
@@ -32,17 +36,19 @@ export function useAvatarUpload() {
     }
   }
 
-  async function handleEditorDone(processedUri: string) {
-    if (!token) return
+  async function handleEditorDone(croppedUri: string) {
     setEditorUri(null)
     setUploading(true)
     setError(null)
     try {
-      const publicUrl = await uploadAvatar(token, processedUri)
-      const res = await api.put<{ data: AppUser }>('/api/v1/users/me', { avatar_url: publicUrl })
-      useAuthStore.setState({ user: res.data })
+      const processed = await ImageManipulator.manipulateAsync(
+        croppedUri,
+        [{ resize: { width: AVATAR_SIZE } }],
+        { compress: AVATAR_QUALITY, format: ImageManipulator.SaveFormat.JPEG },
+      )
+      await setAvatarFromFile(processed.uri)
     } catch {
-      setError('Не удалось загрузить фото')
+      setError('Не удалось сохранить фото')
     } finally {
       setUploading(false)
     }

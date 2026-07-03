@@ -1,0 +1,22 @@
+[package]
+name = "spiritchat-ledger-core"
+version = "0.1.0"
+edition = "2021"
+description = "A small, purpose-built, phone-run Proof-of-Work ledger whose only transaction type is a @username claim — gives SpiritChat's @username system a real first-claim-wins uniqueness guarantee instead of the public DHT's best-effort semantics, with no server, no fees, and no external blockchain. No networking or persistence of its own (see spiritchat-p2p-core for gossip/sync and this crate's store.rs for the redb-backed persistence layer) — this crate is pure consensus/chain logic, fully unit-testable in isolation."
+
+[lib]
+name = "spiritchat_ledger_core"
+crate-type = ["lib"]
+
+[dependencies]
+spiritchat-crypto-core = { path = "../crypto-core" }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+redb = "2"
+thiserror = "2"
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand_chacha = "0.3"
+tempfile = "3"

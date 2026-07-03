@@ -1,30 +1,59 @@
+import { useEffect, useState } from 'react'
 import {
-  View, Text, FlatList, Pressable, ActivityIndicator,
+  View, Text, FlatList, Pressable,
   KeyboardAvoidingView, Platform, StyleSheet,
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
+import { GlassView } from 'expo-glass-effect'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { Avatar } from '../../components/Avatar'
+import { PeerAvatar } from '../../components/PeerAvatar'
 import { MessageBubble } from '../../components/MessageBubble'
 import { ChatInputBar } from '../../components/ChatInputBar'
-import { useChat } from '../../hooks/useChat'
+import { useChatStore, type ChatMessage, type PeerInfo } from '../../store/chat'
+
+const BTN_H = 44
 
 export default function ChatScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
-  const { userId } = useLocalSearchParams<{ userId: string }>()
+  const params = useLocalSearchParams<{
+    userId: string
+    peerFingerprint?: string
+    peerPublicKeyBase64?: string
+    peerUsername?: string
+  }>()
+  const peerId = params.userId
 
-  const { other, messages, loading, error, otherLastReadAt, me, send, loadOlder } = useChat(userId)
+  // A search result carries the peer's info in the route params (first
+  // time this device has ever seen them); reopening an existing
+  // conversation from the Chats list doesn't, so fall back to what's
+  // already known locally — either is enough for `openConversation`.
+  const known = useChatStore(s => s.conversations[peerId] ?? s.activePeers[peerId])
+  const openConversation = useChatStore(s => s.openConversation)
+  const sendMessage = useChatStore(s => s.sendMessage)
+  const messages = useChatStore(s => s.messages[peerId] ?? [])
 
-  const title = other?.display_name?.trim() || (other?.username ? `@${other.username}` : 'Чат')
+  const [ready, setReady] = useState(false)
+
+  useEffect(() => {
+    const peer: PeerInfo = known ?? {
+      peerId,
+      peerFingerprint: params.peerFingerprint ?? '',
+      peerPublicKeyBase64: params.peerPublicKeyBase64 ?? '',
+      peerUsername: params.peerUsername ?? null,
+    }
+    openConversation(peer).finally(() => setReady(true))
+  }, [peerId])
+
+  const title = known?.peerUsername ? `@${known.peerUsername}` : (known?.peerFingerprint || params.peerFingerprint || 'Чат')
 
   function openProfile() {
-    if (!other) return
-    router.push({
-      pathname: '/profile/[id]',
-      params: { id: other.id, preload: JSON.stringify(other) },
-    })
+    router.push({ pathname: '/profile/[id]', params: { id: peerId } })
+  }
+
+  function handleSend(text: string) {
+    sendMessage(peerId, text)
   }
 
   return (
@@ -35,45 +64,40 @@ export default function ChatScreen() {
     >
       {/* Header */}
       <View style={[s.header, { paddingTop: insets.top + 6 }]}>
-        <Pressable onPress={() => router.back()} hitSlop={8} style={s.back}>
-          <Ionicons name="chevron-back" size={28} color="#2f7bff" />
+        <Pressable onPress={() => router.back()} style={s.backOverlay}>
+          <GlassView style={s.backBtn} glassEffectStyle="regular" isInteractive colorScheme="dark">
+            <Ionicons name="chevron-back" size={22} color="#fff" />
+          </GlassView>
         </Pressable>
         <Pressable style={s.headerCenter} onPress={openProfile}>
-          <Avatar uri={other?.avatar_url} size={36} username={other?.username ?? other?.display_name} />
           <Text style={s.headerTitle} numberOfLines={1}>{title}</Text>
         </Pressable>
+        <View style={s.headerRight}>
+          <Pressable onPress={openProfile}>
+            <PeerAvatar peerId={peerId} size={32} username={known?.peerUsername ?? undefined} />
+          </Pressable>
+        </View>
       </View>
 
-      {loading ? (
-        <View style={s.center}><ActivityIndicator color="#52525b" /></View>
-      ) : error ? (
-        <View style={s.center}><Text style={s.errorText}>{error}</Text></View>
-      ) : (
-        <FlatList
-          data={messages}
-          inverted
-          keyExtractor={m => m.client_id ?? m.id}
-          renderItem={({ item }) => {
-            const isMine = item.sender_id === me
-            const readByOther = isMine && !!otherLastReadAt &&
-              otherLastReadAt.localeCompare(item.created_at) >= 0
-            return <MessageBubble msg={item} isMine={isMine} readByOther={readByOther} />
-          }}
-          onEndReached={loadOlder}
-          onEndReachedThreshold={0.4}
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="interactive"
-          contentContainerStyle={{ paddingVertical: 10 }}
-          ListEmptyComponent={
+      <FlatList
+        data={[...messages].reverse()}
+        inverted
+        keyExtractor={m => m.localId}
+        renderItem={({ item }: { item: ChatMessage }) => <MessageBubble msg={item} />}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="interactive"
+        contentContainerStyle={{ paddingVertical: 10 }}
+        ListEmptyComponent={
+          ready ? (
             <View style={s.emptyChat}>
               <Text style={s.emptyText}>Нет сообщений. Напишите первым!</Text>
             </View>
-          }
-        />
-      )}
+          ) : null
+        }
+      />
 
       <View style={{ paddingBottom: insets.bottom + 6 }}>
-        <ChatInputBar onSend={send} />
+        <ChatInputBar onSend={handleSend} />
       </View>
     </KeyboardAvoidingView>
   )
@@ -81,18 +105,21 @@ export default function ChatScreen() {
 
 const s = StyleSheet.create({
   root:   { flex: 1, backgroundColor: '#000' },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
   header: {
     flexDirection: 'row', alignItems: 'center', gap: 4,
-    paddingHorizontal: 8, paddingBottom: 8,
+    paddingHorizontal: 12, paddingBottom: 8,
     borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#1c1c1e',
   },
-  back:         { padding: 2 },
-  headerCenter: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  headerTitle:  { color: '#fff', fontSize: 17, fontWeight: '600', flexShrink: 1 },
+  backOverlay: {},
+  backBtn: {
+    width: BTN_H, height: BTN_H, borderRadius: BTN_H / 2,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  headerCenter: { flex: 1, alignItems: 'center' },
+  headerTitle:  { color: '#fff', fontSize: 17, fontWeight: '600' },
+  headerRight:  { width: BTN_H, alignItems: 'flex-end' },
 
   emptyChat: { transform: [{ scaleY: -1 }], alignItems: 'center', paddingTop: 60 },
   emptyText: { color: '#52525b', fontSize: 15 },
-  errorText: { color: '#f87171', fontSize: 15 },
 })

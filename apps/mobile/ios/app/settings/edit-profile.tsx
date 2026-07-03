@@ -1,17 +1,17 @@
 import { useState } from 'react'
 import {
-  View, Text, TextInput, Pressable,
+  View, Text, TextInput, Pressable, Alert,
   KeyboardAvoidingView, Platform, ActivityIndicator, ScrollView, StyleSheet,
 } from 'react-native'
 import { GlassView } from 'expo-glass-effect'
 import { Ionicons } from '@expo/vector-icons'
 import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useAuthStore, type AppUser } from '../../store/auth'
+import { useProfileStore } from '../../store/profile'
 import { Avatar } from '../../components/Avatar'
-import { api } from '../../lib/api'
 import { useAvatarUpload } from '../../hooks/useAvatarUpload'
 import { AvatarEditorModal } from '../../components/AvatarEditorModal'
+import { navigateAfterAccountChange } from '../../utils/navigation'
 
 const AVATAR_SIZE = 100
 const BTN_H       = 44
@@ -19,38 +19,57 @@ const BTN_H       = 44
 export default function EditProfileScreen() {
   const insets = useSafeAreaInsets()
   const router  = useRouter()
-  const { user } = useAuthStore(s => ({ user: s.user }))
+  const { displayName, bio, fingerprint, avatarLocalPath, username, accounts, setDisplayName, setBio, signOut } = useProfileStore(s => ({
+    displayName:     s.displayName,
+    bio:             s.bio,
+    fingerprint:     s.fingerprint,
+    avatarLocalPath: s.avatarLocalPath,
+    username:        s.username,
+    accounts:        s.accounts,
+    setDisplayName:  s.setDisplayName,
+    setBio:          s.setBio,
+    signOut:         s.signOut,
+  }))
   const { pickAndUpload, uploading: uploadingPhoto, error: uploadError, editorUri, handleEditorDone, handleEditorCancel } = useAvatarUpload()
 
   const BTN_TOP = insets.top + 10
 
-  const [editName, setEditName] = useState(user?.display_name ?? '')
-  const [editBio,  setEditBio]  = useState(user?.bio ?? '')
+  const [editName, setEditName] = useState(displayName)
+  const [editBio,  setEditBio]  = useState(bio)
   const [saving,   setSaving]   = useState(false)
-  const [error,    setError]    = useState<string | null>(null)
 
-  const displayError = error ?? uploadError
+  const displayError = uploadError
 
   async function handleSave() {
     if (saving) return
-    const hasChanges = editName.trim() !== (user?.display_name ?? '') ||
-                       editBio.trim()  !== (user?.bio ?? '')
-    if (!hasChanges) { router.back(); return }
-    if (!editName.trim()) return
-    setError(null)
     setSaving(true)
-    try {
-      const res = await api.put<{ data: AppUser }>('/api/v1/users/me', {
-        display_name: editName.trim(),
-        bio: editBio.trim() || null,
-      })
-      useAuthStore.setState({ user: res.data })
-      router.back()
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Ошибка сохранения'
-      setError(msg)
-      setSaving(false)
-    }
+    await Promise.all([
+      setDisplayName(editName),
+      setBio(editBio),
+    ])
+    setSaving(false)
+    router.back()
+  }
+
+  function handleSignOutPress() {
+    const otherAccountRemains = accounts.length > 1
+    Alert.alert(
+      'Выйти из аккаунта?',
+      otherAccountRemains
+        ? 'Вернуться обратно можно только по фразе восстановления этого аккаунта. Другой зарегистрированный на устройстве аккаунт станет активным.'
+        : 'Здесь нет сервера — вернуться обратно можно только по фразе восстановления. Убедись, что сохранил её (Настройки → Фраза восстановления), иначе аккаунт будет утерян навсегда.',
+      [
+        { text: 'Отмена', style: 'cancel' },
+        {
+          text: 'Выйти',
+          style: 'destructive',
+          onPress: async () => {
+            await signOut()
+            navigateAfterAccountChange(router)
+          },
+        },
+      ]
+    )
   }
 
   return (
@@ -87,14 +106,9 @@ export default function EditProfileScreen() {
         }}
         showsVerticalScrollIndicator={false}
       >
-        {/* Avatar — same position as Settings screen for seamless fade transition */}
         <View style={s.profileSection}>
           <Pressable onPress={pickAndUpload} disabled={uploadingPhoto}>
-            <Avatar
-              uri={user?.avatar_url ?? null}
-              size={AVATAR_SIZE}
-              username={user?.username ?? user?.display_name ?? '?'}
-            />
+            <Avatar uri={avatarLocalPath} size={AVATAR_SIZE} username={editName || '?'} />
             <View style={s.avatarOverlay}>
               {uploadingPhoto
                 ? <ActivityIndicator color="#fff" size="large" />
@@ -129,24 +143,46 @@ export default function EditProfileScreen() {
               returnKeyType="next"
             />
           </View>
-          <Pressable
-            style={({ pressed }) => [s.fieldRow, s.usernameBtn, pressed && s.usernameBtnPressed]}
-            onPress={() => router.push('/settings/username')}
-          >
-            <View style={s.usernameBtnLeft}>
-              <View style={s.usernameIcon}>
-                <Ionicons name="at" size={16} color="#fff" />
-              </View>
-              <View>
-                <Text style={s.fieldLabel}>Имя пользователя</Text>
-                <Text style={s.usernameValue}>
-                  {user?.username ? `@${user.username}` : 'Не задано'}
-                </Text>
-              </View>
-            </View>
-            <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.3)" />
-          </Pressable>
+          <View style={s.fieldRow}>
+            <Text style={s.fieldLabel}>Идентификатор</Text>
+            <Text style={s.fingerprintValue}>{fingerprint}</Text>
+          </View>
         </View>
+        <Text style={s.fingerprintHint}>
+          Это криптографический отпечаток твоего устройства — сравни его с собеседником лично или по другому каналу, чтобы убедиться, что переписка не подменена. Он не редактируется и не зависит от имени.
+        </Text>
+
+        <Pressable
+          style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
+          onPress={() => router.push('/settings/username')}
+        >
+          <View style={s.fieldRow}>
+            <Text style={s.fieldLabel}>Имя пользователя</Text>
+            <Text style={s.usernameValue}>{username ? `@${username}` : 'Не задано'}</Text>
+          </View>
+        </Pressable>
+        <Text style={s.fingerprintHint}>
+          Необязательно — если задать, тебя можно будет найти по точному @имени. Публикуется в открытой P2P-сети без сервера, поэтому уникальность не гарантирована железно.
+        </Text>
+
+        <Pressable
+          style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
+          onPress={() => router.push('/settings/recovery-phrase')}
+        >
+          <View style={s.fieldRow}>
+            <Text style={s.recoveryLabel}>Фраза восстановления</Text>
+          </View>
+        </Pressable>
+
+        <Pressable
+          style={({ pressed }) => [s.group, { marginTop: 12 }, s.recoveryRow, pressed && s.recoveryRowPressed]}
+          onPress={() => router.push('/settings/accounts')}
+        >
+          <View style={s.fieldRow}>
+            <Text style={s.fieldLabel}>Аккаунты</Text>
+            <Text style={s.usernameValue}>{`${accounts.length} из 3`}</Text>
+          </View>
+        </Pressable>
 
         <View style={[s.group, { marginTop: 12 }]}>
           <View style={s.fieldRow}>
@@ -165,13 +201,7 @@ export default function EditProfileScreen() {
         </View>
         <Text style={s.bioCount}>{editBio.length}/200</Text>
 
-        <Pressable
-          onPress={async () => {
-            await useAuthStore.getState().signOut()
-            router.replace('/(auth)/login')
-          }}
-          style={s.signOutBtn}
-        >
+        <Pressable onPress={handleSignOutPress} style={s.signOutBtn}>
           <Text style={s.signOutText}>Выйти из аккаунта</Text>
         </Pressable>
       </ScrollView>
@@ -196,8 +226,11 @@ const s = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.45)',
     alignItems: 'center', justifyContent: 'center',
   },
-  profileTextWrap: { alignItems: 'center', marginTop: 14, minHeight: 72 },
+  profileTextWrap: { alignItems: 'center', marginTop: 14, minHeight: 20 },
   choosePhoto: { color: '#2f7bff', fontSize: 15, fontWeight: '500', textAlign: 'center' },
+
+  errorBox:  { backgroundColor: 'rgba(127,29,29,0.4)', borderRadius: 12, borderWidth: 1, borderColor: '#b91c1c', padding: 12, marginBottom: 12 },
+  errorText: { color: '#f87171', fontSize: 14 },
 
   btnOverlay: { position: 'absolute', zIndex: 10 },
   pillShape: {
@@ -213,18 +246,16 @@ const s = StyleSheet.create({
   fieldLabel:  { color: '#a1a1aa', fontSize: 12, fontWeight: '500' },
   fieldInput:  { color: '#fff', fontSize: 16, paddingVertical: 2 },
 
-  usernameBtn:        { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 0 },
-  usernameBtnPressed: { backgroundColor: '#1a1a1e' },
-  usernameBtnLeft:    { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  usernameIcon: {
-    width: 30, height: 30, borderRadius: 8,
-    backgroundColor: '#3b82f6',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  usernameValue: { color: '#fff', fontSize: 15, marginTop: 2 },
-  bioCount:    { color: '#3f3f46', fontSize: 12, textAlign: 'right', marginTop: 4, marginRight: 4 },
-  errorBox:    { backgroundColor: 'rgba(127,29,29,0.4)', borderRadius: 12, borderWidth: 1, borderColor: '#b91c1c', padding: 12, marginBottom: 12 },
-  errorText:   { color: '#f87171', fontSize: 14 },
+  fingerprintValue: { color: '#fff', fontSize: 15, fontVariant: ['tabular-nums'], marginTop: 2 },
+  fingerprintHint:  { color: '#52525b', fontSize: 12, lineHeight: 17, marginTop: 8, marginHorizontal: 4 },
+
+  recoveryRow:        {},
+  recoveryRowPressed: { backgroundColor: '#1a1a1e' },
+  recoveryLabel:       { color: '#2f7bff', fontSize: 16, fontWeight: '500' },
+  usernameValue:       { color: '#fff', fontSize: 15, marginTop: 2 },
+
+  bioCount: { color: '#3f3f46', fontSize: 12, textAlign: 'right', marginTop: 4, marginRight: 4 },
+
   signOutBtn:  { marginTop: 36, alignItems: 'center', paddingVertical: 14 },
   signOutText: { color: '#ef4444', fontSize: 16, fontWeight: '500', textAlign: 'center' },
 })

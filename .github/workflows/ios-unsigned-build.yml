@@ -3,18 +3,37 @@ name: iOS Unsigned Build (SideStore)
 # Produces an UNSIGNED .ipa for the iOS app. It is not code-signed by Apple —
 # SideStore/AltStore sign it locally on-device with the user's own free
 # Apple ID when sideloading, so no Apple Developer Program membership is
-# needed on the CI side. Once this native shell is installed, future JS-only
-# changes are delivered the normal way, via the existing EAS Update pipeline
-# (expo-updates talks directly to u.expo.dev with its own embedded manifest
-# URL — it does not go through Expo Go's project list/visibility gate that
-# is broken for this account, so it is unaffected by that bug).
+# needed on the CI side.
 #
-# Run manually from the Actions tab when a fresh native shell is needed
-# (i.e. after native dependency changes). Pure JS changes do not need a
-# rebuild — they ship via EAS Update as usual.
+# Every run also publishes the .ipa plus an AltSource-format source.json to
+# the "ios-dev" GitHub Release (stable URLs — see "Publish to iOS dev
+# channel" below). Add that source.json's raw URL to LiveContainer's own
+# Sources tab (Sources → + → paste URL) once, and LiveContainer will offer
+# each new build as an in-app update from then on — same idea as the
+# Android in-app updater, no manual re-download/re-import needed after the
+# one-time setup.
+#
+# Runs automatically on changes to the iOS app or the shared Rust crypto
+# core, or manually from the Actions tab.
 
 on:
+  push:
+    branches:
+      - claude/game-app-architecture-discussion-8gn7ep
+    paths:
+      - 'apps/mobile/ios/**'
+      - 'packages/crypto-core/**'
+      - 'packages/crypto-core-ffi/**'
+      - 'packages/p2p-core/**'
+      - '.github/workflows/ios-unsigned-build.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -32,6 +51,10 @@ jobs:
           echo "Selecting: $LATEST"
           sudo xcode-select -s "$LATEST"
           xcodebuild -version
+          # Recorded for the DerivedData cache key below — restoring a build
+          # cache produced by a different Xcode version onto this one is how
+          # you get bizarre, hard-to-debug archive failures.
+          echo "XCODE_VERSION=$(xcodebuild -version | head -1 | tr ' ' '_')" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
@@ -40,12 +63,109 @@ jobs:
       - name: Install JS dependencies
         run: npm install --legacy-peer-deps
 
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust build (crypto-core-ffi)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/crypto-core-ffi/target
+          key: rust-crypto-core-ffi-ios-${{ runner.os }}-${{ hashFiles('packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml') }}
+          restore-keys: |
+            rust-crypto-core-ffi-ios-${{ runner.os }}-
+
+      - name: Cross-compile crypto core for iOS (device + Apple Silicon simulator)
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --release --lib --target aarch64-apple-ios
+          cargo build --release --lib --target aarch64-apple-ios-sim
+
+      - name: Generate Swift bindings from the crypto core
+        working-directory: packages/crypto-core-ffi
+        run: |
+          cargo build --bin uniffi-bindgen
+          ./target/debug/uniffi-bindgen generate \
+            --library target/aarch64-apple-ios-sim/release/libspiritchat_crypto_core_ffi.dylib \
+            --language swift \
+            --out-dir bindgen-out \
+            --no-format
+
+          MODULE_DIR=../../apps/mobile/ios/modules/spiritchat-crypto-core/ios
+          cp bindgen-out/spiritchat_crypto_core_ffi.swift "$MODULE_DIR/"
+
+          mkdir -p headers
+          cp bindgen-out/spiritchat_crypto_core_ffiFFI.h headers/
+          cp bindgen-out/spiritchat_crypto_core_ffiFFI.modulemap headers/module.modulemap
+
+          rm -rf "$MODULE_DIR/SpiritchatCryptoCoreFFI.xcframework"
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libspiritchat_crypto_core_ffi.a -headers headers \
+            -library target/aarch64-apple-ios-sim/release/libspiritchat_crypto_core_ffi.a -headers headers \
+            -output "$MODULE_DIR/SpiritchatCryptoCoreFFI.xcframework"
+
+      # `expo prebuild` + `pod install` regenerate the whole native project
+      # from scratch every run (ios/ isn't committed) — even when nothing
+      # that actually affects it changed. That defeats DerivedData caching
+      # on its own: Xcode ties build-product validity to the specific
+      # project file it saw last time, so a byte-different-but-equivalent
+      # regenerated project still forces a full rebuild regardless of what's
+      # sitting in DerivedData (confirmed: the DerivedData cache below only
+      # shaved the Archive step by ~6% by itself). Caching the *entire*
+      # generated ios/ directory and skipping regeneration outright when its
+      # only real inputs — package.json, app.json, our own native module's
+      # podspec/config, and the Rust FFI source that gets compiled into it —
+      # haven't changed is what actually lets Xcode see the same project
+      # twice and trust its cache. A change to any of those still forces a
+      # full, correct regeneration; nothing here can serve stale native code.
+      - name: Cache generated native iOS project
+        id: native-project-cache
+        uses: actions/cache@v4
+        with:
+          path: apps/mobile/ios/ios
+          key: native-ios-project-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/app.json', 'apps/mobile/ios/modules/**/*.podspec', 'apps/mobile/ios/modules/**/expo-module.config.json', 'packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml') }}
+
       - name: Prebuild native iOS project
+        if: steps.native-project-cache.outputs.cache-hit != 'true'
         run: npx expo prebuild --platform ios --no-install
 
+      # Fallback caching for when the native project cache above *does*
+      # miss (a real native-relevant change) — still saves time re-resolving
+      # and re-downloading pods even though the project itself must be
+      # regenerated.
+      - name: Cache CocoaPods downloads
+        if: steps.native-project-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/CocoaPods
+            apps/mobile/ios/ios/Pods
+          key: cocoapods-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/modules/**/*.podspec') }}
+          restore-keys: |
+            cocoapods-${{ runner.os }}-
+
       - name: Install CocoaPods dependencies
+        if: steps.native-project-cache.outputs.cache-hit != 'true'
         working-directory: apps/mobile/ios/ios
         run: pod install --repo-update
+
+      # Now that the project itself is stable across runs whenever possible
+      # (see above), this can actually do what it was meant to: let Xcode's
+      # own incremental build system skip recompiling any pod whose inputs
+      # haven't changed, same as a local rebuild would, instead of starting
+      # from nothing every time. Keyed on Podfile.lock so a real dependency
+      # version bump still forces a full, correct rebuild.
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData
+          key: deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ hashFiles('apps/mobile/ios/ios/Podfile.lock') }}
+          restore-keys: |
+            deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
 
       - name: Detect Xcode scheme
         working-directory: apps/mobile/ios/ios
@@ -105,3 +225,57 @@ jobs:
           name: spiritchat-app-unsigned-ipa
           path: apps/mobile/ios/dist/App-unsigned.ipa
           retention-days: 14
+
+      - name: Write LiveContainer/SideStore source manifest
+        run: |
+          VERSION="1.0.0-dev.${{ github.run_number }}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          SIZE="$(stat -f%z dist/App-unsigned.ipa)"
+          BUNDLE_ID="$(node -e "console.log(require('./app.json').expo.ios.bundleIdentifier)")"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/ios-dev/App-unsigned.ipa"
+          # AltSource parsers disagree on where the download lives: older
+          # ones (and AltStore itself) read the flat version/downloadURL/size
+          # fields directly on the app object; newer ones (LiveContainer
+          # included) read a per-version entry from a nested "versions"
+          # array and error ("no IPA specified") if that array is missing or
+          # empty, even with the flat fields present. Emitting both is a
+          # pure superset, so every parser finds what it's looking for.
+          cat > dist/source.json <<EOF
+          {
+            "name": "SpiritChat Dev",
+            "identifier": "com.spiritchat.sources.ios-dev",
+            "apps": [
+              {
+                "name": "SpiritChat",
+                "bundleIdentifier": "$BUNDLE_ID",
+                "developerName": "SpiritChat",
+                "version": "$VERSION",
+                "versionDate": "$DATE",
+                "versionDescription": "${{ github.sha }}",
+                "localizedDescription": "SpiritChat — decentralized end-to-end-encrypted messenger (unsigned dev build, sideloaded via SideStore/LiveContainer).",
+                "downloadURL": "$DOWNLOAD_URL",
+                "size": $SIZE,
+                "versions": [
+                  {
+                    "version": "$VERSION",
+                    "date": "$DATE",
+                    "localizedDescription": "${{ github.sha }}",
+                    "downloadURL": "$DOWNLOAD_URL",
+                    "size": $SIZE
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+
+      - name: Publish to iOS dev channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-dev
+          name: iOS dev channel
+          prerelease: true
+          make_latest: false
+          files: |
+            apps/mobile/ios/dist/App-unsigned.ipa
+            apps/mobile/ios/dist/source.json

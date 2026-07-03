@@ -1,26 +1,30 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { View, ActivityIndicator } from 'react-native'
 import { useRouter } from 'expo-router'
-import { useAuthStore } from '../store/auth'
+import { useProfileStore } from '../store/profile'
+import { hasIdentity } from '../modules/spiritchat-crypto-core'
 
 export default function Index() {
-  const router          = useRouter()
-  const bootstrap       = useAuthStore(s => s.bootstrap)
-  const isBootstrapping = useAuthStore(s => s.isBootstrapping)
-  const token           = useAuthStore(s => s.token)
+  const router    = useRouter()
+  const bootstrap = useProfileStore(s => s.bootstrap)
+  const isReady   = useProfileStore(s => s.isReady)
+  const [checkedIdentity, setCheckedIdentity] = useState(false)
 
   useEffect(() => {
-    bootstrap()
+    // There's no account to log into — this device's Keychain identity,
+    // once it exists, is always available with no session/token to expire.
+    // The only real fork is whether one has ever been created here yet.
+    if (hasIdentity()) {
+      bootstrap()
+    } else {
+      router.replace('/(onboarding)/welcome')
+    }
+    setCheckedIdentity(true)
   }, [])
 
   useEffect(() => {
-    if (isBootstrapping) return
-    if (token) {
-      router.replace('/(tabs)/messages')
-    } else {
-      router.replace('/(auth)/login')
-    }
-  }, [isBootstrapping, token])
+    if (checkedIdentity && isReady) router.replace('/(tabs)/messages')
+  }, [checkedIdentity, isReady])
 
   return (
     <View style={{ flex: 1, backgroundColor: '#000000', alignItems: 'center', justifyContent: 'center' }}>
