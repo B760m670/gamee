@@ -38,6 +38,7 @@ pub enum FfiP2pEvent {
     NewBlockMined { height: u64 },
     MixPacketArrived { payload: Vec<u8> },
     MixForwardFailed { reason: String },
+    MixRelayDiscovered { peer_id: String },
 }
 
 impl From<P2pEvent> for FfiP2pEvent {
@@ -99,6 +100,7 @@ impl From<P2pEvent> for FfiP2pEvent {
             P2pEvent::NewBlockMined { height } => Self::NewBlockMined { height },
             P2pEvent::MixPacketArrived { payload } => Self::MixPacketArrived { payload },
             P2pEvent::MixForwardFailed { reason } => Self::MixForwardFailed { reason },
+            P2pEvent::MixRelayDiscovered { peer } => Self::MixRelayDiscovered { peer_id: peer.to_string() },
         }
     }
 }

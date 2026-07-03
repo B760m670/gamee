@@ -63,6 +63,17 @@ pub enum Command {
     /// to `first_hop`, same as `SendEnvelope`.
     SendMixPacket { first_hop: PeerId, packet_bytes: Vec<u8> },
 
+    /// Broadcasts this node's own Sphinx routing public key to
+    /// `behaviour::mix_relay_directory_topic()`, so other nodes can
+    /// discover it as a usable mix hop even before ever directly
+    /// exchanging mix traffic with it. Purely a discovery signal — a
+    /// sender still needs to `Dial` a chosen relay for the first hop of
+    /// any path, and intermediate-hop forwarding still resolves through
+    /// each relay's own connectivity-based bookkeeping, not this
+    /// announcement. The app layer decides when/whether to call this at
+    /// all (mix-relay participation is opt-in).
+    AnnounceMixRelay,
+
     /// Publishes `claim` under the DHT key derived from `username` (see
     /// `username::record_key_for`). `claim` is opaque to this crate — the
     /// app layer is responsible for making it self-certifying (e.g. a

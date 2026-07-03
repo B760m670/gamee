@@ -83,6 +83,16 @@ pub enum P2pEvent {
     /// peer this node is currently connected to.
     MixForwardFailed { reason: String },
 
+    /// This node learned `peer`'s Sphinx routing public key for the first
+    /// time, via a `Command::AnnounceMixRelay` broadcast it received over
+    /// `behaviour::mix_relay_directory_topic()` (real mix traffic
+    /// exchanged directly with a peer also populates this bookkeeping, but
+    /// silently — this event fires only for gossip-learned discoveries,
+    /// which is the case an app-level "N mix relays currently known"
+    /// transparency figure, in the same honesty-first spirit already used
+    /// for the ledger and the mailbox cache, would want to count).
+    MixRelayDiscovered { peer: PeerId },
+
     /// A DHT lookup for `username` finished with a currently-published
     /// claim (which may or may not be this node's own — the caller is
     /// responsible for verifying it before trusting it).

@@ -62,6 +62,28 @@ pub struct MixMessage {
     pub sender_routing_public_key: [u8; 32],
 }
 
+/// Where a mix-relay-enabled node periodically announces its own Sphinx
+/// routing public key (`Command::AnnounceMixRelay`) — gossip, not the DHT,
+/// since the point is *discovery* (finding some usable relays at all)
+/// rather than looking up one already-known key: a flooded broadcast
+/// naturally reaches every currently-online subscriber, which a targeted
+/// `get_record` can't do without already knowing what key to ask for.
+/// Publishing this is not a secret being leaked — see `MixMessage`'s own
+/// doc comment on why a mix node's willingness to relay and its routing
+/// key are meant to be public.
+pub fn mix_relay_directory_topic() -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new("/spiritchat/mix/relays/1")
+}
+
+/// What's published on `mix_relay_directory_topic()` — nothing but the
+/// publishing peer's own routing public key; gossipsub's own signed
+/// `Message::source` is the peer identity, so there's no separate PeerId
+/// field here to include (or for an impostor to forge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixRelayAnnouncement {
+    pub routing_public_key: [u8; 32],
+}
+
 /// The response half of the blob protocol. The request is just the raw
 /// content id (whatever hash the app chose to identify the blob by) —
 /// opaque to this crate either way.
@@ -84,7 +106,11 @@ pub struct Behaviour {
     pub mix: request_response::cbor::Behaviour<MixMessage, ()>,
     /// Propagates new `@username` ledger blocks and not-yet-mined claims
     /// (see `ledger.rs`) — gossip, not the DHT, since these need to reach
-    /// every node eventually, not be looked up on demand by key.
+    /// every node eventually, not be looked up on demand by key. One
+    /// gossipsub instance serves multiple topics (that's what it's built
+    /// for), so this also carries `mix_relay_directory_topic()`
+    /// announcements — the field name predates that second use and is kept
+    /// rather than renamed purely for churn's sake.
     pub ledger_gossip: gossipsub::Behaviour,
     /// Catches a lagging or brand-new peer up on the ledger — gossip
     /// alone only ever delivers new blocks going forward.
@@ -131,6 +157,7 @@ pub fn build(
         .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
     ledger_gossip.subscribe(&ledger::blocks_topic())?;
     ledger_gossip.subscribe(&ledger::txs_topic())?;
+    ledger_gossip.subscribe(&mix_relay_directory_topic())?;
 
     Ok(Behaviour {
         kad,

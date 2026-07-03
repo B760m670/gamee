@@ -214,6 +214,8 @@ final class P2pSession {
       return ["type": "mixPacketArrived", "payload": payload]
     case .mixForwardFailed(let reason):
       return ["type": "mixForwardFailed", "reason": reason]
+    case .mixRelayDiscovered(let peerId):
+      return ["type": "mixRelayDiscovered", "peerId": peerId]
     }
   }
 }

@@ -602,6 +602,13 @@ fn handle_command(
             swarm.behaviour_mut().mix.send_request(&first_hop, message);
         }
 
+        Command::AnnounceMixRelay => {
+            let announcement = behaviour::MixRelayAnnouncement { routing_public_key: mix_public.to_bytes() };
+            if let Ok(bytes) = bincode::serialize(&announcement) {
+                let _ = swarm.behaviour_mut().ledger_gossip.publish(behaviour::mix_relay_directory_topic(), bytes);
+            }
+        }
+
         Command::AnnounceUsername { username, claim } => {
             let key = username::record_key_for(&username);
             let record = Record::new(key, claim);
@@ -789,7 +796,7 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerGossip(gossip_event)) => {
-            handle_ledger_gossip_event(swarm, chain_store, mempool, mining, events, gossip_event);
+            handle_ledger_gossip_event(swarm, chain_store, mempool, mining, known_mix_routing_keys, events, gossip_event);
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::LedgerSync(sync_event)) => {
@@ -1099,11 +1106,13 @@ fn emit_dummy_mix_traffic(
 /// invalid messages at the gossip layer itself (so they stop propagating
 /// immediately, rather than merely being ignored on arrival) is a real
 /// hardening opportunity, deferred to Phase 5.
+#[allow(clippy::too_many_arguments)]
 fn handle_ledger_gossip_event(
     swarm: &mut Swarm<Behaviour>,
     chain_store: &mut ChainStore,
     mempool: &mut HashMap<Hash32, Transaction>,
     mining: &mut Mining,
+    known_mix_routing_keys: &mut HashMap<PeerId, PublicKey>,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: gossipsub::Event,
 ) {
@@ -1125,6 +1134,34 @@ fn handle_ledger_gossip_event(
                 mining.restart_if_active(chain_store, mempool);
             }
         }
+    } else if message.topic == behaviour::mix_relay_directory_topic().hash() {
+        if let Some(peer) = record_mix_relay_announcement(known_mix_routing_keys, message.source, &message.data) {
+            let _ = events.send(P2pEvent::MixRelayDiscovered { peer });
+        }
+    }
+}
+
+/// Parses a `mix_relay_directory_topic()` gossip message and records the
+/// announcing peer's routing key, if the message is well-formed and
+/// actually has a signed source (gossipsub's `Signed` authenticity mode,
+/// already used by this crate for every topic, guarantees the latter).
+/// Pure and swarm-free on purpose — separated out from
+/// `handle_ledger_gossip_event` specifically so this parsing/bookkeeping
+/// logic is unit-testable without standing up a real swarm. Returns the
+/// peer only when this was a genuinely new discovery (an update to an
+/// already-known peer's key returns `None`), which is what decides
+/// whether `P2pEvent::MixRelayDiscovered` fires.
+fn record_mix_relay_announcement(
+    known_mix_routing_keys: &mut HashMap<PeerId, PublicKey>,
+    source: Option<PeerId>,
+    data: &[u8],
+) -> Option<PeerId> {
+    let peer = source?;
+    let announcement = bincode::deserialize::<behaviour::MixRelayAnnouncement>(data).ok()?;
+    let key = PublicKey::from(announcement.routing_public_key);
+    match known_mix_routing_keys.insert(peer, key) {
+        Some(_) => None,
+        None => Some(peer),
     }
 }
 
@@ -1258,5 +1295,53 @@ fn handle_chain_sync_response(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_well_formed_announcement_from_a_signed_source_is_recorded_as_a_new_discovery() {
+        let mut known = HashMap::new();
+        let peer = PeerId::random();
+        let (_secret, public) = mix::routing_keypair_from_seed(&[3u8; 32]);
+        let bytes = bincode::serialize(&behaviour::MixRelayAnnouncement { routing_public_key: public.to_bytes() }).unwrap();
+
+        let discovered = record_mix_relay_announcement(&mut known, Some(peer), &bytes);
+
+        assert_eq!(discovered, Some(peer));
+        assert_eq!(known.get(&peer), Some(&public));
+    }
+
+    #[test]
+    fn a_second_announcement_from_an_already_known_peer_is_not_reported_as_a_new_discovery() {
+        let mut known = HashMap::new();
+        let peer = PeerId::random();
+        let (_secret, public) = mix::routing_keypair_from_seed(&[3u8; 32]);
+        let bytes = bincode::serialize(&behaviour::MixRelayAnnouncement { routing_public_key: public.to_bytes() }).unwrap();
+
+        assert!(record_mix_relay_announcement(&mut known, Some(peer), &bytes).is_some());
+        assert_eq!(record_mix_relay_announcement(&mut known, Some(peer), &bytes), None);
+    }
+
+    #[test]
+    fn an_announcement_with_no_signed_source_is_ignored() {
+        let mut known = HashMap::new();
+        let (_secret, public) = mix::routing_keypair_from_seed(&[3u8; 32]);
+        let bytes = bincode::serialize(&behaviour::MixRelayAnnouncement { routing_public_key: public.to_bytes() }).unwrap();
+
+        assert_eq!(record_mix_relay_announcement(&mut known, None, &bytes), None);
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn malformed_announcement_bytes_are_ignored_rather_than_panicking() {
+        let mut known = HashMap::new();
+        let peer = PeerId::random();
+
+        assert_eq!(record_mix_relay_announcement(&mut known, Some(peer), b"not a real announcement"), None);
+        assert!(known.is_empty());
     }
 }
