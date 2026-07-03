@@ -116,6 +116,24 @@ pub fn mailbox_tag(shared_material: &[u8], epoch: u64) -> [u8; MAILBOX_TAG_LEN] 
     tag
 }
 
+/// A stable, order-independent combination of two peers' long-term
+/// identity public keys — usable as `mailbox_tag`'s `shared_material`
+/// before any X3DH session exists yet between them (see this module's own
+/// doc comment). Order-independent — sorting the two keys byte-wise
+/// before concatenating — specifically so it doesn't matter which side
+/// computes it "first": `shared_material_from_identity_keys(a, b)` and
+/// `shared_material_from_identity_keys(b, a)` always agree, which is what
+/// lets a sender and a recipient who have never talked before still
+/// derive the exact same mailbox tag independently.
+pub fn shared_material_from_identity_keys(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    let mut out = Vec::with_capacity(38 + first.len() + second.len());
+    out.extend_from_slice(b"spiritchat-mailbox-shared-material-v1");
+    out.extend_from_slice(first);
+    out.extend_from_slice(second);
+    out
+}
+
 /// What travels to a storing node. `envelope` is exactly what `SendEnvelope`
 /// already carries — no format change, and this layer never sees
 /// plaintext here either, same as the direct-send path.
@@ -469,6 +487,23 @@ mod tests {
     #[test]
     fn tags_differ_for_different_shared_material() {
         assert_ne!(mailbox_tag(&[1u8; 32], 0), mailbox_tag(&[2u8; 32], 0));
+    }
+
+    #[test]
+    fn shared_material_from_identity_keys_agrees_regardless_of_argument_order() {
+        let alice_key = [7u8; 32];
+        let bob_key = [9u8; 32];
+        assert_eq!(
+            shared_material_from_identity_keys(&alice_key, &bob_key),
+            shared_material_from_identity_keys(&bob_key, &alice_key)
+        );
+    }
+
+    #[test]
+    fn shared_material_differs_for_a_different_pair_of_keys() {
+        let a = shared_material_from_identity_keys(&[1u8; 32], &[2u8; 32]);
+        let b = shared_material_from_identity_keys(&[1u8; 32], &[3u8; 32]);
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub use command::Command;
 pub use error::{P2pError, Result};
 pub use event::P2pEvent;
 pub use identity::{keypair_from_seed, peer_id_from_public_key, peer_id_from_seed};
+pub use mailbox::shared_material_from_identity_keys;
 pub use mix::{build_packet, node_address_for, routing_keypair_from_seed, MixHop};
 pub use node::P2pNode;
 
