@@ -41,6 +41,8 @@ export type P2pEvent =
   | { type: 'chainSyncCompleted'; height: number }
   | { type: 'chainSyncFailed'; peerId: string; reason: string }
   | { type: 'newBlockMined'; height: number }
+  | { type: 'mixPacketArrived'; payload: Uint8Array }
+  | { type: 'mixForwardFailed'; reason: string }
 
 /**
  * Synthesized by `ChatManager.swift` from decrypted/queued messages — not a
