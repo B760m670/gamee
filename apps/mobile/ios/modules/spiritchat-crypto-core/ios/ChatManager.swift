@@ -41,9 +41,16 @@ final class ChatManager {
   private static let handshakeTag: UInt8 = 0x00
   private static let continuingTag: UInt8 = 0x01
 
+  /// How often `sweepMailboxRetrieval` runs — same order of magnitude as
+  /// the mix's own dummy-traffic interval (`MIX_DUMMY_TRAFFIC_INTERVAL` in
+  /// `node.rs`), so a retrieval query blends into traffic that's already
+  /// happening on this schedule rather than standing out as its own signal.
+  private static let retrievalSweepInterval: TimeInterval = 30
+
   private let lock = NSLock()
   private var peerStates: [String: PeerSendState] = [:]
   private var connectedPeers: Set<String> = []
+  private var retrievalTimer: Timer?
 
   private let slot: Int
   private let node: FfiP2pNode
@@ -74,6 +81,12 @@ final class ChatManager {
     for peerId in Set(ChatStore.loadOutbox(slot: slot).map(\.peerId)) {
       attemptSend(peerId: peerId)
     }
+
+    startRetrievalSweep()
+  }
+
+  deinit {
+    retrievalTimer?.invalidate()
   }
 
   // MARK: - Sending
@@ -192,6 +205,42 @@ final class ChatManager {
     }
   }
 
+  /// The value `depositToMailbox`/`retrieveFromMailbox` both key on for a
+  /// given contact — derived from both identities' long-term public keys,
+  /// so it's computable independently by either side without needing an
+  /// established ratchet session first (unlike the ratchet itself, which
+  /// only exists once a handshake has actually completed).
+  private func mailboxSharedMaterial(peerPublicKey: Data) -> Data {
+    p2pMailboxSharedMaterial(ownIdentityPublicKey: identity.publicKeyBytes(), peerIdentityPublicKey: peerPublicKey)
+  }
+
+  /// Falls back here when a direct send couldn't be delivered (the peer
+  /// went offline mid-flight, or wasn't reachable this attempt) but a
+  /// ratchet session already exists — deposits the same kind of encrypted
+  /// envelope into the serverless mailbox mix instead of just giving up,
+  /// so the recipient's own periodic sweep (`sweepMailboxRetrieval`) can
+  /// pick it up whenever they're next online. Successful *dispatch* ends
+  /// this attempt the same way a hard failure would: the mix gives no
+  /// per-item delivery receipt, and the item stays queued either way, so a
+  /// future reconnect still retries a direct send too.
+  private func depositContinuing(item: ChatStore.OutboxItem, session: ChatStore.Session) {
+    defer { endState(for: item.peerId) }
+    do {
+      let ratchet = try FfiRatchet.fromBytes(bytes: session.ratchetBytes)
+      let ciphertext = try ratchet.encrypt(plaintext: item.plaintext, associatedData: Data())
+      let envelope = Self.frameContinuing(ciphertext)
+      try ChatStore.saveSession(
+        ChatStore.Session(peerId: item.peerId, peerPublicKey: session.peerPublicKey, ratchetBytes: ratchet.toBytes()),
+        slot: slot
+      )
+      let sharedMaterial = mailboxSharedMaterial(peerPublicKey: session.peerPublicKey)
+      try node.depositToMailbox(sharedMaterial: sharedMaterial, envelope: envelope)
+      emit(failedEvent(item: item, reason: "queued for offline delivery"))
+    } catch {
+      emit(failedEvent(item: item, reason: "\(error)"))
+    }
+  }
+
   /// Runs once this device's `fetchBlob` for `peerId`'s contact card comes
   /// back: verifies it (`FfiContactCard.parse` already checks every
   /// signature), runs X3DH against it, bootstraps the initiator side of a
@@ -293,6 +342,106 @@ final class ChatManager {
     }
   }
 
+  /// A mailbox-retrieved envelope carries no attached sender — Sphinx
+  /// delivery hides the true origin from the P2P layer by design, the same
+  /// unlinkability property that makes offline delivery through the mix
+  /// safe in the first place. Dispatch mirrors `onEnvelopeReceived`'s own
+  /// tag byte, but each sub-handler has to *discover or guess* the sender
+  /// instead of already knowing it.
+  private func handleMailboxEnvelopeRetrieved(_ envelope: Data) {
+    guard let tag = envelope.first else { return }
+    let body = Data(envelope.dropFirst())
+    switch tag {
+    case Self.handshakeTag:
+      handleRetrievedHandshake(body: body)
+    case Self.continuingTag:
+      handleRetrievedContinuing(body: body)
+    default:
+      NSLog("[ChatManager] a mailbox-retrieved envelope has an unrecognized type tag \(tag) — dropped")
+    }
+  }
+
+  /// A handshake retrieved from the mailbox: same framing as
+  /// `handleIncomingHandshake`, but the sender's PeerId has to be derived
+  /// from the X3DH response's own `initiatorIdentityBytes` rather than
+  /// being handed one directly by the transport.
+  private func handleRetrievedHandshake(body: Data) {
+    guard body.count >= 2 else { return }
+    let length = Int(body[body.startIndex]) << 8 | Int(body[body.startIndex + 1])
+    let initialMessageStart = body.index(body.startIndex, offsetBy: 2)
+    guard body.distance(from: initialMessageStart, to: body.endIndex) >= length else { return }
+    let initialMessageEnd = body.index(initialMessageStart, offsetBy: length)
+    let initialMessageBytes = Data(body[initialMessageStart..<initialMessageEnd])
+    let ratchetMessageBytes = Data(body[initialMessageEnd...])
+
+    do {
+      let response = try x3dhRespond(agreement: agreement, prekeys: prekeys, initialMessageBytes: initialMessageBytes)
+      let peerId = try p2pPeerIdFromPublicKey(publicKey: response.initiatorIdentityBytes)
+      let ratchet = try FfiRatchet.initResponder(
+        sharedSecretBytes: response.sharedSecret,
+        myRatchetSecretBytes: prekeys.signedPrekeySecretBytes()
+      )
+      let plaintext = try ratchet.decrypt(message: ratchetMessageBytes, associatedData: Data())
+      try ChatStore.saveSession(
+        ChatStore.Session(peerId: peerId, peerPublicKey: response.initiatorIdentityBytes, ratchetBytes: ratchet.toBytes()),
+        slot: slot
+      )
+      let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: response.initiatorIdentityBytes)) ?? ""
+      emit(receivedEvent(peerId: peerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext))
+    } catch {
+      NSLog("[ChatManager] failed to accept a mailbox-retrieved handshake: \(error)")
+    }
+  }
+
+  /// A continuing-conversation envelope retrieved from the mailbox: no
+  /// sender attached, so — unlike `handleIncomingContinuing`, which already
+  /// knows which session to use — this tries every known session's ratchet
+  /// in turn and keeps whichever one actually decrypts. `FfiRatchet.decrypt`
+  /// only succeeds against the one ratchet chain that produced this
+  /// ciphertext, so at most one candidate can ever match.
+  private func handleRetrievedContinuing(body: Data) {
+    for session in ChatStore.loadAllSessions(slot: slot) {
+      guard let ratchet = try? FfiRatchet.fromBytes(bytes: session.ratchetBytes) else { continue }
+      guard let plaintext = try? ratchet.decrypt(message: body, associatedData: Data()) else { continue }
+      try? ChatStore.saveSession(
+        ChatStore.Session(peerId: session.peerId, peerPublicKey: session.peerPublicKey, ratchetBytes: ratchet.toBytes()),
+        slot: slot
+      )
+      let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
+      emit(receivedEvent(peerId: session.peerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
+      return
+    }
+    NSLog("[ChatManager] a mailbox-retrieved continuing envelope matched no known session — dropped")
+  }
+
+  // MARK: - Mailbox retrieval sweep
+
+  /// Periodically checks every contact this device has a session with for
+  /// mail queued while the two of them were never online at the same
+  /// time — the read side of `depositContinuing`'s write. Scheduled
+  /// explicitly on the main run loop rather than via
+  /// `Timer.scheduledTimer` because `ChatManager` isn't guaranteed to be
+  /// constructed on the main thread (`P2pSession.shared`'s lazy
+  /// initialization can run wherever it's first touched), and `.common`
+  /// mode keeps the timer firing even while the run loop is busy tracking
+  /// UI scrolling/gestures.
+  private func startRetrievalSweep() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      let timer = Timer(timeInterval: Self.retrievalSweepInterval, repeats: true) { [weak self] _ in
+        self?.sweepMailboxRetrieval()
+      }
+      RunLoop.main.add(timer, forMode: .common)
+      self.retrievalTimer = timer
+    }
+  }
+
+  private func sweepMailboxRetrieval() {
+    for session in ChatStore.loadAllSessions(slot: slot) {
+      try? node.retrieveFromMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: session.peerPublicKey))
+    }
+  }
+
   // MARK: - P2P event feed
 
   /// Called from the same event pump that drives `P2pSession.encode` (see
@@ -341,8 +490,15 @@ final class ChatManager {
 
     case .envelopeDeliveryFailed(let toPeerId, let reason):
       guard state(for: toPeerId) == .sendingEnvelope else { return }
-      endState(for: toPeerId)
-      if let item = firstOutboxItem(toPeerId) { emit(failedEvent(item: item, reason: reason)) }
+      if let item = firstOutboxItem(toPeerId), let session = ChatStore.loadSession(slot: slot, peerId: toPeerId) {
+        depositContinuing(item: item, session: session)
+      } else {
+        endState(for: toPeerId)
+        if let item = firstOutboxItem(toPeerId) { emit(failedEvent(item: item, reason: reason)) }
+      }
+
+    case .mailboxEnvelopeRetrieved(let envelope):
+      handleMailboxEnvelopeRetrieved(envelope)
 
     default:
       break
