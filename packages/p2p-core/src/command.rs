@@ -111,6 +111,22 @@ pub enum Command {
     /// received (or given up waiting for) the previous reply — the same
     /// "one at a time" shape `ChatManager`'s own outbox already uses on
     /// the sending side.
+    ///
+    /// One honest, current limitation, stated plainly rather than papered
+    /// over: this query's own path's final hop is picked the same
+    /// independent, random way `DepositToMailbox`'s path is — there is no
+    /// deterministic, tag-keyed routing (e.g. Kademlia's own closest-peers
+    /// lookup) steering a query toward whichever specific relay actually
+    /// holds a given tag. With only one relay known, this doesn't matter;
+    /// with several, a single query only reaches the right one with
+    /// roughly `1 / (known relay count)` odds per attempt. `ChatManager`'s
+    /// own periodic retrieval sweep already retries on an ordinary
+    /// schedule regardless (silence looks the same as "wrong relay,"
+    /// which is exactly why there's no separate not-found signal to act
+    /// on), so delivery is still eventual, just not first-try-guaranteed
+    /// once more than one relay is in play — a real gap worth closing with
+    /// deterministic tag-based routing in a later pass, not a correctness
+    /// bug in what exists today.
     RetrieveFromMailbox { shared_material: Vec<u8> },
 
     /// Publishes `claim` under the DHT key derived from `username` (see

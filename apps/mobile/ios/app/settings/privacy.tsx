@@ -5,14 +5,24 @@ import { GlassView } from 'expo-glass-effect'
 import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { SettingsRow } from '../../components/SettingsRow'
-import { mixRelayParticipationEnabled, setMixRelayParticipationEnabled } from '../../modules/spiritchat-crypto-core'
+import {
+  mixRelayParticipationEnabled,
+  setMixRelayParticipationEnabled,
+  mixDummyTrafficBytesPerHourEstimate,
+} from '../../modules/spiritchat-crypto-core'
 
 const BTN_H = 42
+
+function formatBytesPerHour(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б/ч`
+  return `${(bytes / 1024).toFixed(0)} КБ/ч`
+}
 
 export default function PrivacyScreen() {
   const router = useRouter()
   const insets = useSafeAreaInsets()
   const [mixRelayEnabled, setMixRelayEnabled] = useState(() => mixRelayParticipationEnabled())
+  const [trafficEstimate] = useState(() => mixDummyTrafficBytesPerHourEstimate())
 
   const toggleMixRelay = (value: boolean) => {
     setMixRelayParticipationEnabled(value)
@@ -54,6 +64,7 @@ export default function PrivacyScreen() {
               Помогает пересылать чужие зашифрованные сообщения через анонимную сеть,
               когда телефон заряжается и на экране. Взамен ваши сообщения тоже смогут
               доставляться, пока собеседник офлайн — без единого сервера.
+              {'\n'}Фоновый трафик: ~{formatBytesPerHour(trafficEstimate)} (без учёта переписки).
             </Text>
           </View>
           <Switch

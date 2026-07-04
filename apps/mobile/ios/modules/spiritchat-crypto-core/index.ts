@@ -102,6 +102,7 @@ const NativeCryptoCore = requireNativeModule<
     p2pStopMining(): void
     mixRelayParticipationEnabled(): boolean
     setMixRelayParticipationEnabled(enabled: boolean): void
+    mixDummyTrafficBytesPerHourEstimate(): number
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
@@ -650,6 +651,17 @@ export function mixRelayParticipationEnabled(): boolean {
  */
 export function setMixRelayParticipationEnabled(enabled: boolean): void {
   NativeCryptoCore.setMixRelayParticipationEnabled(enabled)
+}
+
+/**
+ * A rough, honest lower-bound estimate (bytes/hour) of this device's own
+ * background data cost from Loopix dummy (cover/loop) mix traffic alone —
+ * real messaging traffic on top of this isn't counted, since it varies
+ * with actual usage rather than being a constant hum. For display next to
+ * the mix-relay participation toggle, not a hard guarantee.
+ */
+export function mixDummyTrafficBytesPerHourEstimate(): number {
+  return NativeCryptoCore.mixDummyTrafficBytesPerHourEstimate()
 }
 
 /**

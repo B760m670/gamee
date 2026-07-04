@@ -403,6 +403,15 @@ public class SpiritchatCryptoCoreModule: Module {
       MixRelayController.shared.participationEnabled = enabled
     }
 
+    // An honest, lower-bound estimate of this device's own background
+    // data cost from dummy (cover/loop) mix traffic alone, at the
+    // interval the native side actually uses — for the same Settings row
+    // as the toggle above, so a user deciding whether to opt out sees a
+    // real number, not just a description.
+    Function("mixDummyTrafficBytesPerHourEstimate") { () -> UInt64 in
+      p2pEstimatedMixDummyTrafficBytesPerHour()
+    }
+
     // Queues `plaintext` for `peerId` and starts delivering it immediately
     // — durable on disk before this returns, so it's never lost even if
     // the peer is offline or this device restarts before it goes out (see

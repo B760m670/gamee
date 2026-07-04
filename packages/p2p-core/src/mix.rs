@@ -145,6 +145,36 @@ pub fn build_dummy_packet(
     build_packet(DUMMY_PAYLOAD_MARKER, path, destination_address, destination_identifier, average_hop_delay)
 }
 
+/// A rough, honest lower bound on this node's own background data cost
+/// from Loopix dummy (cover/loop) traffic alone — not real messaging,
+/// which varies with how much the user actually sends/receives, only the
+/// constant hum `MIX_DUMMY_TRAFFIC_INTERVAL` in `node.rs` produces
+/// regardless of whether there's anything real to send. Measured by
+/// actually serializing one real single-hop dummy packet and reading its
+/// byte length, rather than hand-deriving Sphinx's header-size math —
+/// stays correct even if the underlying format's fixed overhead ever
+/// changes, at the cost of only being exact for the *single-hop* (drop
+/// cover) case; loop traffic's extra hop adds a little more (one more
+/// header layer's worth) that this deliberately doesn't count, keeping
+/// this a lower, not upper, bound — same "state the real limit plainly"
+/// approach already used for every other honesty-first figure in this
+/// project (the ledger's own 51% risk, the mailbox's retention window,
+/// `Command::RetrieveFromMailbox`'s routing-odds disclosure).
+pub fn estimated_dummy_traffic_bytes_per_hour(traffic_interval: std::time::Duration) -> u64 {
+    let (_secret, public) = routing_keypair_from_seed(&[0u8; 32]);
+    let hop = MixHop { address: node_address_for(&[0u8; 32]), public_key: public };
+    let packet = build_dummy_packet(
+        &[hop],
+        DestinationAddressBytes::from_bytes([0u8; 32]),
+        [0u8; 16],
+        std::time::Duration::from_millis(1),
+    )
+    .expect("a single-hop dummy packet always builds successfully");
+    let packet_bytes = packet.to_bytes().len() as u64;
+    let packets_per_hour = 3600 / traffic_interval.as_secs().max(1);
+    packet_bytes * packets_per_hour
+}
+
 /// Builds a **Single Use Reply Block**: a pre-computed return path,
 /// opaque to whoever ends up holding it, that lets a responder send
 /// exactly one reply back to `path`'s originator without ever learning
@@ -401,5 +431,31 @@ mod tests {
             panic!("expected the single hop to be Final");
         };
         assert_eq!(&payload[..b"single hop".len()], b"single hop");
+    }
+
+    #[test]
+    fn the_dummy_traffic_estimate_is_a_small_but_nonzero_number_of_kilobytes_per_hour() {
+        let bytes_per_hour = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(30));
+
+        // At `MIX_DUMMY_TRAFFIC_INTERVAL`'s current 30s cadence this
+        // should land in the low hundreds of KB/hour — real enough to be
+        // worth disclosing honestly in Settings one day, nowhere near
+        // heavy enough to be a battery/data concern on its own. This is a
+        // sanity bound on the figure's *order of magnitude*, not a pinned
+        // exact byte count — it must never silently go to zero (a broken
+        // estimate) or balloon into megabytes (a genuinely alarming
+        // regression in packet size or interval).
+        assert!(bytes_per_hour > 0, "the estimate must never be zero — dummy traffic is real bytes on the wire");
+        assert!(
+            bytes_per_hour < 2_000_000,
+            "dummy traffic ballooned to {bytes_per_hour} bytes/hour — check MIX_DUMMY_TRAFFIC_INTERVAL/packet size"
+        );
+    }
+
+    #[test]
+    fn a_shorter_traffic_interval_estimates_proportionally_more_bytes_per_hour() {
+        let slower = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(60));
+        let faster = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(30));
+        assert_eq!(faster, slower * 2);
     }
 }

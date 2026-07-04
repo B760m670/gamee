@@ -55,6 +55,22 @@ pub fn p2p_mailbox_shared_material(own_identity_public_key: Vec<u8>, peer_identi
     spiritchat_p2p_core::shared_material_from_identity_keys(&own_identity_public_key, &peer_identity_public_key)
 }
 
+/// A rough, honest lower-bound estimate (in bytes/hour) of this device's
+/// own background data cost from Loopix dummy traffic alone, at the real
+/// cadence this crate actually uses (`mix_dummy_traffic_interval_secs`,
+/// not a duplicated/hardcoded copy of it) — real messaging traffic on top
+/// of this is unaccounted for, deliberately, since it varies with actual
+/// usage rather than being a constant hum. See
+/// `spiritchat_p2p_core::estimated_dummy_traffic_bytes_per_hour`'s own doc
+/// comment for exactly what this does and doesn't count. Meant for an
+/// honesty-first Settings display, the same spirit as this project's
+/// existing ledger/mailbox disclosures, not a hard guarantee.
+#[uniffi::export]
+pub fn p2p_estimated_mix_dummy_traffic_bytes_per_hour() -> u64 {
+    let interval = std::time::Duration::from_secs(spiritchat_p2p_core::mix_dummy_traffic_interval_secs());
+    spiritchat_p2p_core::estimated_dummy_traffic_bytes_per_hour(interval)
+}
+
 fn parse_peer_id(text: &str) -> FfiResult<PeerId> {
     PeerId::from_str(text).map_err(|err| FfiError::P2p {
         reason: format!("invalid peer id {text:?}: {err}"),
