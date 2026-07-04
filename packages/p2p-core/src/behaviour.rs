@@ -36,6 +36,54 @@ pub const IDENTIFY_PROTOCOL_VERSION: &str = "/spiritchat/1.0.0";
 /// party being a dedicated host.
 pub const BLOB_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/blob/1.0.0");
 
+/// The wire protocol for carrying a raw Sphinx packet (see `mix.rs`) one
+/// hop closer to its destination. This behaviour only ever moves opaque
+/// bytes — a relay peels its own routing layer (in `node.rs`, not here)
+/// and re-sends the result over this same protocol to whichever peer that
+/// layer named as the next hop, so from this protocol's own point of view
+/// every hop looks identical: bytes in, an empty ack out, and (sometimes)
+/// bytes back out to someone else.
+pub const MIX_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/mix/1.0.0");
+
+/// What travels over `MIX_PROTOCOL`. `sender_routing_public_key` rides
+/// alongside the opaque `packet_bytes` in the clear — this is how a node
+/// learns another peer's Sphinx routing public key at all, since nothing
+/// about a `PeerId` reveals it. This is not a secret being leaked: which
+/// nodes act as mix relays and what their routing keys are is meant to be
+/// public information in a Loopix-style design (the same way a Tor relay's
+/// own identity is public) — what stays hidden is which path any specific
+/// packet took, never that a given node participates in the mix at all.
+/// Whoever sends this is, from the receiving hop's perspective, simply
+/// "the peer this arrived from" — which may be the original sender or any
+/// earlier relay re-wrapping a forwarded hop under its own key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixMessage {
+    pub packet_bytes: Vec<u8>,
+    pub sender_routing_public_key: [u8; 32],
+}
+
+/// Where a mix-relay-enabled node periodically announces its own Sphinx
+/// routing public key (`Command::AnnounceMixRelay`) — gossip, not the DHT,
+/// since the point is *discovery* (finding some usable relays at all)
+/// rather than looking up one already-known key: a flooded broadcast
+/// naturally reaches every currently-online subscriber, which a targeted
+/// `get_record` can't do without already knowing what key to ask for.
+/// Publishing this is not a secret being leaked — see `MixMessage`'s own
+/// doc comment on why a mix node's willingness to relay and its routing
+/// key are meant to be public.
+pub fn mix_relay_directory_topic() -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new("/spiritchat/mix/relays/1")
+}
+
+/// What's published on `mix_relay_directory_topic()` — nothing but the
+/// publishing peer's own routing public key; gossipsub's own signed
+/// `Message::source` is the peer identity, so there's no separate PeerId
+/// field here to include (or for an impostor to forge).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MixRelayAnnouncement {
+    pub routing_public_key: [u8; 32],
+}
+
 /// The response half of the blob protocol. The request is just the raw
 /// content id (whatever hash the app chose to identify the blob by) —
 /// opaque to this crate either way.
@@ -54,9 +102,15 @@ pub struct Behaviour {
     pub dcutr: dcutr::Behaviour,
     pub envelope: request_response::cbor::Behaviour<Vec<u8>, Vec<u8>>,
     pub blob: request_response::cbor::Behaviour<Vec<u8>, BlobResponse>,
+    /// See `MIX_PROTOCOL`/`MixMessage`.
+    pub mix: request_response::cbor::Behaviour<MixMessage, ()>,
     /// Propagates new `@username` ledger blocks and not-yet-mined claims
     /// (see `ledger.rs`) — gossip, not the DHT, since these need to reach
-    /// every node eventually, not be looked up on demand by key.
+    /// every node eventually, not be looked up on demand by key. One
+    /// gossipsub instance serves multiple topics (that's what it's built
+    /// for), so this also carries `mix_relay_directory_topic()`
+    /// announcements — the field name predates that second use and is kept
+    /// rather than renamed purely for churn's sake.
     pub ledger_gossip: gossipsub::Behaviour,
     /// Catches a lagging or brand-new peer up on the ledger — gossip
     /// alone only ever delivers new blocks going forward.
@@ -103,6 +157,7 @@ pub fn build(
         .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.into() })?;
     ledger_gossip.subscribe(&ledger::blocks_topic())?;
     ledger_gossip.subscribe(&ledger::txs_topic())?;
+    ledger_gossip.subscribe(&mix_relay_directory_topic())?;
 
     Ok(Behaviour {
         kad,
@@ -122,6 +177,10 @@ pub fn build(
         blob: request_response::cbor::Behaviour::new(
             [(BLOB_PROTOCOL, ProtocolSupport::Full)],
             request_response::Config::default().with_request_timeout(Duration::from_secs(60)),
+        ),
+        mix: request_response::cbor::Behaviour::new(
+            [(MIX_PROTOCOL, ProtocolSupport::Full)],
+            request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
         ),
         ledger_gossip,
         ledger_sync: request_response::cbor::Behaviour::new(

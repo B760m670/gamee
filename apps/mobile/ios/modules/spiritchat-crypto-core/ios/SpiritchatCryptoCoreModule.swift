@@ -34,6 +34,7 @@ private func removeAccountSlot(_ slot: Int) throws {
   let wasActive = slot == IdentitySession.activeSlot
   if wasActive {
     MiningController.shared.stop()
+    MixRelayController.shared.stop()
     P2pSession.signOut()
   }
   IdentitySession.removeSlot(slot)
@@ -128,6 +129,7 @@ public class SpiritchatCryptoCoreModule: Module {
     // it does on a normal launch.
     Function("switchAccount") { (slot: Int) throws in
       MiningController.shared.stop()
+      MixRelayController.shared.stop()
       P2pSession.signOut()
       try IdentitySession.switchTo(slot: slot)
     }
@@ -158,6 +160,7 @@ public class SpiritchatCryptoCoreModule: Module {
           }
           guard let session = P2pSession.shared else { continue }
           MiningController.shared.start()
+          MixRelayController.shared.start()
           session.chatManager.emit = { event in self.sendEvent("onChatEvent", event) }
           while let event = await session.node.nextEvent() {
             self.sendEvent("onP2pEvent", P2pSession.encode(event))
@@ -383,6 +386,30 @@ public class SpiritchatCryptoCoreModule: Module {
     // mining.
     Function("p2pStopMining") { () throws in
       try requireP2pSession().node.stopMining()
+    }
+
+    // Whether this device offers to relay/announce for the Sphinx/Loopix
+    // mixnet at all — the Settings toggle backing `MixRelayController`.
+    // Defaults to on; setting it re-evaluates immediately (see
+    // `MixRelayController.participationEnabled`'s own doc comment), so a
+    // user turning this off in Settings stops sustained dummy-traffic
+    // generation right away rather than waiting for the next foreground/
+    // charging transition.
+    Function("mixRelayParticipationEnabled") { () -> Bool in
+      MixRelayController.shared.participationEnabled
+    }
+
+    Function("setMixRelayParticipationEnabled") { (enabled: Bool) in
+      MixRelayController.shared.participationEnabled = enabled
+    }
+
+    // An honest, lower-bound estimate of this device's own background
+    // data cost from dummy (cover/loop) mix traffic alone, at the
+    // interval the native side actually uses — for the same Settings row
+    // as the toggle above, so a user deciding whether to opt out sees a
+    // real number, not just a description.
+    Function("mixDummyTrafficBytesPerHourEstimate") { () -> UInt64 in
+      p2pEstimatedMixDummyTrafficBytesPerHour()
     }
 
     // Queues `plaintext` for `peerId` and starts delivering it immediately

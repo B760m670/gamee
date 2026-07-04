@@ -1,15 +1,33 @@
-import { View, Text, Pressable, StyleSheet } from 'react-native'
+import { useState } from 'react'
+import { View, Text, Pressable, Switch, StyleSheet } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { GlassView } from 'expo-glass-effect'
 import { useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { SettingsRow } from '../../components/SettingsRow'
+import {
+  mixRelayParticipationEnabled,
+  setMixRelayParticipationEnabled,
+  mixDummyTrafficBytesPerHourEstimate,
+} from '../../modules/spiritchat-crypto-core'
 
 const BTN_H = 42
+
+function formatBytesPerHour(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б/ч`
+  return `${(bytes / 1024).toFixed(0)} КБ/ч`
+}
 
 export default function PrivacyScreen() {
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  const [mixRelayEnabled, setMixRelayEnabled] = useState(() => mixRelayParticipationEnabled())
+  const [trafficEstimate] = useState(() => mixDummyTrafficBytesPerHourEstimate())
+
+  const toggleMixRelay = (value: boolean) => {
+    setMixRelayParticipationEnabled(value)
+    setMixRelayEnabled(value)
+  }
 
   return (
     <View style={s.root}>
@@ -33,6 +51,28 @@ export default function PrivacyScreen() {
           <Text style={s.rowLabel}>Облачный пароль</Text>
           <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.3)" />
         </SettingsRow>
+
+        <View style={s.rowGap} />
+
+        <Pressable onPress={() => toggleMixRelay(!mixRelayEnabled)} style={s.toggleRow}>
+          <View style={[s.iconWrap, { backgroundColor: '#06b6d4' }]}>
+            <Ionicons name="git-network" size={15} color="#fff" />
+          </View>
+          <View style={s.toggleTextWrap}>
+            <Text style={s.toggleTitle}>Ретрансляция сообщений</Text>
+            <Text style={s.rowSubLabel}>
+              Помогает пересылать чужие зашифрованные сообщения через анонимную сеть,
+              когда телефон заряжается и на экране. Взамен ваши сообщения тоже смогут
+              доставляться, пока собеседник офлайн — без единого сервера.
+              {'\n'}Фоновый трафик: ~{formatBytesPerHour(trafficEstimate)} (без учёта переписки).
+            </Text>
+          </View>
+          <Switch
+            value={mixRelayEnabled}
+            onValueChange={toggleMixRelay}
+            trackColor={{ false: '#3a3a3c', true: '#06b6d4' }}
+          />
+        </Pressable>
       </View>
     </View>
   )
@@ -62,4 +102,18 @@ const s = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   rowLabel: { flex: 1, color: '#fff', fontSize: 17 },
+  rowGap:   { height: 10 },
+
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 12,
+    backgroundColor: '#1c1c1e',
+    borderRadius: 20,
+  },
+  toggleTextWrap: { flex: 1 },
+  toggleTitle:    { color: '#fff', fontSize: 17, marginBottom: 4 },
+  rowSubLabel:    { color: '#71717a', fontSize: 13, lineHeight: 18 },
 })

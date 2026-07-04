@@ -26,6 +26,7 @@ mod event;
 mod identity;
 mod ledger;
 mod mailbox;
+mod mix;
 mod node;
 mod rendezvous;
 mod username;
@@ -35,6 +36,8 @@ pub use command::Command;
 pub use error::{P2pError, Result};
 pub use event::P2pEvent;
 pub use identity::{keypair_from_seed, peer_id_from_public_key, peer_id_from_seed};
-pub use node::P2pNode;
+pub use mailbox::shared_material_from_identity_keys;
+pub use mix::{build_packet, estimated_dummy_traffic_bytes_per_hour, node_address_for, routing_keypair_from_seed, MixHop};
+pub use node::{mix_dummy_traffic_interval_secs, P2pNode};
 
 pub use libp2p::{Multiaddr, PeerId};

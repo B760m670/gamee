@@ -210,6 +210,16 @@ final class P2pSession {
       return ["type": "chainSyncFailed", "peerId": peerId, "reason": reason]
     case .newBlockMined(let height):
       return ["type": "newBlockMined", "height": height]
+    case .mixPacketArrived(let payload):
+      return ["type": "mixPacketArrived", "payload": payload]
+    case .mixForwardFailed(let reason):
+      return ["type": "mixForwardFailed", "reason": reason]
+    case .mixRelayDiscovered(let peerId):
+      return ["type": "mixRelayDiscovered", "peerId": peerId]
+    case .mailboxDepositStored:
+      return ["type": "mailboxDepositStored"]
+    case .mailboxEnvelopeRetrieved(let envelope):
+      return ["type": "mailboxEnvelopeRetrieved", "envelope": envelope]
     }
   }
 }

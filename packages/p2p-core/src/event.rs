@@ -68,6 +68,51 @@ pub enum P2pEvent {
     /// request otherwise failed outright).
     BlobFetchFailed { peer: PeerId, id: Vec<u8>, reason: String },
 
+    /// This node was a Sphinx packet's final hop (see `mix.rs`) —
+    /// `payload` is whatever bytes the original sender's `mix::build_packet`
+    /// wrapped. This layer never interprets `payload` itself, the same way
+    /// `EnvelopeReceived` never interprets its own bytes; what it means
+    /// (e.g. a mailbox deposit or a retrieval query) is decided above this
+    /// crate.
+    MixPacketArrived { payload: Vec<u8> },
+
+    /// A Sphinx packet addressed to this node (as a relay or the final
+    /// hop) could not be forwarded or delivered — a malformed/corrupted
+    /// packet, a peel that failed to decrypt (meaning this packet was never
+    /// really meant for this node), or a resolved next hop that isn't a
+    /// peer this node is currently connected to.
+    MixForwardFailed { reason: String },
+
+    /// This node learned `peer`'s Sphinx routing public key for the first
+    /// time, via a `Command::AnnounceMixRelay` broadcast it received over
+    /// `behaviour::mix_relay_directory_topic()` (real mix traffic
+    /// exchanged directly with a peer also populates this bookkeeping, but
+    /// silently — this event fires only for gossip-learned discoveries,
+    /// which is the case an app-level "N mix relays currently known"
+    /// transparency figure, in the same honesty-first spirit already used
+    /// for the ledger and the mailbox cache, would want to count).
+    MixRelayDiscovered { peer: PeerId },
+
+    /// This node was a Sphinx packet's final hop, and the payload parsed
+    /// and validated (PoW, size, clock — see `mailbox::validate`) as a
+    /// genuine mailbox deposit, which is now held in this node's own
+    /// mailbox cache for whoever the (unlinkable, never revealed to this
+    /// node) recipient turns out to be. No fields: this is a transparency
+    /// signal (an app-level "you're currently relaying for N deposits"
+    /// figure, in the same honesty-first spirit as the ledger's own
+    /// figures, would count these), not something a caller needs to act
+    /// on individually.
+    MailboxDepositStored,
+
+    /// `Command::RetrieveFromMailbox` got an answer: a relay holding a
+    /// match for the queried tag routed `envelope` back through this
+    /// node's own SURB. `envelope` is exactly what `DepositToMailbox`
+    /// was originally given — this layer never inspects it, the same way
+    /// `EnvelopeReceived` never does. If more than one message was
+    /// queued, only the oldest comes back; issue the same
+    /// `RetrieveFromMailbox` again to check for another.
+    MailboxEnvelopeRetrieved { envelope: Vec<u8> },
+
     /// A DHT lookup for `username` finished with a currently-published
     /// claim (which may or may not be this node's own — the caller is
     /// responsible for verifying it before trusting it).

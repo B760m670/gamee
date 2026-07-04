@@ -1,0 +1,461 @@
+//! Anonymous multi-hop routing for mailbox deposits/retrievals, built on
+//! the **Sphinx packet format** — not a homemade design. `sphinx-packet`
+//! (Apache-2.0, from the Nym project) is a small, standalone
+//! implementation of the format underlying Nym, a live, funded anonymity
+//! network; this crate depends only on the packet-format library itself,
+//! never connecting to Nym's own network. Every transitive dependency
+//! (`x25519-dalek`, `curve25519-dalek`, `sha2`, `rand_core`) is already a
+//! dependency of `spiritchat-crypto-core` elsewhere in this workspace and
+//! already proven to cross-compile for this project's iOS/Android targets
+//! in CI — the same category of crate this project already trusts for its
+//! X3DH/Double Ratchet implementation, not a new class of risk.
+//!
+//! What a Sphinx packet buys, precisely: each hop can decrypt only its own
+//! routing layer (who handed it this packet, who to forward to next, how
+//! long to hold it) — never the full path, never whether it's holding the
+//! first or last hop. `sphinx_packet::header::delays` generates
+//! Loopix-style Poisson (exponentially distributed) per-hop delays
+//! natively; layering that on top of bare onion-peeling is what turns
+//! "hides the path" into "also resists timing correlation," the second
+//! half of Loopix's actual published design (mixing) beyond Sphinx's own
+//! (routing).
+//!
+//! This module only builds/peels packets — pure logic, no networking, no
+//! knowledge of `PeerId`/the swarm. Wiring a peeled `ForwardHop` to an
+//! actual `SendEnvelope`-style dial-and-deliver, and a `FinalHop` into
+//! `mailbox.rs`'s (soon to be tag-addressed) storage, is Phase 2's job.
+
+use hkdf::Hkdf;
+use sha2::Sha256;
+use sphinx_packet::header::delays::{self, Delay};
+use sphinx_packet::packet::builder::DEFAULT_PAYLOAD_SIZE;
+use sphinx_packet::route::{Destination, DestinationAddressBytes, Node, NodeAddressBytes, SURBIdentifier};
+use sphinx_packet::surb::{SURBMaterial, SURB};
+use sphinx_packet::{ProcessedPacket, ProcessedPacketData, SphinxPacket};
+use x25519_dalek::{PublicKey, StaticSecret};
+
+use crate::error::{P2pError, Result};
+
+/// The Sphinx format's own hard cap on how many hops a single packet's
+/// header can describe — not a policy choice this crate makes.
+pub const MAX_PATH_LENGTH: usize = sphinx_packet::constants::MAX_PATH_LENGTH;
+
+fn to_mix_err(err: impl std::fmt::Display) -> P2pError {
+    P2pError::Mix(err.to_string())
+}
+
+/// A mix hop this node knows how to route through — its outward-facing
+/// 32-byte address (see `node_address_for`) and its Sphinx routing public
+/// key (distinct from, though derived the same way as, its libp2p
+/// identity key — see Phase 2 for how these get published/discovered).
+pub struct MixHop {
+    pub address: NodeAddressBytes,
+    pub public_key: PublicKey,
+}
+
+/// Derives the 32-byte address a `PeerId` is routed under inside a Sphinx
+/// packet — the packet format's own address field is fixed-size and
+/// doesn't fit libp2p's (longer, multihash-wrapped) `PeerId` encoding
+/// directly, so this is a stable hash of it instead. Never the identity
+/// itself: a hop only ever learns "forward to whoever answers to this
+/// hash," resolved back to a real dialable peer via Phase 2's mix-relay
+/// directory, not by inverting the hash.
+pub fn node_address_for(peer_id_bytes: &[u8]) -> NodeAddressBytes {
+    use sha2::Digest;
+    let digest = Sha256::digest(peer_id_bytes);
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    NodeAddressBytes::from_bytes(bytes)
+}
+
+/// Derives this node's mix routing keypair from the same 32-byte seed its
+/// libp2p identity already comes from (`identity::keypair_from_seed`) —
+/// domain-separated via HKDF so one raw seed produces two cryptographically
+/// independent keys for two different jobs (the signing/noise-handshake
+/// identity vs. Sphinx's own per-hop Diffie-Hellman), never reusing raw key
+/// material across purposes. Deterministic on purpose: this node needs to
+/// reconstruct the same routing secret on every restart without a separate
+/// keyfile, the same way its libp2p identity already does.
+pub fn routing_keypair_from_seed(identity_seed: &[u8; 32]) -> (StaticSecret, PublicKey) {
+    let hk = Hkdf::<Sha256>::new(None, identity_seed);
+    let mut scalar = [0u8; 32];
+    hk.expand(b"spiritchat-mix-routing-key-v1", &mut scalar)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    let secret = StaticSecret::from(scalar);
+    let public = PublicKey::from(&secret);
+    (secret, public)
+}
+
+/// Builds a Sphinx packet carrying `message` through `path` (in order),
+/// with independently-sampled Poisson delays per hop (Loopix's mixing
+/// model — see the module doc comment) averaging `average_hop_delay`,
+/// terminating at `destination`. `path.len()` must be within
+/// `MAX_PATH_LENGTH`; validated here rather than left to the crate to
+/// reject less legibly.
+pub fn build_packet(
+    message: &[u8],
+    path: &[MixHop],
+    destination_address: DestinationAddressBytes,
+    destination_identifier: SURBIdentifier,
+    average_hop_delay: std::time::Duration,
+) -> Result<SphinxPacket> {
+    if path.is_empty() || path.len() > MAX_PATH_LENGTH {
+        return Err(P2pError::Mix(format!(
+            "mix path must have between 1 and {MAX_PATH_LENGTH} hops, got {}",
+            path.len()
+        )));
+    }
+
+    let route: Vec<Node> = path.iter().map(|hop| Node::new(hop.address, hop.public_key)).collect();
+    let delays = delays::generate_from_average_duration(path.len(), average_hop_delay);
+    let destination = Destination::new(destination_address, destination_identifier);
+
+    SphinxPacket::new(message.to_vec(), &route, &destination, &delays).map_err(to_mix_err)
+}
+
+/// Prefixes the plaintext payload of loop/cover traffic — Sphinx packets
+/// this node (or a peer doing the same thing) generated purely to shape
+/// traffic timing/volume, never a real deposit or query. Only the packet's
+/// final hop ever sees a payload at all (an intermediate relay only ever
+/// sees a `Forward` outcome, never plaintext), so this marker never leaks
+/// to anyone the dummy packet wasn't already addressed to — which, for
+/// both loop and cover traffic, is always either this node itself or
+/// exactly the peer generating its own dummy traffic the same way, so
+/// seeing it is never surprising or evidence that a real message was
+/// suppressed.
+const DUMMY_PAYLOAD_MARKER: &[u8] = b"spiritchat-mix-dummy-v1";
+
+/// Whether a peeled final-hop payload is loop/cover traffic rather than a
+/// real deposit or query — the receiving end's cue to discard it silently
+/// instead of surfacing `P2pEvent::MixPacketArrived`.
+pub fn is_dummy_payload(payload: &[u8]) -> bool {
+    payload.starts_with(DUMMY_PAYLOAD_MARKER)
+}
+
+/// Builds a Sphinx packet carrying nothing but `DUMMY_PAYLOAD_MARKER` —
+/// bitwise indistinguishable from a real deposit/query packet to anyone
+/// but the final hop that decrypts it, which is the whole point: loop and
+/// cover traffic must cost an outside observer nothing to rule out.
+pub fn build_dummy_packet(
+    path: &[MixHop],
+    destination_address: DestinationAddressBytes,
+    destination_identifier: SURBIdentifier,
+    average_hop_delay: std::time::Duration,
+) -> Result<SphinxPacket> {
+    build_packet(DUMMY_PAYLOAD_MARKER, path, destination_address, destination_identifier, average_hop_delay)
+}
+
+/// A rough, honest lower bound on this node's own background data cost
+/// from Loopix dummy (cover/loop) traffic alone — not real messaging,
+/// which varies with how much the user actually sends/receives, only the
+/// constant hum `MIX_DUMMY_TRAFFIC_INTERVAL` in `node.rs` produces
+/// regardless of whether there's anything real to send. Measured by
+/// actually serializing one real single-hop dummy packet and reading its
+/// byte length, rather than hand-deriving Sphinx's header-size math —
+/// stays correct even if the underlying format's fixed overhead ever
+/// changes, at the cost of only being exact for the *single-hop* (drop
+/// cover) case; loop traffic's extra hop adds a little more (one more
+/// header layer's worth) that this deliberately doesn't count, keeping
+/// this a lower, not upper, bound — same "state the real limit plainly"
+/// approach already used for every other honesty-first figure in this
+/// project (the ledger's own 51% risk, the mailbox's retention window,
+/// `Command::RetrieveFromMailbox`'s routing-odds disclosure).
+pub fn estimated_dummy_traffic_bytes_per_hour(traffic_interval: std::time::Duration) -> u64 {
+    let (_secret, public) = routing_keypair_from_seed(&[0u8; 32]);
+    let hop = MixHop { address: node_address_for(&[0u8; 32]), public_key: public };
+    let packet = build_dummy_packet(
+        &[hop],
+        DestinationAddressBytes::from_bytes([0u8; 32]),
+        [0u8; 16],
+        std::time::Duration::from_millis(1),
+    )
+    .expect("a single-hop dummy packet always builds successfully");
+    let packet_bytes = packet.to_bytes().len() as u64;
+    let packets_per_hour = 3600 / traffic_interval.as_secs().max(1);
+    packet_bytes * packets_per_hour
+}
+
+/// Builds a **Single Use Reply Block**: a pre-computed return path,
+/// opaque to whoever ends up holding it, that lets a responder send
+/// exactly one reply back to `path`'s originator without ever learning
+/// what that path is (its own hop addresses/keys are already layered
+/// into the SURB's header, the same way a forward packet's are — the
+/// responder only ever learns "send the resulting bytes to this first
+/// hop," never anything past it). This is what makes anonymous
+/// *retrieval* possible: a mailbox query can embed one of these so the
+/// relay answering it can route the result back without the query ever
+/// having revealed who's asking. `path`'s last hop is where the reply
+/// ultimately arrives — building a SURB whose own path ends at this
+/// node's own address (see `node_address_for`) is how a node gets a
+/// reply routed back to itself, mirroring exactly how a normal outbound
+/// packet's last hop is its final destination.
+pub fn build_surb(
+    path: &[MixHop],
+    destination_address: DestinationAddressBytes,
+    destination_identifier: SURBIdentifier,
+    average_hop_delay: std::time::Duration,
+) -> Result<SURB> {
+    if path.is_empty() || path.len() > MAX_PATH_LENGTH {
+        return Err(P2pError::Mix(format!(
+            "SURB path must have between 1 and {MAX_PATH_LENGTH} hops, got {}",
+            path.len()
+        )));
+    }
+
+    let route: Vec<Node> = path.iter().map(|hop| Node::new(hop.address, hop.public_key)).collect();
+    let delays = delays::generate_from_average_duration(path.len(), average_hop_delay);
+    let destination = Destination::new(destination_address, destination_identifier);
+
+    SURBMaterial::new(route, delays, destination).construct_SURB().map_err(to_mix_err)
+}
+
+/// Consumes a SURB (received inside some earlier query's payload, never
+/// built by this node itself) to wrap `reply_message` for delivery back
+/// along its pre-computed path — returns the resulting packet and the
+/// first hop to send it to. Always the same fixed payload size a normal
+/// packet uses (`DEFAULT_PAYLOAD_SIZE`), so a reply is bitwise
+/// indistinguishable in size from any other packet on the wire.
+pub fn use_surb(surb: SURB, reply_message: &[u8]) -> Result<(SphinxPacket, NodeAddressBytes)> {
+    surb.use_surb(reply_message, DEFAULT_PAYLOAD_SIZE).map_err(to_mix_err)
+}
+
+/// What peeling one layer off an incoming packet, at this node, produces.
+pub enum PeelOutcome {
+    /// Not the final hop — forward `next_hop_packet` to whoever answers to
+    /// `next_hop_address`, but only after `delay` (Loopix mixing: this is
+    /// exactly what breaks the arrival/departure timing correlation an
+    /// observer would otherwise be able to make).
+    Forward { next_hop_packet: SphinxPacket, next_hop_address: NodeAddressBytes, delay: Delay },
+    /// This node is the final hop — `payload` is the original deposit/
+    /// retrieval-request bytes this packet was built to carry.
+    Final { destination_address: DestinationAddressBytes, identifier: SURBIdentifier, payload: Vec<u8> },
+}
+
+/// Peels exactly one Sphinx layer using this node's own mix routing secret
+/// key (distinct from its libp2p identity key). Never inspects, and
+/// cannot recover, anything about hops before or after the immediate
+/// neighbors this layer reveals.
+pub fn peel(packet: SphinxPacket, node_secret_key: &StaticSecret) -> Result<PeelOutcome> {
+    let processed: ProcessedPacket = packet.process(node_secret_key).map_err(to_mix_err)?;
+    match processed.data {
+        ProcessedPacketData::ForwardHop { next_hop_packet, next_hop_address, delay } => {
+            Ok(PeelOutcome::Forward { next_hop_packet, next_hop_address, delay })
+        }
+        ProcessedPacketData::FinalHop { destination, identifier, payload } => Ok(PeelOutcome::Final {
+            destination_address: destination,
+            identifier,
+            payload: payload.recover_plaintext().map_err(to_mix_err)?,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::OsRng;
+
+    struct TestHop {
+        secret: StaticSecret,
+        hop: MixHop,
+    }
+
+    fn generate_hop(address_seed: u8) -> TestHop {
+        let secret = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&secret);
+        let address = NodeAddressBytes::from_bytes([address_seed; 32]);
+        TestHop { secret, hop: MixHop { address, public_key } }
+    }
+
+    #[test]
+    fn a_message_survives_being_peeled_through_every_hop_of_a_multi_hop_path() {
+        let hops = [generate_hop(1), generate_hop(2), generate_hop(3)];
+        let path: Vec<MixHop> = hops
+            .iter()
+            .map(|h| MixHop { address: h.hop.address, public_key: h.hop.public_key })
+            .collect();
+
+        let destination_address = DestinationAddressBytes::from_bytes([9u8; 32]);
+        let identifier: SURBIdentifier = [7u8; 16];
+        let message = b"a message no single hop should be able to read or fully trace";
+
+        let packet = build_packet(
+            message,
+            &path,
+            destination_address,
+            identifier,
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+
+        // Hop 1: must forward, not terminate.
+        let after_hop1 = peel(packet, &hops[0].secret).unwrap();
+        let PeelOutcome::Forward { next_hop_packet, next_hop_address, .. } = after_hop1 else {
+            panic!("the first of three hops must be a Forward outcome, not Final");
+        };
+        assert_eq!(next_hop_address, hops[1].hop.address);
+
+        // Hop 2: must also forward.
+        let after_hop2 = peel(next_hop_packet, &hops[1].secret).unwrap();
+        let PeelOutcome::Forward { next_hop_packet, next_hop_address, .. } = after_hop2 else {
+            panic!("the second of three hops must be a Forward outcome, not Final");
+        };
+        assert_eq!(next_hop_address, hops[2].hop.address);
+
+        // Hop 3 (final): must terminate with the original message intact.
+        let after_hop3 = peel(next_hop_packet, &hops[2].secret).unwrap();
+        let PeelOutcome::Final { destination_address: got_destination, identifier: got_identifier, payload } =
+            after_hop3
+        else {
+            panic!("the last hop must be a Final outcome");
+        };
+        assert_eq!(got_destination, destination_address);
+        assert_eq!(got_identifier, identifier);
+        assert_eq!(&payload[..message.len()], message);
+    }
+
+    #[test]
+    fn a_path_longer_than_the_format_allows_is_rejected_before_building_anything() {
+        let hops: Vec<TestHop> = (0..(MAX_PATH_LENGTH as u8 + 1)).map(generate_hop).collect();
+        let path: Vec<MixHop> = hops.iter().map(|h| MixHop { address: h.hop.address, public_key: h.hop.public_key }).collect();
+
+        let result = build_packet(
+            b"too many hops",
+            &path,
+            DestinationAddressBytes::from_bytes([0u8; 32]),
+            [0u8; 16],
+            std::time::Duration::from_millis(1),
+        );
+        match result {
+            Err(P2pError::Mix(_)) => {}
+            Err(other) => panic!("expected a Mix error, got a different P2pError variant: {other}"),
+            Ok(_) => panic!("a path longer than MAX_PATH_LENGTH must be rejected"),
+        }
+    }
+
+    #[test]
+    fn routing_keys_are_deterministic_from_seed_but_differ_from_a_different_seed() {
+        let (secret_a, public_a) = routing_keypair_from_seed(&[1u8; 32]);
+        let (_secret_a_again, public_a_again) = routing_keypair_from_seed(&[1u8; 32]);
+        let (_secret_b, public_b) = routing_keypair_from_seed(&[2u8; 32]);
+
+        assert_eq!(public_a.as_bytes(), public_a_again.as_bytes());
+        assert_ne!(public_a.as_bytes(), public_b.as_bytes());
+        // The derived secret must actually match the derived public key —
+        // not just be *some* deterministic value.
+        assert_eq!(PublicKey::from(&secret_a).as_bytes(), public_a.as_bytes());
+    }
+
+    #[test]
+    fn a_dummy_packet_is_recognized_as_dummy_once_peeled() {
+        let hop = generate_hop(1);
+        let path = vec![MixHop { address: hop.hop.address, public_key: hop.hop.public_key }];
+
+        let packet = build_dummy_packet(
+            &path,
+            DestinationAddressBytes::from_bytes([0u8; 32]),
+            [0u8; 16],
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let PeelOutcome::Final { payload, .. } = peel(packet, &hop.secret).unwrap() else {
+            panic!("a single-hop dummy packet must peel to a Final outcome");
+        };
+        assert!(is_dummy_payload(&payload));
+    }
+
+    #[test]
+    fn a_surb_carries_a_reply_back_through_its_own_prebuilt_path_to_the_querier() {
+        // hops[0] plays the relay that will end up answering a query;
+        // hops[1] plays the querier's own node, at the end of the return
+        // path it built for itself.
+        let hops = [generate_hop(1), generate_hop(2)];
+        let path: Vec<MixHop> = hops.iter().map(|h| MixHop { address: h.hop.address, public_key: h.hop.public_key }).collect();
+        let destination_address = DestinationAddressBytes::from_bytes([9u8; 32]);
+        let identifier: SURBIdentifier = [3u8; 16];
+
+        let surb = build_surb(&path, destination_address, identifier, std::time::Duration::from_millis(10)).unwrap();
+
+        // The querier ships `surb.to_bytes()` off inside a query payload;
+        // the relay that ends up answering reconstructs it from those
+        // bytes — never having built the SURB, or known the path inside
+        // it, itself.
+        let surb_bytes = surb.to_bytes();
+        let responders_surb = SURB::from_bytes(&surb_bytes).unwrap();
+        assert_eq!(responders_surb.first_hop(), hops[0].hop.address);
+
+        let reply_message = b"the deposit's envelope bytes, or whatever else the query answers";
+        let (reply_packet, next_hop_address) = use_surb(responders_surb, reply_message).unwrap();
+        assert_eq!(next_hop_address, hops[0].hop.address);
+
+        // Hop 1 (a relay along the return path) peels and forwards, same
+        // as it would for any other packet — a SURB-originated reply is
+        // structurally indistinguishable from a fresh outbound packet at
+        // every hop but the last.
+        let after_hop1 = peel(reply_packet, &hops[0].secret).unwrap();
+        let PeelOutcome::Forward { next_hop_packet, next_hop_address, .. } = after_hop1 else {
+            panic!("the first hop of a 2-hop SURB reply must be a Forward outcome");
+        };
+        assert_eq!(next_hop_address, hops[1].hop.address);
+
+        // Hop 2 — the querier's own node — recovers the reply.
+        let PeelOutcome::Final { payload, .. } = peel(next_hop_packet, &hops[1].secret).unwrap() else {
+            panic!("the SURB's own final hop must be a Final outcome");
+        };
+        assert_eq!(&payload[..reply_message.len()], reply_message);
+    }
+
+    #[test]
+    fn a_real_message_is_never_mistaken_for_a_dummy() {
+        assert!(!is_dummy_payload(b"a message no single hop should be able to read or fully trace"));
+        assert!(!is_dummy_payload(b""));
+    }
+
+    #[test]
+    fn a_packet_round_trips_through_its_own_byte_encoding() {
+        let hops = [generate_hop(1)];
+        let path: Vec<MixHop> = hops.iter().map(|h| MixHop { address: h.hop.address, public_key: h.hop.public_key }).collect();
+        let packet = build_packet(
+            b"single hop",
+            &path,
+            DestinationAddressBytes::from_bytes([5u8; 32]),
+            [1u8; 16],
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let bytes = packet.to_bytes();
+        let restored = SphinxPacket::from_bytes(&bytes).unwrap();
+
+        let PeelOutcome::Final { payload, .. } = peel(restored, &hops[0].secret).unwrap() else {
+            panic!("expected the single hop to be Final");
+        };
+        assert_eq!(&payload[..b"single hop".len()], b"single hop");
+    }
+
+    #[test]
+    fn the_dummy_traffic_estimate_is_a_small_but_nonzero_number_of_kilobytes_per_hour() {
+        let bytes_per_hour = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(30));
+
+        // At `MIX_DUMMY_TRAFFIC_INTERVAL`'s current 30s cadence this
+        // should land in the low hundreds of KB/hour — real enough to be
+        // worth disclosing honestly in Settings one day, nowhere near
+        // heavy enough to be a battery/data concern on its own. This is a
+        // sanity bound on the figure's *order of magnitude*, not a pinned
+        // exact byte count — it must never silently go to zero (a broken
+        // estimate) or balloon into megabytes (a genuinely alarming
+        // regression in packet size or interval).
+        assert!(bytes_per_hour > 0, "the estimate must never be zero — dummy traffic is real bytes on the wire");
+        assert!(
+            bytes_per_hour < 2_000_000,
+            "dummy traffic ballooned to {bytes_per_hour} bytes/hour — check MIX_DUMMY_TRAFFIC_INTERVAL/packet size"
+        );
+    }
+
+    #[test]
+    fn a_shorter_traffic_interval_estimates_proportionally_more_bytes_per_hour() {
+        let slower = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(60));
+        let faster = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(30));
+        assert_eq!(faster, slower * 2);
+    }
+}

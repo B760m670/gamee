@@ -66,6 +66,23 @@ enum ChatStore {
     try data.write(to: sessionPath(slot: slot, peerId: session.peerId), options: .atomic)
   }
 
+  /// Every contact this device currently has a live ratchet session with —
+  /// what a periodic mailbox-retrieval sweep iterates (there's no separate
+  /// "conversations" list on this side; a session file *is* the record of
+  /// a conversation existing) and what a mailbox-retrieved envelope with no
+  /// attached sender identity gets matched against by trying each one's
+  /// ratchet in turn.
+  static func loadAllSessions(slot: Int) -> [Session] {
+    let dir = sessionsDirectory(slot: slot)
+    guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
+      return []
+    }
+    return files.compactMap { url in
+      guard let data = try? Data(contentsOf: url) else { return nil }
+      return try? JSONDecoder().decode(Session.self, from: data)
+    }
+  }
+
   private static func outboxPath(slot: Int) -> URL {
     chatsDirectory(slot: slot).appendingPathComponent("outbox.json")
   }

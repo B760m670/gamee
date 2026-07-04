@@ -44,6 +44,33 @@ pub fn p2p_peer_id_from_public_key(public_key: Vec<u8>) -> FfiResult<String> {
         .map_err(|err| FfiError::P2p { reason: err.to_string() })
 }
 
+/// The value `deposit_to_mailbox`/`retrieve_from_mailbox` both need as
+/// `shared_material` — a stable, order-independent combination of two
+/// peers' long-term identity public keys, computable by either side
+/// without ever having talked to the other yet. See
+/// `spiritchat_p2p_core::shared_material_from_identity_keys`'s own doc
+/// comment for why order-independence is what makes this work at all.
+#[uniffi::export]
+pub fn p2p_mailbox_shared_material(own_identity_public_key: Vec<u8>, peer_identity_public_key: Vec<u8>) -> Vec<u8> {
+    spiritchat_p2p_core::shared_material_from_identity_keys(&own_identity_public_key, &peer_identity_public_key)
+}
+
+/// A rough, honest lower-bound estimate (in bytes/hour) of this device's
+/// own background data cost from Loopix dummy traffic alone, at the real
+/// cadence this crate actually uses (`mix_dummy_traffic_interval_secs`,
+/// not a duplicated/hardcoded copy of it) — real messaging traffic on top
+/// of this is unaccounted for, deliberately, since it varies with actual
+/// usage rather than being a constant hum. See
+/// `spiritchat_p2p_core::estimated_dummy_traffic_bytes_per_hour`'s own doc
+/// comment for exactly what this does and doesn't count. Meant for an
+/// honesty-first Settings display, the same spirit as this project's
+/// existing ledger/mailbox disclosures, not a hard guarantee.
+#[uniffi::export]
+pub fn p2p_estimated_mix_dummy_traffic_bytes_per_hour() -> u64 {
+    let interval = std::time::Duration::from_secs(spiritchat_p2p_core::mix_dummy_traffic_interval_secs());
+    spiritchat_p2p_core::estimated_dummy_traffic_bytes_per_hour(interval)
+}
+
 fn parse_peer_id(text: &str) -> FfiResult<PeerId> {
     PeerId::from_str(text).map_err(|err| FfiError::P2p {
         reason: format!("invalid peer id {text:?}: {err}"),
@@ -256,6 +283,48 @@ impl FfiP2pNode {
     /// currently mining.
     pub fn stop_mining(&self) -> FfiResult<()> {
         self.send(Command::StopMining)
+    }
+
+    /// Deposits `envelope` into whichever mix relay ends up as the
+    /// Sphinx path's final hop — serverless offline delivery for when a
+    /// direct `send_envelope` genuinely fails. `shared_material` should
+    /// come from `p2p_mailbox_shared_material` (or, once a session
+    /// exists, an X3DH shared secret) — see that function's own doc
+    /// comment. Fire-and-forget: success isn't itself confirmed, only a
+    /// routing failure surfaces, as `MixForwardFailed` from `next_event`.
+    pub fn deposit_to_mailbox(&self, shared_material: Vec<u8>, envelope: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::DepositToMailbox { shared_material, envelope })
+    }
+
+    /// Anonymously asks whether anything is currently queued under
+    /// `shared_material`'s current-epoch mailbox tag — the exact tag a
+    /// matching `deposit_to_mailbox` would have used. A match surfaces as
+    /// `MailboxEnvelopeRetrieved` from `next_event`; no reply at all
+    /// means nothing is currently queued (there is no explicit "not
+    /// found" answer — see `Command::RetrieveFromMailbox`'s own doc
+    /// comment for why). Answers with at most one envelope per call; call
+    /// again after receiving one to check for another.
+    pub fn retrieve_from_mailbox(&self, shared_material: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::RetrieveFromMailbox { shared_material })
+    }
+
+    /// Broadcasts this node's own Sphinx routing public key so other
+    /// nodes can discover it as a usable mix relay — opt-in mix
+    /// participation. The app layer decides whether/when to call this
+    /// (e.g. gated the same way mining is, on foreground + charging).
+    pub fn announce_mix_relay(&self) -> FfiResult<()> {
+        self.send(Command::AnnounceMixRelay)
+    }
+
+    /// Turns this node's sustained Loopix dummy-traffic generation on or
+    /// off — off by default at spawn. Meant to be called alongside
+    /// `announce_mix_relay`, gated by the same policy (e.g.
+    /// `MixRelayController` on iOS): passive forwarding for others needs
+    /// no gate at all (cheap, only happens when asked), but continuously
+    /// originating cover/loop packets is an ongoing cost worth an explicit
+    /// on/off switch.
+    pub fn set_mix_dummy_traffic_active(&self, enabled: bool) -> FfiResult<()> {
+        self.send(Command::SetMixDummyTrafficActive { enabled })
     }
 
     /// Cleanly stops this node — after this, `next_event` returns `None`.

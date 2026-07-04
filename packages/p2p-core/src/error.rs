@@ -28,6 +28,9 @@ pub enum P2pError {
 
     #[error("mailbox error: {0}")]
     Mailbox(String),
+
+    #[error("mix routing error: {0}")]
+    Mix(String),
 }
 
 impl From<spiritchat_ledger_core::LedgerError> for P2pError {

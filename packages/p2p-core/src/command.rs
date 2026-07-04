@@ -53,6 +53,82 @@ pub enum Command {
     /// `P2pEvent::BlobFetched`/`BlobFetchFailed`.
     FetchBlob { peer: PeerId, id: Vec<u8> },
 
+    /// Sends an already-built Sphinx packet (`mix::build_packet`) to
+    /// `first_hop`, the first node in whatever path the caller chose.
+    /// Every hop after that is handled automatically by this crate's own
+    /// event loop, peeling and re-forwarding as `MixPacket` requests arrive
+    /// — the caller never talks to intermediate hops directly, only
+    /// receives `P2pEvent::MixPacketArrived` if and when this node itself
+    /// ends up being a path's final hop. Requires an existing connection
+    /// to `first_hop`, same as `SendEnvelope`.
+    SendMixPacket { first_hop: PeerId, packet_bytes: Vec<u8> },
+
+    /// Broadcasts this node's own Sphinx routing public key to
+    /// `behaviour::mix_relay_directory_topic()`, so other nodes can
+    /// discover it as a usable mix hop even before ever directly
+    /// exchanging mix traffic with it. Purely a discovery signal — a
+    /// sender still needs to `Dial` a chosen relay for the first hop of
+    /// any path, and intermediate-hop forwarding still resolves through
+    /// each relay's own connectivity-based bookkeeping, not this
+    /// announcement. The app layer decides when/whether to call this at
+    /// all (mix-relay participation is opt-in).
+    AnnounceMixRelay,
+
+    /// Deposits `envelope` (an already-encrypted message, same bytes
+    /// `SendEnvelope` would carry directly) into the mailbox cache of
+    /// whichever mix relay ends up as the Sphinx path's final hop —
+    /// serverless offline delivery for when the recipient isn't reachable
+    /// right now. `shared_material` must be a value both sender and
+    /// recipient can compute independently and identically (an X3DH
+    /// shared secret if a session already exists, or else a stable,
+    /// order-independent combination of both peers' known long-term
+    /// public keys) — it never leaves this device; only
+    /// `mailbox::mailbox_tag(shared_material, epoch)`'s output, an opaque
+    /// tag, ever crosses the network. The proof-of-work stamp this
+    /// requires is mined on a blocking thread, mirroring the ledger's own
+    /// mining loop, so this command returns immediately; delivery is
+    /// fire-and-forget from the sender's point of view (mirroring
+    /// `SendMixPacket`'s own ack-only wire semantics) — a chosen relay
+    /// being unreachable at all surfaces as `P2pEvent::MixForwardFailed`,
+    /// same as any other mix send failure.
+    DepositToMailbox { shared_material: Vec<u8>, envelope: Vec<u8> },
+
+    /// Asks whichever mix relay ends up as the query's Sphinx path final
+    /// hop whether anything is currently queued under
+    /// `mailbox::mailbox_tag(shared_material, current_epoch)` — the exact
+    /// tag a sender's `DepositToMailbox` for this same `shared_material`
+    /// would have deposited under. The query carries a SURB (Single Use
+    /// Reply Block) so a relay holding a match can route the answer back
+    /// without ever learning who asked; a match surfaces as
+    /// `P2pEvent::MailboxEnvelopeRetrieved`. Silence (no reply within
+    /// however long the caller chooses to wait) means nothing is
+    /// currently queued — there is no explicit "not found" reply, since
+    /// that would need answering *every* query, real or empty, which
+    /// defeats the point of a relay only spending effort on real matches.
+    /// A single query answers with at most one envelope (a SURB is
+    /// single-use by design); if more than one message is queued, a
+    /// caller wanting all of them needs to issue this again once it's
+    /// received (or given up waiting for) the previous reply — the same
+    /// "one at a time" shape `ChatManager`'s own outbox already uses on
+    /// the sending side.
+    ///
+    /// This query's own path's final hop is picked *deterministically*:
+    /// whichever currently known and connected relay's `PeerId` is closest
+    /// to this tag under Kademlia's own XOR distance metric — the same
+    /// relay a matching `DepositToMailbox` for this tag would have
+    /// converged on, rather than an independent random pick. Honestly:
+    /// this converges only as
+    /// well as sender and recipient's known-relay sets actually overlap
+    /// (weaker right after either side discovers a brand new relay the
+    /// other hasn't yet, strengthens as the mix relay directory settles —
+    /// the same "improves as the network grows" shape true of everything
+    /// else built on it), not a network-wide guarantee the way a live
+    /// Kademlia `get_closest_peers` query across the whole DHT would be.
+    /// `ChatManager`'s own periodic retrieval sweep still retries on an
+    /// ordinary schedule regardless, since silence (nothing queued yet, or
+    /// a still-diverged view of who's closest) looks the same either way.
+    RetrieveFromMailbox { shared_material: Vec<u8> },
+
     /// Publishes `claim` under the DHT key derived from `username` (see
     /// `username::record_key_for`). `claim` is opaque to this crate — the
     /// app layer is responsible for making it self-certifying (e.g. a
@@ -129,6 +205,17 @@ pub enum Command {
     /// Stops the mining loop started by `StartMining`. A no-op if not
     /// currently mining.
     StopMining,
+
+    /// Turns this node's Loopix-style dummy traffic generation (drop cover
+    /// and loop packets toward known mix relays, on `MIX_DUMMY_TRAFFIC_INTERVAL`)
+    /// on or off. Defaults to off at spawn — unlike passive per-packet mix
+    /// forwarding (always on for whoever routes traffic through this node;
+    /// cheap, event-driven, needs no gate) and `AnnounceMixRelay` (a one-shot
+    /// the app calls whenever it wants), sustained dummy traffic is an
+    /// ongoing background cost the app layer should only opt into when it's
+    /// judged worth paying — e.g. `MixRelayController` on iOS, mirroring
+    /// `StartMining`/`StopMining`'s own foreground+charging gate.
+    SetMixDummyTrafficActive { enabled: bool },
 
     /// Cleanly stops the event loop — after this, `next_event` returns
     /// `None` and the node can no longer be used; a new identity needs a
