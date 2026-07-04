@@ -10,6 +10,7 @@ import { UserListItem } from '../../components/UserListItem'
 import { ConversationRow } from '../../components/ConversationRow'
 import { useUsernameSearch, normalizeUsernameQuery, type FoundUser } from '../../hooks/useUsernameSearch'
 import { useChatStore } from '../../store/chat'
+import { useGroupStore } from '../../store/groups'
 import { useProfileStore } from '../../store/profile'
 
 // Deliberately a plain, always-in-flow search field — not a hidden,
@@ -23,6 +24,7 @@ export default function ChatsScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const conversations = useChatStore(s => s.conversations)
+  const groups = useGroupStore(s => s.groups)
   const myPeerId = useProfileStore(s => s.peerId)
 
   const [query, setQuery] = useState('')
@@ -34,11 +36,22 @@ export default function ChatsScreen() {
   // no legitimate reason to open a "chat" with yourself.
   const results = useMemo(() => rawResults.filter(u => u.peerId !== myPeerId), [rawResults, myPeerId])
   const items = useMemo(() => Object.values(conversations).sort((a, b) => b.lastMessageAt - a.lastMessageAt), [conversations])
+  const groupItems = useMemo(() => Object.values(groups), [groups])
   const term = normalizeUsernameQuery(query)
 
   function openChat(peerId: string) {
     Keyboard.dismiss()
     router.push({ pathname: '/chat/[userId]', params: { userId: peerId } })
+  }
+
+  function openGroup(groupId: string) {
+    Keyboard.dismiss()
+    router.push({ pathname: '/group/[groupId]', params: { groupId } })
+  }
+
+  function openNewGroup() {
+    Keyboard.dismiss()
+    router.push({ pathname: '/group/new' })
   }
 
   function openFoundUser(user: FoundUser) {
@@ -59,6 +72,9 @@ export default function ChatsScreen() {
     <View style={[s.root, { paddingTop: insets.top }]}>
       <View style={s.header}>
         <Text style={s.title}>Chats</Text>
+        <Pressable onPress={openNewGroup} hitSlop={8}>
+          <Ionicons name="people-circle-outline" size={26} color="#2f7bff" />
+        </Pressable>
       </View>
 
       <View style={s.searchRow}>
@@ -121,6 +137,25 @@ export default function ChatsScreen() {
           renderItem={({ item }) => <ConversationRow item={item} onPress={openChat} />}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: insets.bottom + 20 }}
+          ListHeaderComponent={
+            groupItems.length > 0 ? (
+              <View>
+                <Text style={s.sectionHeader}>Группы</Text>
+                {groupItems.map(group => (
+                  <Pressable
+                    key={group.groupId}
+                    style={({ pressed }) => [s.groupRow, pressed && s.groupRowPressed]}
+                    onPress={() => openGroup(group.groupId)}
+                  >
+                    <View style={s.groupIcon}>
+                      <Ionicons name="people" size={22} color="#71717a" />
+                    </View>
+                    <Text style={s.groupTitle} numberOfLines={1}>{group.name}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null
+          }
           ListEmptyComponent={
             <View style={s.empty}>
               <Ionicons name="chatbubbles-outline" size={56} color="#27272a" />
@@ -135,9 +170,23 @@ export default function ChatsScreen() {
 
 const s = StyleSheet.create({
   root:   { flex: 1, backgroundColor: '#000' },
-  header: { paddingHorizontal: 16, paddingVertical: 14 },
+  header: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingVertical: 14,
+  },
   title:  { color: '#fff', fontSize: 22, fontWeight: '700' },
   list:   { flex: 1 },
+
+  groupRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    paddingHorizontal: 16, paddingVertical: 8,
+  },
+  groupRowPressed: { backgroundColor: '#1a1a1e' },
+  groupIcon: {
+    width: 54, height: 54, borderRadius: 27, backgroundColor: '#1c1c1e',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  groupTitle: { flex: 1, color: '#fff', fontSize: 16, fontWeight: '600' },
 
   searchRow: {
     flexDirection: 'row', alignItems: 'center', gap: 8,
