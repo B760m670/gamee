@@ -22,6 +22,10 @@ export type P2pEvent =
   | { type: 'addressAnnouncementFailed'; reason: string }
   | { type: 'blobFetched'; peerId: string; id: string; localPath: string }
   | { type: 'blobFetchFailed'; peerId: string; id: string; reason: string }
+  | { type: 'contactCardAnnounced' }
+  | { type: 'contactCardAnnouncementFailed'; reason: string }
+  | { type: 'contactCardResolved'; ownerIdentityPublicKeyBase64: string; card: Uint8Array }
+  | { type: 'contactCardResolutionFailed'; ownerIdentityPublicKeyBase64: string }
   | { type: 'usernameResolved'; username: string; publicKeyBase64: string; fingerprint: string; peerId: string }
   | { type: 'usernameClaimInvalid'; username: string }
   | { type: 'usernameResolutionFailed'; username: string }

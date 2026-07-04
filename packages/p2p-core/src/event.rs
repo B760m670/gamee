@@ -68,6 +68,24 @@ pub enum P2pEvent {
     /// request otherwise failed outright).
     BlobFetchFailed { peer: PeerId, id: Vec<u8>, reason: String },
 
+    /// `Command::AnnounceContactCard` finished publishing to the DHT (or
+    /// failed to reach the required quorum). Other peers'
+    /// `ResolveContactCard` lookups only have something to find once this
+    /// has happened at least once.
+    ContactCardAnnounced,
+    ContactCardAnnouncementFailed { reason: String },
+
+    /// A DHT lookup for `owner_identity_public_key`'s contact card finished
+    /// with a currently-published card. `owner_identity_public_key` is
+    /// echoed back (the same value `Command::ResolveContactCard` was given)
+    /// so the caller can match this answer to whichever outstanding
+    /// first-contact attempt it belongs to.
+    ContactCardResolved { owner_identity_public_key: Vec<u8>, card: Vec<u8> },
+    /// Nobody has published a contact card for `owner_identity_public_key`
+    /// right now (or the lookup otherwise failed) — this identity has
+    /// never announced one, or is offline and nothing replicated it yet.
+    ContactCardResolutionFailed { owner_identity_public_key: Vec<u8> },
+
     /// This node was a Sphinx packet's final hop (see `mix.rs`) —
     /// `payload` is whatever bytes the original sender's `mix::build_packet`
     /// wrapped. This layer never interprets `payload` itself, the same way

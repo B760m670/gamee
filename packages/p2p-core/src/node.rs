@@ -31,6 +31,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse, MixMessage};
 use crate::bootstrap;
 use crate::command::Command;
+use crate::contact_card;
 use crate::error::{P2pError, Result};
 use crate::event::P2pEvent;
 use crate::identity;
@@ -250,6 +251,11 @@ struct Pending {
     /// A `RequestChainSync`'s follow-up: waiting on a batch of blocks from
     /// `peer` after learning its tip is heavier than ours.
     chain_sync_blocks: HashMap<OutboundRequestId, PeerId>,
+    announce_contact_card: std::collections::HashSet<QueryId>,
+    /// Keyed by the same `owner_identity_public_key` the original
+    /// `Command::ResolveContactCard` was given, so the answering event can
+    /// echo it back to the caller.
+    resolve_contact_card: HashMap<QueryId, Vec<u8>>,
 }
 
 /// One in-flight `spawn_blocking` nonce search — tagged with a generation
@@ -549,7 +555,7 @@ async fn run_event_loop(
 }
 
 /// Whether `command` needs at least one connected peer to have any real
-/// chance of succeeding — the four commands that go straight to Kademlia's
+/// chance of succeeding — the commands that go straight to Kademlia's
 /// `put_record`/`get_record`. Dialing itself is excluded: it's how a
 /// connection gets made in the first place, so it must never be deferred.
 fn needs_dht_peer(command: &Command) -> bool {
@@ -559,6 +565,8 @@ fn needs_dht_peer(command: &Command) -> bool {
             | Command::AnnounceAddresses { .. }
             | Command::AnnounceUsername { .. }
             | Command::ResolveUsername { .. }
+            | Command::AnnounceContactCard { .. }
+            | Command::ResolveContactCard { .. }
     )
 }
 
@@ -650,6 +658,20 @@ fn handle_command(
         Command::FetchBlob { peer, id } => {
             let request_id = swarm.behaviour_mut().blob.send_request(&peer, id.clone());
             pending.blob_fetch.insert(request_id, (peer, id));
+        }
+
+        Command::AnnounceContactCard { owner_identity_public_key, card } => {
+            let key = contact_card::record_key_for(&owner_identity_public_key);
+            let record = Record::new(key, card);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_contact_card.insert(query_id);
+            }
+        }
+
+        Command::ResolveContactCard { owner_identity_public_key } => {
+            let key = contact_card::record_key_for(&owner_identity_public_key);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_contact_card.insert(query_id, owner_identity_public_key);
         }
 
         Command::SendMixPacket { first_hop, packet_bytes } => {
@@ -919,6 +941,11 @@ fn handle_kad_event(
                     username,
                     claim: found.record.value,
                 });
+            } else if let Some(owner_identity_public_key) = pending.resolve_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardResolved {
+                    owner_identity_public_key,
+                    card: found.record.value,
+                });
             }
         }
         QueryResult::GetRecord(Err(_)) => {
@@ -926,6 +953,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::PeerAddressResolutionFailed { peer });
             } else if let Some(username) = pending.resolve_username.remove(&id) {
                 let _ = events.send(P2pEvent::UsernameResolutionFailed { username });
+            } else if let Some(owner_identity_public_key) = pending.resolve_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardResolutionFailed { owner_identity_public_key });
             }
         }
         QueryResult::PutRecord(Ok(PutRecordOk { .. })) => {
@@ -933,6 +962,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::AddressesAnnounced);
             } else if let Some(username) = pending.announce_username.remove(&id) {
                 let _ = events.send(P2pEvent::UsernameAnnounced { username });
+            } else if pending.announce_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardAnnounced);
             }
         }
         QueryResult::PutRecord(Err(err)) => {
@@ -943,6 +974,8 @@ fn handle_kad_event(
                     username,
                     reason: err.to_string(),
                 });
+            } else if pending.announce_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardAnnouncementFailed { reason: err.to_string() });
             }
         }
         _ => {}

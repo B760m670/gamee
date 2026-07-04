@@ -10,16 +10,25 @@ import Foundation
 /// decrypted results this class emits through `emit`.
 ///
 /// The crypto itself (`packages/crypto-core`) and the transport
-/// (`packages/p2p-core`'s envelope/blob protocols) are both already fully
-/// built and tested; this class is only the glue between them:
-/// - A contact's current prekey bundle ("contact card") is fetched the same
-///   way an avatar is — reusing the existing blob protocol under a fixed,
-///   well-known blob id — rather than adding a new libp2p protocol.
+/// (`packages/p2p-core`'s envelope/blob/mailbox/DHT primitives) are both
+/// already fully built and tested; this class is only the glue between
+/// them:
+/// - A contact's current prekey bundle ("contact card") is normally
+///   fetched the same way an avatar is — reusing the existing blob
+///   protocol under a fixed, well-known blob id — but that needs a live
+///   connection to them; if that fails (or the initial dial does), this
+///   falls back to `resolveContactCard`'s DHT lookup, which a contact who
+///   published their card while last online can still answer even while
+///   currently offline (see `announceContactCard` in `init`).
 /// - A conversation's first envelope carries both the X3DH `InitialMessage`
 ///   and the first ratchet ciphertext, framed as a 1-byte type tag (and,
 ///   for the first message, a 2-byte length prefix ahead of the initial
 ///   message bytes); every later envelope is just tagged ratchet
 ///   ciphertext. See `frameHandshake`/`frameContinuing` below.
+/// - When a contact isn't directly reachable, an encrypted envelope is
+///   deposited into the serverless Sphinx-mix mailbox instead of the
+///   message just failing outright — see `depositContinuing`/
+///   `sweepMailboxRetrieval`.
 final class ChatManager {
   /// Which async step (if any) is outstanding for a given peer — guards
   /// against acting on a stray/duplicate event (e.g. an `EnvelopeDelivered`
@@ -28,6 +37,7 @@ final class ChatManager {
   private enum PeerSendState {
     case dialing
     case fetchingCard
+    case resolvingCardViaDht
     case sendingEnvelope
   }
 
@@ -47,16 +57,31 @@ final class ChatManager {
   /// happening on this schedule rather than standing out as its own signal.
   private static let retrievalSweepInterval: TimeInterval = 30
 
+  /// How often this device re-publishes its own contact card into the
+  /// DHT (`reannounceContactCard`) — a DHT record needs refreshing so it
+  /// doesn't expire, but there's no reason to hammer the network with an
+  /// unchanged card anywhere near as often as the mailbox retrieval sweep.
+  private static let contactCardAnnounceInterval: TimeInterval = 30 * 60
+
   private let lock = NSLock()
   private var peerStates: [String: PeerSendState] = [:]
   private var connectedPeers: Set<String> = []
   private var retrievalTimer: Timer?
+  private var contactCardAnnounceTimer: Timer?
 
   private let slot: Int
   private let node: FfiP2pNode
   private let identity: FfiIdentity
   private let agreement: FfiAgreementKey
   private let prekeys: FfiPrekeyStore
+
+  /// Computed exactly once, in `init` — `FfiPrekeyStore.contactCard`
+  /// hands out a fresh one-time prekey on every call ("generate a new
+  /// card per contact"), so `reannounceContactCard` must re-publish this
+  /// same stored value rather than minting (and burning through the
+  /// finite one-time-prekey pool for) a new one every 30 minutes just to
+  /// refresh an unchanged DHT record.
+  private let contactCard: Data
 
   /// Set by whoever creates this instance (`SpiritchatCryptoCoreModule`) to
   /// forward events to JS via `sendEvent("onChatEvent", ...)` — kept as a
@@ -73,7 +98,13 @@ final class ChatManager {
     self.prekeys = prekeys
 
     let card = prekeys.contactCard(identity: identity, agreement: agreement)
+    self.contactCard = card
     try? node.setLocalBlob(id: Self.contactCardBlobId, bytes: card)
+    // Also published into the DHT, not just served over a live
+    // connection — see `announceContactCard`'s own doc comment for why
+    // that's what makes a *first* message to this device possible even
+    // while it's the one currently offline.
+    try? node.announceContactCard(ownerIdentityPublicKey: identity.publicKeyBytes(), card: card)
 
     // Anything left over from a previous run (app killed mid-send, or the
     // recipient was offline) gets another chance now — the same dial/
@@ -83,10 +114,12 @@ final class ChatManager {
     }
 
     startRetrievalSweep()
+    startContactCardAnnounceSweep()
   }
 
   deinit {
     retrievalTimer?.invalidate()
+    contactCardAnnounceTimer?.invalidate()
   }
 
   // MARK: - Sending
@@ -241,11 +274,23 @@ final class ChatManager {
     }
   }
 
-  /// Runs once this device's `fetchBlob` for `peerId`'s contact card comes
-  /// back: verifies it (`FfiContactCard.parse` already checks every
+  /// What `handleCardFetched` does with the freshly-framed first envelope
+  /// once X3DH and the ratchet are set up: send it immediately (the card
+  /// came from a direct `fetchBlob`, meaning the peer is reachable right
+  /// now) or deposit it into the mailbox (the card came from
+  /// `resolveContactCard`'s DHT fallback, meaning it very much isn't) —
+  /// every other step is identical either way.
+  private enum FirstEnvelopeDelivery {
+    case sendDirectly
+    case depositToMailbox
+  }
+
+  /// Runs once this device has `peerId`'s contact card, however it got
+  /// it: verifies it (`FfiContactCard.parse` already checks every
   /// signature), runs X3DH against it, bootstraps the initiator side of a
-  /// Double Ratchet session, and sends the first (combined) envelope.
-  private func handleCardFetched(peerId: String, cardBytes: Data) {
+  /// Double Ratchet session, and either sends or deposits the first
+  /// (combined) envelope per `delivery`.
+  private func handleCardFetched(peerId: String, cardBytes: Data, delivery: FirstEnvelopeDelivery) {
     guard let item = firstOutboxItem(peerId) else {
       endState(for: peerId)
       return
@@ -267,8 +312,15 @@ final class ChatManager {
         ChatStore.Session(peerId: peerId, peerPublicKey: item.peerPublicKey, ratchetBytes: ratchet.toBytes()),
         slot: slot
       )
-      transitionState(.sendingEnvelope, for: peerId)
-      try node.sendEnvelope(peerId: peerId, bytes: envelope)
+      switch delivery {
+      case .sendDirectly:
+        transitionState(.sendingEnvelope, for: peerId)
+        try node.sendEnvelope(peerId: peerId, bytes: envelope)
+      case .depositToMailbox:
+        try node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: item.peerPublicKey), envelope: envelope)
+        endState(for: peerId)
+        emit(failedEvent(item: item, reason: "queued for offline delivery"))
+      }
     } catch {
       endState(for: peerId)
       emit(failedEvent(item: item, reason: "\(error)"))
@@ -442,6 +494,27 @@ final class ChatManager {
     }
   }
 
+  // MARK: - Contact card DHT announcement
+
+  /// Periodically re-publishes this device's own contact card into the
+  /// DHT (`announceContactCard`) so the record doesn't expire — mirrors
+  /// `startRetrievalSweep`'s own main-run-loop scheduling caution (this
+  /// class isn't guaranteed to be constructed on the main thread).
+  private func startContactCardAnnounceSweep() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      let timer = Timer(timeInterval: Self.contactCardAnnounceInterval, repeats: true) { [weak self] _ in
+        self?.reannounceContactCard()
+      }
+      RunLoop.main.add(timer, forMode: .common)
+      self.contactCardAnnounceTimer = timer
+    }
+  }
+
+  private func reannounceContactCard() {
+    try? node.announceContactCard(ownerIdentityPublicKey: identity.publicKeyBytes(), card: contactCard)
+  }
+
   // MARK: - P2P event feed
 
   /// Called from the same event pump that drives `P2pSession.encode` (see
@@ -464,17 +537,57 @@ final class ChatManager {
 
     case .dialFailed(let maybePeerId, let reason):
       guard let peerId = maybePeerId, state(for: peerId) == .dialing else { return }
-      endState(for: peerId)
-      if let item = firstOutboxItem(peerId) { emit(failedEvent(item: item, reason: reason)) }
+      guard let item = firstOutboxItem(peerId) else { endState(for: peerId); return }
+      if let session = ChatStore.loadSession(slot: slot, peerId: peerId) {
+        // An existing conversation — the peer just isn't reachable right
+        // now. Deposit into the mailbox instead of giving up outright,
+        // the same fallback an already-connected send's later failure
+        // (`envelopeDeliveryFailed`) already uses.
+        depositContinuing(item: item, session: session)
+      } else {
+        // First contact with someone not directly reachable right now —
+        // try the DHT for their contact card instead of giving up; if
+        // that also fails, there's truly nothing left to try.
+        transitionState(.resolvingCardViaDht, for: peerId)
+        do {
+          try node.resolveContactCard(ownerIdentityPublicKey: item.peerPublicKey)
+        } catch {
+          endState(for: peerId)
+          emit(failedEvent(item: item, reason: reason))
+        }
+      }
 
     case .blobFetched(let peerId, let id, let bytes):
       guard id == Self.contactCardBlobId, state(for: peerId) == .fetchingCard else { return }
-      handleCardFetched(peerId: peerId, cardBytes: bytes)
+      handleCardFetched(peerId: peerId, cardBytes: bytes, delivery: .sendDirectly)
 
     case .blobFetchFailed(let peerId, let id, let reason):
       guard id == Self.contactCardBlobId, state(for: peerId) == .fetchingCard else { return }
+      guard let item = firstOutboxItem(peerId) else { endState(for: peerId); return }
+      // `attemptSend` only ever calls `fetchBlob` when no session exists
+      // yet, so this is always a first-contact case — try the DHT next.
+      transitionState(.resolvingCardViaDht, for: peerId)
+      do {
+        try node.resolveContactCard(ownerIdentityPublicKey: item.peerPublicKey)
+      } catch {
+        endState(for: peerId)
+        emit(failedEvent(item: item, reason: reason))
+      }
+
+    case .contactCardResolved(let ownerIdentityPublicKey, let card):
+      guard let peerId = try? p2pPeerIdFromPublicKey(publicKey: ownerIdentityPublicKey),
+            state(for: peerId) == .resolvingCardViaDht
+      else { return }
+      handleCardFetched(peerId: peerId, cardBytes: card, delivery: .depositToMailbox)
+
+    case .contactCardResolutionFailed(let ownerIdentityPublicKey):
+      guard let peerId = try? p2pPeerIdFromPublicKey(publicKey: ownerIdentityPublicKey),
+            state(for: peerId) == .resolvingCardViaDht
+      else { return }
       endState(for: peerId)
-      if let item = firstOutboxItem(peerId) { emit(failedEvent(item: item, reason: reason)) }
+      if let item = firstOutboxItem(peerId) {
+        emit(failedEvent(item: item, reason: "Собеседник офлайн, и его карточка ещё не найдена в сети"))
+      }
 
     case .envelopeReceived(let fromPeerId, let bytes):
       onEnvelopeReceived(fromPeerId: fromPeerId, bytes: bytes)

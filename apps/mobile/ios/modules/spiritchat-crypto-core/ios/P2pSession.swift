@@ -158,6 +158,18 @@ final class P2pSession {
       return ["type": "blobFetched", "peerId": peerId, "id": idHex, "localPath": url.absoluteString]
     case .blobFetchFailed(let peerId, let id, let reason):
       return ["type": "blobFetchFailed", "peerId": peerId, "id": id.hexEncoded, "reason": reason]
+    case .contactCardAnnounced:
+      return ["type": "contactCardAnnounced"]
+    case .contactCardAnnouncementFailed(let reason):
+      return ["type": "contactCardAnnouncementFailed", "reason": reason]
+    case .contactCardResolved(let ownerIdentityPublicKey, let card):
+      return [
+        "type": "contactCardResolved",
+        "ownerIdentityPublicKeyBase64": ownerIdentityPublicKey.base64EncodedString(),
+        "card": card,
+      ]
+    case .contactCardResolutionFailed(let ownerIdentityPublicKey):
+      return ["type": "contactCardResolutionFailed", "ownerIdentityPublicKeyBase64": ownerIdentityPublicKey.base64EncodedString()]
     case .usernameResolved(let username, let claim):
       // Verify here, not in JS — the DHT is a public, untrusted store, so
       // an unverified claim must never reach the app as if it were

@@ -53,6 +53,28 @@ pub enum Command {
     /// `P2pEvent::BlobFetched`/`BlobFetchFailed`.
     FetchBlob { peer: PeerId, id: Vec<u8> },
 
+    /// Publishes this node's own current contact card (an opaque prekey
+    /// bundle — see `SetLocalBlob`'s own doc comment for why this crate
+    /// never inspects one) into the public DHT, keyed by
+    /// `owner_identity_public_key` (see `contact_card::record_key_for`)
+    /// rather than a fixed blob id fetched over a live connection. Unlike
+    /// `SetLocalBlob`, a DHT record survives this node going offline, as
+    /// long as the handful of nodes Kademlia replicated it to still hold
+    /// it — the only way a *first* message to this node can ever reach it
+    /// while it's offline. Re-run periodically (DHT records expire), the
+    /// same as `AnnounceAddresses`. Answered by
+    /// `P2pEvent::ContactCardAnnounced`/`ContactCardAnnouncementFailed`.
+    AnnounceContactCard { owner_identity_public_key: Vec<u8>, card: Vec<u8> },
+
+    /// Looks up whatever contact card is currently published for
+    /// `owner_identity_public_key` — the fallback `ChatManager` tries once
+    /// a direct `FetchBlob` (or the dial before it) has failed and no
+    /// ratchet session with this identity exists yet, so there's still a
+    /// path to a first message even though the recipient isn't reachable
+    /// right now. Answered by
+    /// `P2pEvent::ContactCardResolved`/`ContactCardResolutionFailed`.
+    ResolveContactCard { owner_identity_public_key: Vec<u8> },
+
     /// Sends an already-built Sphinx packet (`mix::build_packet`) to
     /// `first_hop`, the first node in whatever path the caller chose.
     /// Every hop after that is handled automatically by this crate's own

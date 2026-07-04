@@ -21,6 +21,7 @@
 mod behaviour;
 mod bootstrap;
 mod command;
+mod contact_card;
 mod error;
 mod event;
 mod identity;
