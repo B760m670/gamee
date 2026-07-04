@@ -38,6 +38,7 @@ use crate::event::P2pEvent;
 use crate::identity;
 use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 use crate::mailbox;
+use crate::mailbox_dht;
 use crate::mix;
 use crate::rendezvous;
 use crate::username;
@@ -260,6 +261,12 @@ struct Pending {
     announce_avatar_pointer: std::collections::HashSet<QueryId>,
     /// Keyed by the same `owner` `Command::ResolveAvatarPointer` was given.
     resolve_avatar_pointer: HashMap<QueryId, PeerId>,
+    /// One entry per in-flight `mailbox_dht::record_key_for` slot lookup a
+    /// `Command::RetrieveFromMailbox` fired off — see
+    /// `send_mailbox_retrieval_query`. Just a marker (there's nothing to
+    /// echo back beyond the envelope bytes the record itself carries), so
+    /// a `HashSet` is enough, same as `announce`/`announce_contact_card`.
+    mailbox_dht_retrieval: std::collections::HashSet<QueryId>,
 }
 
 /// One in-flight `spawn_blocking` nonce search — tagged with a generation
@@ -720,7 +727,7 @@ fn handle_command(
         }
 
         Command::RetrieveFromMailbox { shared_material } => {
-            send_mailbox_retrieval_query(swarm, known_mix_relays, known_mix_routing_keys, local_peer_id, mix_public, shared_material, events);
+            send_mailbox_retrieval_query(swarm, known_mix_relays, known_mix_routing_keys, local_peer_id, mix_public, pending, shared_material, events);
         }
 
         Command::AnnounceUsername { username, claim } => {
@@ -968,6 +975,14 @@ fn handle_kad_event(
                 });
             } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerResolved { owner, avatar_content_id: found.record.value });
+            } else if pending.mailbox_dht_retrieval.remove(&id) {
+                // One of a `RetrieveFromMailbox`'s per-slot DHT lookups
+                // (see `send_mailbox_retrieval_query`) found a replica —
+                // surfaced exactly like a mix-routed
+                // `MailboxEnvelopeRetrieved` so the app layer (and
+                // ChatManager.swift) needs no changes to benefit from
+                // this second delivery avenue.
+                let _ = events.send(P2pEvent::MailboxEnvelopeRetrieved { envelope: found.record.value });
             }
         }
         QueryResult::GetRecord(Err(_)) => {
@@ -979,6 +994,11 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardResolutionFailed { owner_identity_public_key });
             } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerResolutionFailed { owner });
+            } else {
+                // An empty slot is the expected steady state, not a real
+                // failure — silence, same reasoning as a mailbox query
+                // that simply finds nothing queued under a tag.
+                pending.mailbox_dht_retrieval.remove(&id);
             }
         }
         QueryResult::PutRecord(Ok(PutRecordOk { .. })) => {
@@ -1181,10 +1201,24 @@ fn handle_mix_event(
                             // sender who can already tell locally whether
                             // their own stamp/timestamp were valid before
                             // ever sending.
-                            if mailbox::validate(&deposit, mailbox::now_unix()).is_ok()
-                                && mailbox_store.accept(deposit).is_ok()
-                            {
-                                let _ = events.send(P2pEvent::MailboxDepositStored);
+                            if mailbox::validate(&deposit, mailbox::now_unix()).is_ok() {
+                                // Replicate into the public DHT before
+                                // `accept` consumes `deposit` — this
+                                // node's own local `MailboxStore` stays
+                                // the primary copy either way; the DHT
+                                // put is supplementary redundancy so a
+                                // recipient can still recover this
+                                // deposit even if a later mix-routed
+                                // query can't currently reach *this* node
+                                // specifically (see mailbox_dht.rs).
+                                let slot = mailbox::dht_replication_slot(&deposit, mailbox_dht::MAILBOX_DHT_SLOTS);
+                                let key = mailbox_dht::record_key_for(&deposit.tag, slot);
+                                let record = Record::new(key, deposit.envelope.clone());
+                                let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::One);
+
+                                if mailbox_store.accept(deposit).is_ok() {
+                                    let _ = events.send(P2pEvent::MailboxDepositStored);
+                                }
                             }
                         } else if let Some((tag, surb)) = parse_mailbox_query(&payload) {
                             // This node is being asked, as an anonymous
@@ -1460,17 +1494,33 @@ fn send_mailbox_deposit(
 /// likely to reach whoever holds the match instead of depending on luck.
 /// See `Command::RetrieveFromMailbox`'s own doc comment for the full round
 /// trip this kicks off.
+#[allow(clippy::too_many_arguments)]
 fn send_mailbox_retrieval_query(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
     known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
     local_peer_id: PeerId,
     mix_public: PublicKey,
+    pending: &mut Pending,
     shared_material: Vec<u8>,
     events: &mpsc::UnboundedSender<P2pEvent>,
 ) {
     let mut rng = rand::thread_rng();
     let tag = mailbox::mailbox_tag(&shared_material, mailbox::epoch_for(mailbox::now_unix()));
+
+    // Independent of the mix-routed query below, and fired regardless of
+    // whether a usable mix path even exists right now: any of the DHT's
+    // own replica nodes for one of this tag's slots (see
+    // `mailbox_dht.rs`) can answer, not just the one deterministic relay
+    // the mix path's final hop would be. This is what lets a retrieval
+    // succeed even while this node has no live mix relay connection at
+    // all, as long as *some* DHT peer does.
+    for slot in 0..mailbox_dht::MAILBOX_DHT_SLOTS {
+        let key = mailbox_dht::record_key_for(&tag, slot);
+        let query_id = swarm.behaviour_mut().kad.get_record(key);
+        pending.mailbox_dht_retrieval.insert(query_id);
+    }
+
     let Some(hops) = build_mix_path_to_tag(&tag, known_mix_relays, known_mix_routing_keys, &mut rng) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
         return;

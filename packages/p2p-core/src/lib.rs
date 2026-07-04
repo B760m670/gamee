@@ -28,6 +28,7 @@ mod event;
 mod identity;
 mod ledger;
 mod mailbox;
+mod mailbox_dht;
 mod mix;
 mod node;
 mod rendezvous;
