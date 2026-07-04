@@ -450,5 +450,34 @@ public class SpiritchatCryptoCoreModule: Module {
       }
       return try requireP2pSession().chatManager.sendMessage(peerId: peerId, peerPublicKey: publicKey, plaintext: plaintextBytes)
     }
+
+    // Creates a group named `name` with `memberPeerIds` as its initial
+    // members — every one of them must already be an existing 1:1 contact
+    // (see ChatManager's own "MARK: - Groups" doc comment for this v1's
+    // scope). Returns the new group's id, or throws if this device's own
+    // identity isn't ready yet. `groupInvited`/`groupMessageReceived` on
+    // `onChatEvent` answer what happens next for everyone else.
+    Function("chatCreateGroup") { (name: String, memberPeerIds: [String]) throws -> String in
+      guard let groupId = try requireP2pSession().chatManager.createGroup(name: name, memberPeerIds: memberPeerIds) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return groupId
+    }
+
+    // Encrypts `plaintext` once (Sender Keys) and fans it out to every
+    // other member of `groupId` — best-effort per member (direct send,
+    // falling back to a single mailbox deposit attempt), not the
+    // persistent retry queue `chatSendMessage` gets. Returns a local id;
+    // throws if this device isn't a member of `groupId` or its plaintext
+    // isn't valid UTF-8.
+    Function("chatSendGroupMessage") { (groupId: String, plaintext: String) throws -> String in
+      guard let plaintextBytes = plaintext.data(using: .utf8) else {
+        throw ChatError.malformedPlaintext
+      }
+      guard let localId = try requireP2pSession().chatManager.sendGroupMessage(groupId: groupId, plaintext: plaintextBytes) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return localId
+    }
   }
 }

@@ -65,6 +65,8 @@ export type ChatEvent =
   | { type: 'messageReceived'; peerId: string; peerFingerprint: string; peerPublicKeyBase64: string; plaintext: string; at: number }
   | { type: 'messageSent'; peerId: string; localId: string }
   | { type: 'messageFailed'; peerId: string; localId: string; reason: string }
+  | { type: 'groupInvited'; groupId: string; name: string; members: string[] }
+  | { type: 'groupMessageReceived'; groupId: string; senderPeerId: string; plaintext: string; at: number }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -114,6 +116,8 @@ const NativeCryptoCore = requireNativeModule<
     setMixRelayParticipationEnabled(enabled: boolean): void
     mixDummyTrafficBytesPerHourEstimate(): number
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
+    chatCreateGroup(name: string, memberPeerIds: string[]): string
+    chatSendGroupMessage(groupId: string, plaintext: string): string
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -717,6 +721,30 @@ export function mixDummyTrafficBytesPerHourEstimate(): number {
  */
 export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string {
   return NativeCryptoCore.chatSendMessage(peerId, peerPublicKeyBase64, plaintext)
+}
+
+/**
+ * Creates a group named `name` with `memberPeerIds` as its initial
+ * members. Every member must already be an existing 1:1 contact (a group
+ * invite piggybacks on an *existing* pairwise session — it never triggers
+ * first-contact/X3DH establishment the way `chatSendMessage` does); groups
+ * can't yet have members added or removed after creation. Returns the new
+ * group's id.
+ */
+export function chatCreateGroup(name: string, memberPeerIds: string[]): string {
+  return NativeCryptoCore.chatCreateGroup(name, memberPeerIds)
+}
+
+/**
+ * Encrypts `plaintext` once (Sender Keys — see
+ * `spiritchat_crypto_core::sender_key`) and fans it out to every other
+ * member of `groupId`. Delivery is best-effort per member (direct send,
+ * falling back to a single mailbox deposit attempt) rather than
+ * `chatSendMessage`'s persistent retry queue — a member unreachable
+ * through both avenues simply misses this message. Returns a local id.
+ */
+export function chatSendGroupMessage(groupId: string, plaintext: string): string {
+  return NativeCryptoCore.chatSendGroupMessage(groupId, plaintext)
 }
 
 /** Subscribes to decrypted/queued-message events. Returns an unsubscribe function. */

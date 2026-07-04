@@ -50,6 +50,34 @@ final class ChatManager {
 
   private static let handshakeTag: UInt8 = 0x00
   private static let continuingTag: UInt8 = 0x01
+  /// A group message: `[groupMessageTag][groupId: 16 bytes][Sender Key
+  /// envelope]` — sent directly (never wrapped in a pairwise ratchet
+  /// layer, unlike `handshakeTag`/`continuingTag`), since the Sender Key
+  /// scheme's own AEAD+signature already provide this envelope's
+  /// confidentiality and per-sender authenticity within the group. See
+  /// `sendGroupMessage`'s own doc comment for why this is what makes
+  /// Sender Keys cheaper than re-encrypting per-recipient the way 1:1
+  /// messaging does.
+  private static let groupMessageTag: UInt8 = 0x02
+
+  /// A group *control* message's own inner tag, distinct from (and never
+  /// compared against) the envelope-level tags above — these travel
+  /// nested one level deeper, inside a pairwise ratchet message's own
+  /// plaintext (see `groupControlAssociatedData`).
+  private static let controlInviteTag: UInt8 = 0x01
+  private static let controlDistributionTag: UInt8 = 0x02
+
+  /// Group control messages (an invite, or a member handing out their
+  /// Sender Key chain — see `GroupStore`) travel through an *existing*
+  /// pairwise ratchet session, exactly like an ordinary chat message,
+  /// just under this associated data instead of empty. A receiver tries
+  /// an ordinary chat decrypt first (empty AAD, the common case, checked
+  /// first for the exact behavior every existing 1:1 message already
+  /// has) and only falls back to this AAD if that fails — safe because a
+  /// failed `FfiRatchet.decrypt` attempt never mutates the ratchet (see
+  /// its own doc comment), so retrying against the same session bytes a
+  /// second time is never a double-spend of any ratchet state.
+  private static let groupControlAssociatedData = Data("spiritchat-group-control-v1".utf8)
 
   /// How often `sweepMailboxRetrieval` runs — same order of magnitude as
   /// the mix's own dummy-traffic interval (`MIX_DUMMY_TRAFFIC_INTERVAL` in
@@ -327,6 +355,248 @@ final class ChatManager {
     }
   }
 
+  // MARK: - Groups (Sender Keys)
+  //
+  // Every group member encrypts once, under their own Sender Key chain,
+  // for every other member to decrypt — cheaper than 1:1 messaging's
+  // per-recipient re-encryption, at the cost of everyone in the group
+  // sharing the AEAD key, which is why every message also carries a
+  // signature (checked inside `spiritchat_crypto_core::sender_key`
+  // itself, not here) proving *which* member actually sent it. See that
+  // module's own doc comment for the scheme in full.
+  //
+  // Deliberately v1-scoped: a group is created with a fixed initial
+  // member list (no add/remove afterward yet), and every member named at
+  // creation must already be an existing 1:1 contact (a group control
+  // message piggybacks on an *existing* pairwise ratchet session — it
+  // never triggers first-contact/X3DH establishment the way an ordinary
+  // `sendMessage` does). Both control-message delivery and group content
+  // fan-out are best-effort (direct send, falling back to a single
+  // mailbox deposit attempt) rather than the persistent retry queue
+  // 1:1 messages get — a member who's unreachable through both avenues
+  // simply won't have working group crypto until a later interaction
+  // gives another chance to catch up.
+
+  /// Creates a new group named `name` with `memberPeerIds` as its initial
+  /// (non-self) members — every one of them must already have an
+  /// established pairwise session (see this section's own doc comment).
+  /// Returns the new group's id, or `nil` if this device's own identity
+  /// isn't available yet or the group couldn't be persisted.
+  @discardableResult
+  func createGroup(name: String, memberPeerIds: [String]) -> String? {
+    guard let myPeerId = try? node.localPeerId() else { return nil }
+    let groupIdBytes = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+    let groupId = Self.hexString(groupIdBytes)
+
+    let ownState = FfiSenderKeyState.generate()
+    let session = GroupStore.Session(
+      groupId: groupId, name: name, members: memberPeerIds,
+      ownSenderKeyStateBytes: ownState.toBytes(), receiverStates: [:]
+    )
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return nil }
+
+    // The invite's own member list includes this device (the creator) —
+    // every recipient needs to know to also send *it* their distribution,
+    // not just each other.
+    let allMembers = memberPeerIds + [myPeerId]
+    let distribution = ownState.toDistributionBytes()
+    for member in memberPeerIds {
+      sendGroupControlMessageBestEffort(
+        peerId: member,
+        payload: Self.frameGroupInvite(groupId: groupIdBytes, name: name, members: allMembers, distribution: distribution)
+      )
+    }
+    return groupId
+  }
+
+  /// Encrypts `plaintext` once under this device's own chain for `groupId`
+  /// and fans the same ciphertext out to every other member — returns a
+  /// local id (nothing currently tracks it against a delivery event, since
+  /// fan-out is best-effort; kept for symmetry with `sendMessage` and any
+  /// future UI that wants one). `nil` if this device isn't (or is no
+  /// longer) a member of `groupId`.
+  @discardableResult
+  func sendGroupMessage(groupId: String, plaintext: Data) -> String? {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes)
+    else { return nil }
+
+    guard let signedEnvelope = try? ownState.encrypt(plaintext: plaintext, associatedData: groupIdBytes) else {
+      return nil
+    }
+    session.ownSenderKeyStateBytes = ownState.toBytes()
+    try? GroupStore.saveSession(session, slot: slot)
+
+    let wireEnvelope = Self.frameGroupMessage(groupId: groupIdBytes, signedEnvelope: signedEnvelope)
+    for member in session.members {
+      sendGroupContentBestEffort(peerId: member, wireEnvelope: wireEnvelope)
+    }
+    return UUID().uuidString
+  }
+
+  /// Delivers `wireEnvelope` to `peerId` right now if reachable, otherwise
+  /// falls back to a single mailbox deposit attempt using the *pairwise*
+  /// shared material already established with them (see
+  /// `mailboxSharedMaterial`) — reusing that same per-pair mailbox queue
+  /// for group content too, distinguished on retrieval purely by this
+  /// envelope's own leading tag byte, the same way every other kind of
+  /// envelope already is. Requires an existing pairwise session (to learn
+  /// `peerId`'s identity public key for the mailbox tag) — a group member
+  /// this device has literally never established one with can't be
+  /// reached this way, consistent with this section's own v1 scope.
+  private func sendGroupContentBestEffort(peerId: String, wireEnvelope: Data) {
+    if isConnected(peerId) {
+      do {
+        try node.sendEnvelope(peerId: peerId, bytes: wireEnvelope)
+        return
+      } catch {
+        // Fall through to the mailbox below.
+      }
+    }
+    guard let pairwiseSession = ChatStore.loadSession(slot: slot, peerId: peerId) else {
+      NSLog("[ChatManager] no pairwise session with group member \(peerId) — cannot deliver a group message to them right now")
+      return
+    }
+    try? node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: pairwiseSession.peerPublicKey), envelope: wireEnvelope)
+  }
+
+  /// Encrypts `payload` (an invite or a member distribution) under the
+  /// *existing* pairwise ratchet session with `peerId`, using
+  /// `groupControlAssociatedData` so the receiving end can tell it apart
+  /// from an ordinary chat message. Returns `false` (and does nothing
+  /// else) if no such session exists yet — see this section's own v1
+  /// scope note on why this never triggers first-contact establishment.
+  @discardableResult
+  private func sendGroupControlMessageBestEffort(peerId: String, payload: Data) -> Bool {
+    guard let session = ChatStore.loadSession(slot: slot, peerId: peerId) else {
+      NSLog("[ChatManager] no pairwise session with \(peerId) yet — add them as a contact before adding them to a group")
+      return false
+    }
+    do {
+      let ratchet = try FfiRatchet.fromBytes(bytes: session.ratchetBytes)
+      let ciphertext = try ratchet.encrypt(plaintext: payload, associatedData: Self.groupControlAssociatedData)
+      let envelope = Self.frameContinuing(ciphertext)
+      try ChatStore.saveSession(
+        ChatStore.Session(peerId: peerId, peerPublicKey: session.peerPublicKey, ratchetBytes: ratchet.toBytes()),
+        slot: slot
+      )
+      if isConnected(peerId) {
+        try node.sendEnvelope(peerId: peerId, bytes: envelope)
+      } else {
+        try node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: session.peerPublicKey), envelope: envelope)
+      }
+      return true
+    } catch {
+      NSLog("[ChatManager] failed to deliver a group control message to \(peerId): \(error)")
+      return false
+    }
+  }
+
+  /// A group invite (`Self.controlInviteTag`) or someone's chain handout
+  /// (`Self.controlDistributionTag`) — dispatched here once
+  /// `handleIncomingGroupControl`/`handleRetrievedContinuing` have already
+  /// confirmed `payload` decrypted successfully under
+  /// `groupControlAssociatedData`.
+  private func dispatchGroupControlPayload(fromPeerId: String, payload: Data) {
+    guard let tag = payload.first else { return }
+    let body = Data(payload.dropFirst())
+    switch tag {
+    case Self.controlInviteTag:
+      guard let (groupId, name, members, distribution) = Self.parseGroupInvite(body) else { return }
+      handleGroupInvite(fromPeerId: fromPeerId, groupIdBytes: groupId, name: name, allMembers: members, distributionBytes: distribution)
+    case Self.controlDistributionTag:
+      guard let (groupId, distribution) = Self.parseGroupMemberDistribution(body) else { return }
+      handleGroupMemberDistribution(fromPeerId: fromPeerId, groupIdBytes: groupId, distributionBytes: distribution)
+    default:
+      NSLog("[ChatManager] unrecognized group control message tag \(tag) from \(fromPeerId) — dropped")
+    }
+  }
+
+  /// `fromPeerId` invited this device into a new group. If this device
+  /// already knows `groupId` (a duplicate/retried invite), this is
+  /// treated exactly like an ordinary member distribution instead of
+  /// re-creating the group from scratch. Otherwise: records the
+  /// inviter's own distribution, generates this device's own fresh chain
+  /// for the group, and hands that chain out to every other named member
+  /// (including the inviter) the same best-effort way `createGroup` does.
+  private func handleGroupInvite(fromPeerId: String, groupIdBytes: Data, name: String, allMembers: [String], distributionBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard GroupStore.loadSession(slot: slot, groupId: groupId) == nil else {
+      handleGroupMemberDistribution(fromPeerId: fromPeerId, groupIdBytes: groupIdBytes, distributionBytes: distributionBytes)
+      return
+    }
+    guard let myPeerId = try? node.localPeerId(),
+          let creatorReceiverState = try? FfiSenderKeyReceiverState.fromDistributionBytes(bytes: distributionBytes)
+    else { return }
+
+    let otherMembers = allMembers.filter { $0 != myPeerId }
+    let ownState = FfiSenderKeyState.generate()
+    let session = GroupStore.Session(
+      groupId: groupId, name: name, members: otherMembers,
+      ownSenderKeyStateBytes: ownState.toBytes(),
+      receiverStates: [fromPeerId: creatorReceiverState.toBytes()]
+    )
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    emit(groupInvitedEvent(groupId: groupId, name: name, members: otherMembers))
+
+    let myDistribution = ownState.toDistributionBytes()
+    for member in otherMembers {
+      sendGroupControlMessageBestEffort(
+        peerId: member,
+        payload: Self.frameGroupMemberDistribution(groupId: groupIdBytes, distribution: myDistribution)
+      )
+    }
+  }
+
+  /// `fromPeerId` handed out their current Sender Key chain for a group
+  /// this device already knows about — recorded so a later
+  /// `handleIncomingGroupMessage` from them can actually decrypt. Silently
+  /// dropped if this device doesn't recognize `groupId` at all (an invite
+  /// must have been lost, or arrived out of order) — there's nothing
+  /// meaningful to attach this distribution to yet.
+  private func handleGroupMemberDistribution(fromPeerId: String, groupIdBytes: Data, distributionBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId) else {
+      NSLog("[ChatManager] a member distribution for unknown group \(groupId) from \(fromPeerId) — dropped")
+      return
+    }
+    guard let receiverState = try? FfiSenderKeyReceiverState.fromDistributionBytes(bytes: distributionBytes) else { return }
+    session.receiverStates[fromPeerId] = receiverState.toBytes()
+    try? GroupStore.saveSession(session, slot: slot)
+  }
+
+  /// A group content envelope (`Self.groupMessageTag`) — arrived either
+  /// directly (`onEnvelopeReceived`) or via the mailbox
+  /// (`handleMailboxEnvelopeRetrieved`); unlike the 1:1 case, both paths
+  /// share one handler here, since neither ever needs the transport-level
+  /// sender: the envelope itself never names one (that's the whole point
+  /// of Sender Keys' signature living *inside* the encrypted content, not
+  /// on the wire), so every known member's receiver state is tried in
+  /// turn regardless of how this arrived — mirrors
+  /// `handleRetrievedContinuing`'s own "try every candidate" shape.
+  private func handleIncomingGroupMessage(_ bytes: Data) {
+    guard bytes.count >= 16 else { return }
+    let groupIdBytes = Data(bytes.prefix(16))
+    let signedEnvelope = Data(bytes.dropFirst(16))
+    let groupId = Self.hexString(groupIdBytes)
+    guard let session = GroupStore.loadSession(slot: slot, groupId: groupId) else {
+      NSLog("[ChatManager] a group message for unknown group \(groupId) — dropped")
+      return
+    }
+
+    for (memberPeerId, receiverStateBytes) in session.receiverStates {
+      guard let receiverState = try? FfiSenderKeyReceiverState.fromBytes(bytes: receiverStateBytes) else { continue }
+      guard let plaintext = try? receiverState.decrypt(message: signedEnvelope, associatedData: groupIdBytes) else { continue }
+      var updated = session
+      updated.receiverStates[memberPeerId] = receiverState.toBytes()
+      try? GroupStore.saveSession(updated, slot: slot)
+      emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: memberPeerId, plaintext: plaintext))
+      return
+    }
+    NSLog("[ChatManager] a group message for \(groupId) matched no known member's chain — dropped")
+  }
+
   // MARK: - Receiving
 
   private func onEnvelopeReceived(fromPeerId: String, bytes: Data) {
@@ -337,6 +607,8 @@ final class ChatManager {
       handleIncomingHandshake(fromPeerId: fromPeerId, body: Data(body))
     case Self.continuingTag:
       handleIncomingContinuing(fromPeerId: fromPeerId, body: Data(body))
+    case Self.groupMessageTag:
+      handleIncomingGroupMessage(Data(body))
     default:
       NSLog("[ChatManager] envelope from \(fromPeerId) has an unrecognized type tag \(tag) — dropped")
     }
@@ -390,8 +662,28 @@ final class ChatManager {
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
       emit(receivedEvent(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
     } catch {
-      NSLog("[ChatManager] failed to decrypt an envelope from \(fromPeerId): \(error)")
+      // Might actually be a group control message sent through this same
+      // session instead — see `groupControlAssociatedData`'s own doc
+      // comment for why retrying here is always safe.
+      handleIncomingGroupControl(fromPeerId: fromPeerId, session: session, body: body)
     }
+  }
+
+  /// A failed ordinary decrypt in `handleIncomingContinuing` falls back
+  /// here — tries the same session once more under
+  /// `groupControlAssociatedData` before giving up entirely.
+  private func handleIncomingGroupControl(fromPeerId: String, session: ChatStore.Session, body: Data) {
+    guard let ratchet = try? FfiRatchet.fromBytes(bytes: session.ratchetBytes),
+          let payload = try? ratchet.decrypt(message: body, associatedData: Self.groupControlAssociatedData)
+    else {
+      NSLog("[ChatManager] failed to decrypt an envelope from \(fromPeerId) as either a chat message or a group control message")
+      return
+    }
+    try? ChatStore.saveSession(
+      ChatStore.Session(peerId: fromPeerId, peerPublicKey: session.peerPublicKey, ratchetBytes: ratchet.toBytes()),
+      slot: slot
+    )
+    dispatchGroupControlPayload(fromPeerId: fromPeerId, payload: payload)
   }
 
   /// A mailbox-retrieved envelope carries no attached sender — Sphinx
@@ -408,6 +700,8 @@ final class ChatManager {
       handleRetrievedHandshake(body: body)
     case Self.continuingTag:
       handleRetrievedContinuing(body: body)
+    case Self.groupMessageTag:
+      handleIncomingGroupMessage(body)
     default:
       NSLog("[ChatManager] a mailbox-retrieved envelope has an unrecognized type tag \(tag) — dropped")
     }
@@ -461,6 +755,16 @@ final class ChatManager {
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
       emit(receivedEvent(peerId: session.peerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
+      return
+    }
+    for session in ChatStore.loadAllSessions(slot: slot) {
+      guard let ratchet = try? FfiRatchet.fromBytes(bytes: session.ratchetBytes) else { continue }
+      guard let payload = try? ratchet.decrypt(message: body, associatedData: Self.groupControlAssociatedData) else { continue }
+      try? ChatStore.saveSession(
+        ChatStore.Session(peerId: session.peerId, peerPublicKey: session.peerPublicKey, ratchetBytes: ratchet.toBytes()),
+        slot: slot
+      )
+      dispatchGroupControlPayload(fromPeerId: session.peerId, payload: payload)
       return
     }
     NSLog("[ChatManager] a mailbox-retrieved continuing envelope matched no known session — dropped")
@@ -641,6 +945,101 @@ final class ChatManager {
     return out
   }
 
+  /// `[groupMessageTag][groupId: 16 bytes][Sender Key envelope]`.
+  private static func frameGroupMessage(groupId: Data, signedEnvelope: Data) -> Data {
+    var out = Data([groupMessageTag])
+    out.append(groupId)
+    out.append(signedEnvelope)
+    return out
+  }
+
+  /// `[controlInviteTag][groupId: 16 bytes][1-byte name length][name][1-byte
+  /// member count][for each: 1-byte peer id length, peer id][Sender Key
+  /// distribution bytes]`. The distribution is last (and un-length-
+  /// prefixed) since `SenderKeyDistribution::decode` requires its own
+  /// input to be exactly its own length, not merely a prefix of a longer
+  /// buffer — the same reason it has to come after every length-prefixed
+  /// field here, not before.
+  private static func frameGroupInvite(groupId: Data, name: String, members: [String], distribution: Data) -> Data {
+    var out = Data([controlInviteTag])
+    out.append(groupId)
+    let nameBytes = Data(name.utf8.prefix(255))
+    out.append(UInt8(nameBytes.count))
+    out.append(nameBytes)
+    let clampedMembers = members.prefix(255)
+    out.append(UInt8(clampedMembers.count))
+    for member in clampedMembers {
+      let memberBytes = Data(member.utf8.prefix(255))
+      out.append(UInt8(memberBytes.count))
+      out.append(memberBytes)
+    }
+    out.append(distribution)
+    return out
+  }
+
+  private static func parseGroupInvite(_ body: Data) -> (groupId: Data, name: String, members: [String], distribution: Data)? {
+    var offset = body.startIndex
+    guard body.distance(from: offset, to: body.endIndex) >= 16 else { return nil }
+    let groupId = Data(body[offset..<body.index(offset, offsetBy: 16)])
+    offset = body.index(offset, offsetBy: 16)
+
+    guard offset < body.endIndex else { return nil }
+    let nameLength = Int(body[offset])
+    offset = body.index(after: offset)
+    guard body.distance(from: offset, to: body.endIndex) >= nameLength else { return nil }
+    let nameEnd = body.index(offset, offsetBy: nameLength)
+    let name = String(data: Data(body[offset..<nameEnd]), encoding: .utf8) ?? ""
+    offset = nameEnd
+
+    guard offset < body.endIndex else { return nil }
+    let memberCount = Int(body[offset])
+    offset = body.index(after: offset)
+    var members: [String] = []
+    for _ in 0..<memberCount {
+      guard offset < body.endIndex else { return nil }
+      let length = Int(body[offset])
+      offset = body.index(after: offset)
+      guard body.distance(from: offset, to: body.endIndex) >= length else { return nil }
+      let end = body.index(offset, offsetBy: length)
+      guard let member = String(data: Data(body[offset..<end]), encoding: .utf8) else { return nil }
+      members.append(member)
+      offset = end
+    }
+
+    return (groupId, name, members, Data(body[offset...]))
+  }
+
+  /// `[controlDistributionTag][groupId: 16 bytes][Sender Key distribution
+  /// bytes]`.
+  private static func frameGroupMemberDistribution(groupId: Data, distribution: Data) -> Data {
+    var out = Data([controlDistributionTag])
+    out.append(groupId)
+    out.append(distribution)
+    return out
+  }
+
+  private static func parseGroupMemberDistribution(_ body: Data) -> (groupId: Data, distribution: Data)? {
+    guard body.count >= 16 else { return nil }
+    return (Data(body.prefix(16)), Data(body.dropFirst(16)))
+  }
+
+  private static func hexString(_ data: Data) -> String {
+    data.map { String(format: "%02x", $0) }.joined()
+  }
+
+  private static func data(fromHex hex: String) -> Data? {
+    guard hex.count % 2 == 0 else { return nil }
+    var out = Data(capacity: hex.count / 2)
+    var index = hex.startIndex
+    while index < hex.endIndex {
+      let next = hex.index(index, offsetBy: 2)
+      guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+      out.append(byte)
+      index = next
+    }
+    return out
+  }
+
   // MARK: - Event encoding
 
   private func receivedEvent(peerId: String, peerFingerprint: String, peerPublicKey: Data, plaintext: Data) -> [String: Any?] {
@@ -660,5 +1059,19 @@ final class ChatManager {
 
   private func failedEvent(item: ChatStore.OutboxItem, reason: String) -> [String: Any?] {
     ["type": "messageFailed", "peerId": item.peerId, "localId": item.localId, "reason": reason]
+  }
+
+  private func groupInvitedEvent(groupId: String, name: String, members: [String]) -> [String: Any?] {
+    ["type": "groupInvited", "groupId": groupId, "name": name, "members": members]
+  }
+
+  private func groupMessageReceivedEvent(groupId: String, senderPeerId: String, plaintext: Data) -> [String: Any?] {
+    [
+      "type": "groupMessageReceived",
+      "groupId": groupId,
+      "senderPeerId": senderPeerId,
+      "plaintext": String(data: plaintext, encoding: .utf8) ?? "",
+      "at": Date().timeIntervalSince1970,
+    ]
   }
 }
