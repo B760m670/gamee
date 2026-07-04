@@ -1,5 +1,5 @@
-mod aead;
-mod chain;
+pub(crate) mod aead;
+pub(crate) mod chain;
 pub mod envelope;
 mod header;
 mod root_kdf;
