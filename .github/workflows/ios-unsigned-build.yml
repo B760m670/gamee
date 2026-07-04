@@ -127,7 +127,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: apps/mobile/ios/ios
-          key: native-ios-project-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/app.json', 'apps/mobile/ios/modules/**/*.podspec', 'apps/mobile/ios/modules/**/expo-module.config.json', 'packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml') }}
+          key: native-ios-project-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/app.json', 'apps/mobile/ios/modules/**/*.podspec', 'apps/mobile/ios/modules/**/expo-module.config.json', 'apps/mobile/ios/modules/**/*.swift', 'packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml') }}
 
       - name: Prebuild native iOS project
         if: steps.native-project-cache.outputs.cache-hit != 'true'
