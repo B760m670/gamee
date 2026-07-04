@@ -1972,4 +1972,64 @@ mod tests {
         let path = build_mix_path_to_tag(&[3u8; 32], &HashMap::new(), &HashMap::new(), &mut rand::thread_rng());
         assert!(path.is_none());
     }
+
+    // Phase 8 hardening: a statistical check that a *minority* coalition
+    // of colluding relays essentially never ends up controlling every hop
+    // of a real path — the only way collusion could ever link sender to
+    // recipient by construction (see mix.rs's own
+    // `colluding_entry_and_exit_hops_cannot_bridge_an_honest_middle_hop`
+    // for why even a *partial* coalition, missing just the middle hop,
+    // already isn't enough). This doesn't re-derive the combinatorics by
+    // hand and assert an exact match (flaky, and re-implements the thing
+    // under test) — it just confirms `build_mix_path_to_tag`'s real,
+    // production path-selection isn't secretly biased toward reusing a
+    // small subset of relays, which is the one way this guarantee could
+    // quietly break without any single unit test of `pick_mix_path` in
+    // isolation catching it.
+    #[test]
+    fn a_minority_colluding_coalition_rarely_ends_up_controlling_every_hop_of_a_random_path() {
+        const TOTAL_RELAYS: u8 = 7;
+        const COLLUDING_RELAYS: u8 = 3; // a minority: 3 of 7
+
+        let mut relays = HashMap::new();
+        let mut keys = HashMap::new();
+        let mut colluding = std::collections::HashSet::new();
+        for seed in 1..=TOTAL_RELAYS {
+            let (address, peer, public) = usable_relay(seed);
+            relays.insert(address, peer);
+            keys.insert(peer, public);
+            if seed <= COLLUDING_RELAYS {
+                colluding.insert(peer);
+            }
+        }
+
+        const TRIALS: u32 = 500;
+        let mut fully_colluding_paths = 0u32;
+        let mut rng = rand::thread_rng();
+        for trial in 0..TRIALS {
+            let tag = {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&trial.to_le_bytes());
+                bytes
+            };
+            let path = build_mix_path_to_tag(&tag, &relays, &keys, &mut rng).unwrap();
+            assert_eq!(path.len(), MIX_PATH_HOPS, "the full relay pool is large enough that every trial should get a full-length path");
+            if path.iter().all(|&(_, peer, _)| colluding.contains(&peer)) {
+                fully_colluding_paths += 1;
+            }
+        }
+
+        // The true combinatorial rate (ignoring the deterministic final-hop
+        // pinning, which only makes a full-coalition path harder, never
+        // easier) is C(3,3)/C(7,3) = 1/35 ≈ 2.9%. Assert comfortably above
+        // that noise floor rather than pinning the exact figure — this is a
+        // regression guard against the selection becoming *biased* toward
+        // the same small subset, not a re-verification of the exact odds.
+        let rate = f64::from(fully_colluding_paths) / f64::from(TRIALS);
+        assert!(
+            rate < 0.15,
+            "a minority coalition of {COLLUDING_RELAYS}/{TOTAL_RELAYS} relays controlled every hop in {fully_colluding_paths}/{TRIALS} trials \
+             ({rate:.3}) — real routing should land far closer to the ~2.9% a fair random selection predicts"
+        );
+    }
 }

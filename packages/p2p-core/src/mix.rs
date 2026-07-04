@@ -458,4 +458,114 @@ mod tests {
         let faster = estimated_dummy_traffic_bytes_per_hour(std::time::Duration::from_secs(30));
         assert_eq!(faster, slower * 2);
     }
+
+    // Phase 8 hardening: the adversarial-collusion property. Two colluding
+    // relays occupy the *entry* and *exit* positions of a real 3-hop path,
+    // with a genuinely honest (non-colluding) relay in between — the
+    // minimum shape Loopix's own security argument depends on (a 2-hop
+    // path would let entry+exit collude trivially, since they're already
+    // adjacent). These tests prove, against the real Sphinx primitives
+    // this crate depends on (not by construction alone), that pooling
+    // everything the two colluding hops individually, legitimately observe
+    // — what they received, what they forwarded, whose address they were
+    // told to forward to — never reproduces the honest middle hop's own
+    // secret-dependent transformation, so the colluding pair cannot link
+    // entry to exit without it.
+    #[test]
+    fn colluding_entry_and_exit_hops_cannot_bridge_an_honest_middle_hop() {
+        let entry = generate_hop(1); // colluding
+        let middle = generate_hop(2); // honest — never shares anything
+        let exit = generate_hop(3); // colluding
+        let path: Vec<MixHop> = [&entry, &middle, &exit]
+            .iter()
+            .map(|h| MixHop { address: h.hop.address, public_key: h.hop.public_key })
+            .collect();
+
+        let payload = b"a real mailbox deposit's envelope bytes";
+        let packet_from_alice = build_packet(
+            payload,
+            &path,
+            DestinationAddressBytes::from_bytes([1u8; 32]),
+            [2u8; 16],
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let packet_from_alice_bytes = packet_from_alice.to_bytes();
+
+        // Entry hop's own observation: what it received from Alice, and
+        // what it forwards onward to the honest middle hop.
+        let after_entry = peel(packet_from_alice, &entry.secret).unwrap();
+        let PeelOutcome::Forward { next_hop_packet: forwarded_by_entry, next_hop_address, .. } = after_entry else {
+            panic!("the entry hop of a 3-hop path must be a Forward outcome");
+        };
+        assert_eq!(next_hop_address, middle.hop.address);
+        let forwarded_by_entry_bytes = forwarded_by_entry.to_bytes();
+
+        // The honest middle hop re-encrypts the layer entirely on its own,
+        // sharing nothing with either colluding party.
+        let after_middle = peel(forwarded_by_entry, &middle.secret).unwrap();
+        let PeelOutcome::Forward { next_hop_packet: received_by_exit, next_hop_address, .. } = after_middle else {
+            panic!("the middle hop of a 3-hop path must be a Forward outcome");
+        };
+        assert_eq!(next_hop_address, exit.hop.address);
+        let received_by_exit_bytes = received_by_exit.to_bytes();
+
+        // Exit hop's own observation: only what it received (already
+        // transformed once more by the honest middle hop) and the final
+        // plaintext.
+        let PeelOutcome::Final { payload: recovered, .. } = peel(received_by_exit, &exit.secret).unwrap() else {
+            panic!("the exit hop of a 3-hop path must be a Final outcome");
+        };
+        assert_eq!(&recovered[..payload.len()], payload);
+
+        // The colluding pair's pooled transcript: {what Alice sent the
+        // entry hop, what the entry hop forwarded} vs. {what the exit hop
+        // received}. If these ever coincided, the honest middle hop's own
+        // re-encryption would have added nothing, and the pair could
+        // trivially recognize each other's halves of the same packet
+        // without it.
+        assert_ne!(
+            forwarded_by_entry_bytes, received_by_exit_bytes,
+            "the honest middle hop's re-encryption must change the bytes on the wire, \
+             or the entry and exit hop could recognize the same packet passing through both of them"
+        );
+        assert_ne!(packet_from_alice_bytes, received_by_exit_bytes);
+        assert_ne!(packet_from_alice_bytes, forwarded_by_entry_bytes);
+
+        // The decisive check: the colluding pair's own two keys are not
+        // enough to bypass the honest hop. Neither can process what the
+        // *other* half of the path produced without the middle hop's
+        // secret — peeling with the wrong node's key must fail outright
+        // (a MAC/authentication failure in the underlying format), never
+        // silently succeed with a wrong-but-plausible result.
+        assert!(
+            peel(SphinxPacket::from_bytes(&forwarded_by_entry_bytes).unwrap(), &exit.secret).is_err(),
+            "the exit hop must not be able to peel what the entry hop forwarded, skipping the honest middle hop"
+        );
+        assert!(
+            peel(SphinxPacket::from_bytes(&received_by_exit_bytes).unwrap(), &entry.secret).is_err(),
+            "the entry hop must not be able to peel what the exit hop received, skipping the honest middle hop"
+        );
+    }
+
+    #[test]
+    fn peeling_with_the_wrong_nodes_secret_key_fails_rather_than_silently_producing_garbage() {
+        let real_hop = generate_hop(1);
+        let impostor = generate_hop(2);
+        let path = vec![MixHop { address: real_hop.hop.address, public_key: real_hop.hop.public_key }];
+
+        let packet = build_packet(
+            b"only real_hop should ever be able to read this",
+            &path,
+            DestinationAddressBytes::from_bytes([4u8; 32]),
+            [5u8; 16],
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+
+        // A relay that was never addressed by this packet's header (an
+        // eavesdropper, or a colluding relay hoping to shortcut past an
+        // honest one) must not be able to process it at all.
+        assert!(peel(packet, &impostor.secret).is_err());
+    }
 }
