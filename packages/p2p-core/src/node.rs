@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::avatar_pointer;
 use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse, MixMessage};
 use crate::bootstrap;
 use crate::command::Command;
@@ -256,6 +257,9 @@ struct Pending {
     /// `Command::ResolveContactCard` was given, so the answering event can
     /// echo it back to the caller.
     resolve_contact_card: HashMap<QueryId, Vec<u8>>,
+    announce_avatar_pointer: std::collections::HashSet<QueryId>,
+    /// Keyed by the same `owner` `Command::ResolveAvatarPointer` was given.
+    resolve_avatar_pointer: HashMap<QueryId, PeerId>,
 }
 
 /// One in-flight `spawn_blocking` nonce search — tagged with a generation
@@ -567,6 +571,8 @@ fn needs_dht_peer(command: &Command) -> bool {
             | Command::ResolveUsername { .. }
             | Command::AnnounceContactCard { .. }
             | Command::ResolveContactCard { .. }
+            | Command::AnnounceAvatarPointer { .. }
+            | Command::ResolveAvatarPointer { .. }
     )
 }
 
@@ -672,6 +678,20 @@ fn handle_command(
             let key = contact_card::record_key_for(&owner_identity_public_key);
             let query_id = swarm.behaviour_mut().kad.get_record(key);
             pending.resolve_contact_card.insert(query_id, owner_identity_public_key);
+        }
+
+        Command::AnnounceAvatarPointer { avatar_content_id } => {
+            let key = avatar_pointer::record_key_for(&local_peer_id);
+            let record = Record::new(key, avatar_content_id);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_avatar_pointer.insert(query_id);
+            }
+        }
+
+        Command::ResolveAvatarPointer { owner } => {
+            let key = avatar_pointer::record_key_for(&owner);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_avatar_pointer.insert(query_id, owner);
         }
 
         Command::SendMixPacket { first_hop, packet_bytes } => {
@@ -946,6 +966,8 @@ fn handle_kad_event(
                     owner_identity_public_key,
                     card: found.record.value,
                 });
+            } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerResolved { owner, avatar_content_id: found.record.value });
             }
         }
         QueryResult::GetRecord(Err(_)) => {
@@ -955,6 +977,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::UsernameResolutionFailed { username });
             } else if let Some(owner_identity_public_key) = pending.resolve_contact_card.remove(&id) {
                 let _ = events.send(P2pEvent::ContactCardResolutionFailed { owner_identity_public_key });
+            } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerResolutionFailed { owner });
             }
         }
         QueryResult::PutRecord(Ok(PutRecordOk { .. })) => {
@@ -964,6 +988,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::UsernameAnnounced { username });
             } else if pending.announce_contact_card.remove(&id) {
                 let _ = events.send(P2pEvent::ContactCardAnnounced);
+            } else if pending.announce_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerAnnounced);
             }
         }
         QueryResult::PutRecord(Err(err)) => {
@@ -976,6 +1002,8 @@ fn handle_kad_event(
                 });
             } else if pending.announce_contact_card.remove(&id) {
                 let _ = events.send(P2pEvent::ContactCardAnnouncementFailed { reason: err.to_string() });
+            } else if pending.announce_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerAnnouncementFailed { reason: err.to_string() });
             }
         }
         _ => {}

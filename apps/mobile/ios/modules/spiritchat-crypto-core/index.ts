@@ -26,6 +26,10 @@ export type P2pEvent =
   | { type: 'contactCardAnnouncementFailed'; reason: string }
   | { type: 'contactCardResolved'; ownerIdentityPublicKeyBase64: string; card: Uint8Array }
   | { type: 'contactCardResolutionFailed'; ownerIdentityPublicKeyBase64: string }
+  | { type: 'avatarPointerAnnounced' }
+  | { type: 'avatarPointerAnnouncementFailed'; reason: string }
+  | { type: 'avatarPointerResolved'; peerId: string; avatarContentId: Uint8Array }
+  | { type: 'avatarPointerResolutionFailed'; peerId: string }
   | { type: 'usernameResolved'; username: string; publicKeyBase64: string; fingerprint: string; peerId: string }
   | { type: 'usernameClaimInvalid'; username: string }
   | { type: 'usernameResolutionFailed'; username: string }
@@ -96,6 +100,8 @@ const NativeCryptoCore = requireNativeModule<
     blobReserve(idHex: string): boolean
     p2pFetchBlob(peerId: string, idHex: string): void
     p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void
+    p2pAnnounceAvatarPointer(avatarContentId: Uint8Array): void
+    p2pResolveAvatarPointer(peerId: string): void
     ledgerBuildUsernameClaim(username: string, anchorHeight: number, anchorBlockHash: Uint8Array, nonce: Uint8Array): Uint8Array
     p2pSubmitUsernameClaim(transactionBytes: Uint8Array): void
     p2pSubmitMinedBlock(blockBytes: Uint8Array): void
@@ -344,6 +350,27 @@ export function p2pFetchBlob(peerId: string, idHex: string): void {
  */
 export function p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void {
   NativeCryptoCore.p2pSetLocalBlobRaw(idHex, bytes)
+}
+
+/**
+ * Publishes this device's own current avatar content id into the public
+ * DHT, keyed by its own peer id — the pointer only, not the avatar bytes
+ * (those still need `p2pFetchBlob` over a live connection). Re-run
+ * periodically (DHT records expire) and whenever the avatar changes.
+ * Answered by `avatarPointerAnnounced`/`avatarPointerAnnouncementFailed`.
+ */
+export function p2pAnnounceAvatarPointer(avatarContentId: Uint8Array): void {
+  NativeCryptoCore.p2pAnnounceAvatarPointer(avatarContentId)
+}
+
+/**
+ * Looks up whatever avatar content id `peerId` currently has published in
+ * the DHT — lets a caller learn which id to `p2pFetchBlob` even while
+ * `peerId` is offline right now. Answered by `avatarPointerResolved`/
+ * `avatarPointerResolutionFailed`.
+ */
+export function p2pResolveAvatarPointer(peerId: string): void {
+  NativeCryptoCore.p2pResolveAvatarPointer(peerId)
 }
 
 export type UsernameLookup =

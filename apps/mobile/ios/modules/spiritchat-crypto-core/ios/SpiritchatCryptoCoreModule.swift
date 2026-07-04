@@ -312,6 +312,25 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().node.setLocalBlob(id: id, bytes: bytes)
     }
 
+    // Publishes this device's own current avatar content id into the
+    // public DHT, keyed by its own peer id — the pointer only, not the
+    // avatar bytes (those still need `p2pFetchBlob` over a live
+    // connection). `avatarContentId` is opaque bytes to this layer (see
+    // store/peerAvatars.ts for what it encodes). Answered by
+    // `avatarPointerAnnounced`/`avatarPointerAnnouncementFailed` on
+    // `onP2pEvent`.
+    Function("p2pAnnounceAvatarPointer") { (avatarContentId: Data) throws in
+      try requireP2pSession().node.announceAvatarPointer(avatarContentId: avatarContentId)
+    }
+
+    // Looks up whatever avatar content id `peerId` currently has published
+    // in the DHT — lets a caller learn which id to `p2pFetchBlob` even
+    // while `peerId` is offline right now. Answered by
+    // `avatarPointerResolved`/`avatarPointerResolutionFailed`.
+    Function("p2pResolveAvatarPointer") { (peerId: String) throws in
+      try requireP2pSession().node.resolveAvatarPointer(peerId: peerId)
+    }
+
     // Builds and signs a new @username ledger claim — pure (nothing sent
     // anywhere yet); pass the result to `p2pSubmitUsernameClaim`. Claim-
     // building lives in Rust (not hand-encoded here, unlike the old DHT

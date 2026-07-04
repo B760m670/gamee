@@ -170,6 +170,14 @@ final class P2pSession {
       ]
     case .contactCardResolutionFailed(let ownerIdentityPublicKey):
       return ["type": "contactCardResolutionFailed", "ownerIdentityPublicKeyBase64": ownerIdentityPublicKey.base64EncodedString()]
+    case .avatarPointerAnnounced:
+      return ["type": "avatarPointerAnnounced"]
+    case .avatarPointerAnnouncementFailed(let reason):
+      return ["type": "avatarPointerAnnouncementFailed", "reason": reason]
+    case .avatarPointerResolved(let peerId, let avatarContentId):
+      return ["type": "avatarPointerResolved", "peerId": peerId, "avatarContentId": avatarContentId]
+    case .avatarPointerResolutionFailed(let peerId):
+      return ["type": "avatarPointerResolutionFailed", "peerId": peerId]
     case .usernameResolved(let username, let claim):
       // Verify here, not in JS — the DHT is a public, untrusted store, so
       // an unverified claim must never reach the app as if it were

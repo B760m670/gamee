@@ -101,6 +101,26 @@ const P2P_RETRY_INTERVAL_MS = 1000
  * bounds how long `bootstrap` itself keeps polling for a first success. */
 const P2P_RETRY_ATTEMPTS = 30
 
+/** How often to re-publish this device's avatar pointer into the DHT so
+ * the record doesn't expire while the app stays open across a long
+ * session — mirrors the same "DHT records expire, re-announce
+ * periodically" reasoning already applied to contact cards/addresses. */
+const AVATAR_POINTER_REANNOUNCE_INTERVAL_MS = 30 * 60 * 1000
+
+/** Started once, after this store's first successful bootstrap — not
+ * per-account, since the interval callback reads whichever account is
+ * currently active via `get()` at fire time (see the module doc comment
+ * on `switchAccount`/`signOut` for why that's safe without restarting
+ * this timer on every account change). */
+let avatarPointerReannounceStarted = false
+function ensureAvatarPointerReannounceStarted(get: () => ProfileState) {
+  if (avatarPointerReannounceStarted) return
+  avatarPointerReannounceStarted = true
+  setInterval(() => {
+    if (get().isReady) publishOwnAvatarPointer(get().avatarId)
+  }, AVATAR_POINTER_REANNOUNCE_INTERVAL_MS)
+}
+
 export const useProfileStore = create<ProfileState>((set, get) => ({
   isReady:         false,
   fingerprint:     '',
@@ -157,6 +177,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     // store/peerAvatars.ts) — republished every launch since the P2P node
     // itself remembers nothing between runs, same reasoning as `blobReserve`.
     if (p2pReady) publishOwnAvatarPointer(avatarId)
+    ensureAvatarPointerReannounceStarted(get)
 
     set({
       isReady:         true,

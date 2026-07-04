@@ -86,6 +86,19 @@ pub enum P2pEvent {
     /// never announced one, or is offline and nothing replicated it yet.
     ContactCardResolutionFailed { owner_identity_public_key: Vec<u8> },
 
+    /// `Command::AnnounceAvatarPointer` finished publishing to the DHT (or
+    /// failed to reach the required quorum).
+    AvatarPointerAnnounced,
+    AvatarPointerAnnouncementFailed { reason: String },
+
+    /// A DHT lookup for `owner`'s avatar content id finished with a
+    /// currently-published one. Still needs an ordinary `FetchBlob` from
+    /// `owner` under `avatar_content_id` to get the actual image bytes.
+    AvatarPointerResolved { owner: PeerId, avatar_content_id: Vec<u8> },
+    /// Nobody has published an avatar pointer for `owner` right now (or
+    /// the lookup otherwise failed).
+    AvatarPointerResolutionFailed { owner: PeerId },
+
     /// This node was a Sphinx packet's final hop (see `mix.rs`) —
     /// `payload` is whatever bytes the original sender's `mix::build_packet`
     /// wrapped. This layer never interprets `payload` itself, the same way

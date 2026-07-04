@@ -75,6 +75,27 @@ pub enum Command {
     /// `P2pEvent::ContactCardResolved`/`ContactCardResolutionFailed`.
     ResolveContactCard { owner_identity_public_key: Vec<u8> },
 
+    /// Publishes this node's own current avatar *content id* (not the
+    /// image bytes — those still need `SetLocalBlob`/`FetchBlob`, since
+    /// they're genuinely content-addressed) into the public DHT, keyed by
+    /// this node's own `PeerId` (see `avatar_pointer::record_key_for`).
+    /// Lets a peer discover which content id to `FetchBlob` for even
+    /// before ever fetching it directly, and even while this node is
+    /// currently offline — though the content bytes themselves still need
+    /// a live connection either way. Re-run periodically (DHT records
+    /// expire) and whenever the avatar changes. Answered by
+    /// `P2pEvent::AvatarPointerAnnounced`/`AvatarPointerAnnouncementFailed`.
+    AnnounceAvatarPointer { avatar_content_id: Vec<u8> },
+
+    /// Looks up whatever avatar content id `owner` currently has
+    /// published. A resolved id still needs an ordinary `FetchBlob` from
+    /// `owner` to get the actual image bytes — this only answers *what*
+    /// to ask for, the same way `ResolveContactCard` only answers what a
+    /// mailbox deposit should be encrypted for, not whether the recipient
+    /// is reachable. Answered by
+    /// `P2pEvent::AvatarPointerResolved`/`AvatarPointerResolutionFailed`.
+    ResolveAvatarPointer { owner: PeerId },
+
     /// Sends an already-built Sphinx packet (`mix::build_packet`) to
     /// `first_hop`, the first node in whatever path the caller chose.
     /// Every hop after that is handled automatically by this crate's own

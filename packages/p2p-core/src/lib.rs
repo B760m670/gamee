@@ -18,6 +18,7 @@
 //! punching where possible (`dcutr`) — both are libp2p protocols any peer
 //! can run, not a role this project's infrastructure fills.
 
+mod avatar_pointer;
 mod behaviour;
 mod bootstrap;
 mod command;

@@ -29,6 +29,10 @@ pub enum FfiP2pEvent {
     ContactCardAnnouncementFailed { reason: String },
     ContactCardResolved { owner_identity_public_key: Vec<u8>, card: Vec<u8> },
     ContactCardResolutionFailed { owner_identity_public_key: Vec<u8> },
+    AvatarPointerAnnounced,
+    AvatarPointerAnnouncementFailed { reason: String },
+    AvatarPointerResolved { peer_id: String, avatar_content_id: Vec<u8> },
+    AvatarPointerResolutionFailed { peer_id: String },
     UsernameResolved { username: String, claim: Vec<u8> },
     UsernameResolutionFailed { username: String },
     UsernameAnnounced { username: String },
@@ -90,6 +94,16 @@ impl From<P2pEvent> for FfiP2pEvent {
             }
             P2pEvent::ContactCardResolutionFailed { owner_identity_public_key } => {
                 Self::ContactCardResolutionFailed { owner_identity_public_key }
+            }
+            P2pEvent::AvatarPointerAnnounced => Self::AvatarPointerAnnounced,
+            P2pEvent::AvatarPointerAnnouncementFailed { reason } => {
+                Self::AvatarPointerAnnouncementFailed { reason }
+            }
+            P2pEvent::AvatarPointerResolved { owner, avatar_content_id } => {
+                Self::AvatarPointerResolved { peer_id: owner.to_string(), avatar_content_id }
+            }
+            P2pEvent::AvatarPointerResolutionFailed { owner } => {
+                Self::AvatarPointerResolutionFailed { peer_id: owner.to_string() }
             }
             P2pEvent::UsernameResolved { username, claim } => {
                 Self::UsernameResolved { username, claim }
