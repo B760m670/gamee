@@ -5,6 +5,7 @@
 //! exactly what it does and doesn't buy.
 
 mod distribution;
+pub mod envelope;
 mod header;
 mod skipped;
 mod state;

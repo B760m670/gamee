@@ -17,6 +17,7 @@ mod p2p_node;
 mod prekeys;
 mod ratchet;
 mod recovery_phrase;
+mod sender_key;
 
 pub use agreement::FfiAgreementKey;
 pub use blob::blob_content_id;
@@ -30,5 +31,6 @@ pub use p2p_node::{p2p_peer_id_from_public_key, FfiP2pNode};
 pub use prekeys::FfiPrekeyStore;
 pub use ratchet::FfiRatchet;
 pub use recovery_phrase::FfiRecoveryPhrase;
+pub use sender_key::{FfiSenderKeyReceiverState, FfiSenderKeyState};
 
 uniffi::setup_scaffolding!();
