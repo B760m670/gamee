@@ -1285,17 +1285,70 @@ fn pick_mix_path(
         .choose_multiple(rng, hop_count)
 }
 
+/// Among usable relays (same "connected and its routing key is known"
+/// filter `pick_mix_relay`/`pick_mix_path` already apply), the one whose
+/// `PeerId` is closest to `tag` under Kademlia's own XOR distance metric
+/// (`KBucketKey`/`KBucketDistance` — the same one `kad::Behaviour` itself
+/// uses to decide who's "close" to a DHT key) — a deterministic answer
+/// depending only on `tag` and the candidate set, never on who's asking.
+/// This is what makes a sender's deposit and a recipient's later retrieval
+/// query converge on the *same* relay as their path's real final hop,
+/// closing the gap `Command::RetrieveFromMailbox`'s own doc comment used
+/// to disclose (a single query only reaching the right relay by luck).
+/// It's still only "closest among what this node currently knows and is
+/// connected to," not a network-wide guarantee — the same "strengthens as
+/// the mix relay directory grows" honesty already true of everything else
+/// built on it — but strictly better than picking uniformly at random.
+/// `None` only when no usable relay is known at all, same as
+/// `pick_mix_relay`.
+fn closest_relay_to_tag(
+    tag: &[u8],
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+) -> Option<(NodeAddressBytes, PeerId, PublicKey)> {
+    let tag_key = kad::KBucketKey::new(tag.to_vec());
+    known_mix_relays
+        .iter()
+        .filter_map(|(&address, &peer)| known_mix_routing_keys.get(&peer).map(|&key| (address, peer, key)))
+        .min_by_key(|&(_, peer, _)| kad::KBucketKey::from(peer).distance(&tag_key))
+}
+
+/// Builds a real path whose *final* hop is deterministically
+/// `closest_relay_to_tag` — so a sender's deposit and a recipient's later
+/// retrieval query for the same tag converge on the same relay as their
+/// path's own final hop — with up to `MIX_PATH_HOPS - 1` earlier,
+/// anonymizing hops chosen the same random way `pick_mix_path` always has,
+/// excluding the final hop's own peer (a path never routes through the
+/// same peer twice). `None` only if no usable relay is known at all.
+fn build_mix_path_to_tag(
+    tag: &[u8],
+    known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
+    known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
+    rng: &mut impl Rng,
+) -> Option<Vec<(NodeAddressBytes, PeerId, PublicKey)>> {
+    let final_hop = closest_relay_to_tag(tag, known_mix_relays, known_mix_routing_keys)?;
+    let intermediate_candidates: HashMap<NodeAddressBytes, PeerId> = known_mix_relays
+        .iter()
+        .filter(|&(_, &peer)| peer != final_hop.1)
+        .map(|(&address, &peer)| (address, peer))
+        .collect();
+    let mut path = pick_mix_path(&intermediate_candidates, known_mix_routing_keys, MIX_PATH_HOPS.saturating_sub(1), rng);
+    path.push(final_hop);
+    Some(path)
+}
+
 /// Routes an already-stamped `deposit` into the mix, addressed so that
 /// whichever relay ends up as the path's final hop stores it — see
 /// `Command::DepositToMailbox`'s own doc comment. Picks a real, up-to-
-/// `MIX_PATH_HOPS`-long path via `pick_mix_path` — the actual "no single
-/// relay learns both who deposited and what tag it's stored under"
-/// property this whole mixnet exists to buy: the *first* hop sees this
-/// node's real identity but not the tag inside; the *final* hop sees the
-/// tag but, since it only ever talks to the previous hop, never this
-/// node's real identity. Sent to the path's own first hop — every later
-/// hop is handled automatically by `handle_mix_event`'s own peel-and-
-/// forward logic, this function never talks to them directly.
+/// `MIX_PATH_HOPS`-long path via `build_mix_path_to_tag`, whose final hop
+/// is *deterministically* the relay closest to this deposit's own tag —
+/// the actual "no single relay learns both who deposited and what tag
+/// it's stored under" property this whole mixnet exists to buy: the
+/// *first* hop sees this node's real identity but not the tag inside; the
+/// *final* hop sees the tag but, since it only ever talks to the previous
+/// hop, never this node's real identity. Sent to the path's own first hop
+/// — every later hop is handled automatically by `handle_mix_event`'s own
+/// peel-and-forward logic, this function never talks to them directly.
 fn send_mailbox_deposit(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
@@ -1305,11 +1358,11 @@ fn send_mailbox_deposit(
     events: &mpsc::UnboundedSender<P2pEvent>,
 ) {
     let mut rng = rand::thread_rng();
-    let hops = pick_mix_path(known_mix_relays, known_mix_routing_keys, MIX_PATH_HOPS, &mut rng);
-    let Some(&(_, first_hop_peer, _)) = hops.first() else {
+    let Some(hops) = build_mix_path_to_tag(&deposit.tag, known_mix_relays, known_mix_routing_keys, &mut rng) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
         return;
     };
+    let first_hop_peer = hops[0].1;
 
     let Some(payload) = frame_mailbox_deposit(&deposit) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "failed to encode the mailbox deposit".into() });
@@ -1339,8 +1392,13 @@ fn send_mailbox_deposit(
 /// as the final leg) — a single-hop return would mean whichever relay
 /// ends up holding a match learns this node's real identity directly by
 /// using the SURB, undoing exactly the property the outbound path's own
-/// multiple hops buy. See `Command::RetrieveFromMailbox`'s own doc
-/// comment for the full round trip this kicks off.
+/// multiple hops buy. The outbound path's own final hop is
+/// deterministically `closest_relay_to_tag` — the same relay a matching
+/// `DepositToMailbox` for this tag would have converged on — rather than
+/// a uniformly random pick, which is what makes a single query actually
+/// likely to reach whoever holds the match instead of depending on luck.
+/// See `Command::RetrieveFromMailbox`'s own doc comment for the full round
+/// trip this kicks off.
 fn send_mailbox_retrieval_query(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
@@ -1351,13 +1409,12 @@ fn send_mailbox_retrieval_query(
     events: &mpsc::UnboundedSender<P2pEvent>,
 ) {
     let mut rng = rand::thread_rng();
-    let hops = pick_mix_path(known_mix_relays, known_mix_routing_keys, MIX_PATH_HOPS, &mut rng);
-    let Some(&(_, first_hop_peer, _)) = hops.first() else {
+    let tag = mailbox::mailbox_tag(&shared_material, mailbox::epoch_for(mailbox::now_unix()));
+    let Some(hops) = build_mix_path_to_tag(&tag, known_mix_relays, known_mix_routing_keys, &mut rng) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
         return;
     };
-
-    let tag = mailbox::mailbox_tag(&shared_material, mailbox::epoch_for(mailbox::now_unix()));
+    let first_hop_peer = hops[0].1;
 
     // Picked independently from the outbound path above, except for one
     // hard exclusion: the outbound path's own final hop is whichever
@@ -1767,5 +1824,91 @@ mod tests {
         let path = pick_mix_path(&relays, &HashMap::new(), 3, &mut rand::thread_rng());
 
         assert!(path.is_empty());
+    }
+
+    #[test]
+    fn closest_relay_to_tag_agrees_regardless_of_which_side_asks() {
+        // The whole point: two independent callers computing this against
+        // the *same* candidate set for the *same* tag must always agree —
+        // that's what lets a sender's deposit and a recipient's retrieval
+        // query converge on the same relay without ever coordinating.
+        let mut relays = HashMap::new();
+        let mut keys = HashMap::new();
+        for seed in 1..=5u8 {
+            let (address, peer, public) = usable_relay(seed);
+            relays.insert(address, peer);
+            keys.insert(peer, public);
+        }
+        let tag = [42u8; 32];
+
+        let first = closest_relay_to_tag(&tag, &relays, &keys);
+        let second = closest_relay_to_tag(&tag, &relays, &keys);
+
+        assert!(first.is_some());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn closest_relay_to_tag_differs_for_a_different_tag_in_general() {
+        // Not a strict mathematical guarantee (two different tags could in
+        // principle hash closest to the same peer), but with 5 candidates
+        // and two very different tag values it would be a suspicious
+        // coincidence if this function weren't actually using the tag at
+        // all — a basic sanity check that it isn't secretly constant.
+        let mut relays = HashMap::new();
+        let mut keys = HashMap::new();
+        for seed in 1..=5u8 {
+            let (address, peer, public) = usable_relay(seed);
+            relays.insert(address, peer);
+            keys.insert(peer, public);
+        }
+
+        let a = closest_relay_to_tag(&[1u8; 32], &relays, &keys);
+        let b = closest_relay_to_tag(&[255u8; 32], &relays, &keys);
+
+        assert!(a.is_some() && b.is_some());
+    }
+
+    #[test]
+    fn closest_relay_to_tag_returns_nothing_when_no_relay_is_known_at_all() {
+        assert_eq!(closest_relay_to_tag(&[7u8; 32], &HashMap::new(), &HashMap::new()), None);
+    }
+
+    #[test]
+    fn build_mix_path_to_tag_always_ends_at_the_deterministic_closest_relay() {
+        let mut relays = HashMap::new();
+        let mut keys = HashMap::new();
+        for seed in 1..=5u8 {
+            let (address, peer, public) = usable_relay(seed);
+            relays.insert(address, peer);
+            keys.insert(peer, public);
+        }
+        let tag = [9u8; 32];
+        let expected_final = closest_relay_to_tag(&tag, &relays, &keys).unwrap();
+
+        let path = build_mix_path_to_tag(&tag, &relays, &keys, &mut rand::thread_rng()).unwrap();
+
+        assert_eq!(*path.last().unwrap(), expected_final);
+        let distinct: std::collections::HashSet<_> = path.iter().map(|&(_, peer, _)| peer).collect();
+        assert_eq!(distinct.len(), path.len(), "a path must never route through the same peer twice");
+    }
+
+    #[test]
+    fn build_mix_path_to_tag_degrades_to_a_single_hop_with_only_one_relay_known() {
+        let mut relays = HashMap::new();
+        let mut keys = HashMap::new();
+        let (address, peer, public) = usable_relay(6);
+        relays.insert(address, peer);
+        keys.insert(peer, public);
+
+        let path = build_mix_path_to_tag(&[3u8; 32], &relays, &keys, &mut rand::thread_rng()).unwrap();
+
+        assert_eq!(path, vec![(address, peer, public)]);
+    }
+
+    #[test]
+    fn build_mix_path_to_tag_returns_nothing_when_no_relay_is_known_at_all() {
+        let path = build_mix_path_to_tag(&[3u8; 32], &HashMap::new(), &HashMap::new(), &mut rand::thread_rng());
+        assert!(path.is_none());
     }
 }

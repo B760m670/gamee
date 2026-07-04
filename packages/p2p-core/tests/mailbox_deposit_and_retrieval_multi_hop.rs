@@ -191,36 +191,27 @@ async fn alice_deposits_and_retrieves_through_a_real_multi_hop_mesh() {
 
     // Now Alice, acting as though she were the recipient (same
     // shared_material), retrieves it back through an independently
-    // multi-hop outbound query and SURB return leg. With 3 known relays
-    // and no deterministic, tag-keyed routing to the one actually holding
-    // it (see `Command::RetrieveFromMailbox`'s own doc comment — an
-    // honest, currently-real limitation), a *single* query only reaches
-    // the right relay roughly a third of the time; retrying on an
-    // ordinary schedule is exactly what `ChatManager`'s own periodic sweep
-    // already does, so this test does the same rather than asserting
-    // first-try success.
-    let mut retry_interval = tokio::time::interval(Duration::from_millis(1500));
+    // multi-hop outbound query and SURB return leg. The query's own
+    // outbound path picks its final hop deterministically (closest to the
+    // tag, same as the deposit above did) — so with all 3 relays already
+    // known to Alice, this should succeed on the very first attempt, no
+    // retry needed; a regression here would mean the deterministic
+    // routing fix stopped actually converging.
     alice.command(Command::RetrieveFromMailbox { shared_material: SHARED_MATERIAL.to_vec() }).unwrap();
 
-    let retrieved = tokio::time::timeout(Duration::from_secs(30), async {
+    let retrieved = tokio::time::timeout(WAIT_TIMEOUT, async {
         loop {
             tokio::select! {
                 Some(event) = alice.next_event() => {
                     match event {
                         P2pEvent::MailboxEnvelopeRetrieved { envelope } => return envelope,
-                        // Not a hard failure worth aborting the retry loop
-                        // over — just this attempt's random path coming up
-                        // short; the next tick tries again.
-                        P2pEvent::MixForwardFailed { .. } => {}
+                        P2pEvent::MixForwardFailed { reason } => panic!("alice's retrieval query failed to route: {reason}"),
                         _ => {}
                     }
                 }
                 Some(_) = bob.next_event() => {}
                 Some(_) = carol.next_event() => {}
                 Some(_) = dave.next_event() => {}
-                _ = retry_interval.tick() => {
-                    alice.command(Command::RetrieveFromMailbox { shared_material: SHARED_MATERIAL.to_vec() }).unwrap();
-                }
             }
         }
     })
