@@ -1,6 +1,12 @@
 import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
-import { chatCreateGroup, chatSendGroupMessage, type ChatEvent } from '../modules/spiritchat-crypto-core'
+import {
+  chatCreateGroup,
+  chatSendGroupMessage,
+  chatAddGroupMember,
+  chatRemoveGroupMember,
+  type ChatEvent,
+} from '../modules/spiritchat-crypto-core'
 import type { ChatMessage } from './chat'
 
 /**
@@ -39,6 +45,9 @@ interface GroupState {
   /** Every named member must already be an existing 1:1 contact — see `chatCreateGroup`'s own doc comment. Returns the new group's id, or `null` if `name`/`memberPeerIds` were empty. */
   createGroup: (name: string, memberPeerIds: string[]) => string | null
   sendMessage: (groupId: string, text: string) => void
+  /** `newMemberPeerId` must already be an existing 1:1 contact — see `chatAddGroupMember`'s own doc comment. */
+  addMember: (groupId: string, newMemberPeerId: string) => void
+  removeMember: (groupId: string, memberToRemove: string) => void
   handleChatEvent: (event: ChatEvent) => void
 }
 
@@ -91,10 +100,12 @@ export const useGroupStore = create<GroupState>((set, get) => ({
     return groupId
   },
 
-  // Best-effort, same as the native side (see chatSendGroupMessage's own
-  // doc comment) — renders immediately with `status: 'sent'` since
-  // there's no per-member delivery event to wait for, unlike
-  // store/chat.ts's `sendMessage`.
+  // Renders immediately with `status: 'sent'` — delivery is durable and
+  // retried on reconnect on the native side (see chatSendGroupMessage's
+  // own doc comment) the same way 1:1 messages are, but there's no
+  // single per-member delivery event to reflect back into one message's
+  // status the way store/chat.ts's `sendMessage` does, since one group
+  // message fans out to several members independently.
   sendMessage: (groupId, text) => {
     const trimmed = text.trim()
     if (!trimmed) return
@@ -105,6 +116,14 @@ export const useGroupStore = create<GroupState>((set, get) => ({
     const nextMessages = [...(get().messages[groupId] ?? []), message]
     set(state => ({ messages: { ...state.messages, [groupId]: nextMessages } }))
     persistGroupMessages(myFingerprint, groupId, nextMessages).catch(() => {})
+  },
+
+  addMember: (groupId, newMemberPeerId) => {
+    chatAddGroupMember(groupId, newMemberPeerId)
+  },
+
+  removeMember: (groupId, memberToRemove) => {
+    chatRemoveGroupMember(groupId, memberToRemove)
   },
 
   // Routes every `onChatEvent` from the native side (see app/_layout.tsx,
@@ -136,6 +155,24 @@ export const useGroupStore = create<GroupState>((set, get) => ({
       const nextMessages = [...(get().messages[event.groupId] ?? []), message]
       set(state => ({ messages: { ...state.messages, [event.groupId]: nextMessages } }))
       persistGroupMessages(myFingerprint, event.groupId, nextMessages).catch(() => {})
+      return
+    }
+
+    if (event.type === 'groupMemberAdded') {
+      const group = get().groups[event.groupId]
+      if (!group || group.members.includes(event.memberPeerId)) return
+      const nextGroups = { ...get().groups, [event.groupId]: { ...group, members: [...group.members, event.memberPeerId] } }
+      set({ groups: nextGroups })
+      persistGroups(myFingerprint, nextGroups).catch(() => {})
+      return
+    }
+
+    if (event.type === 'groupMemberRemoved') {
+      const group = get().groups[event.groupId]
+      if (!group) return
+      const nextGroups = { ...get().groups, [event.groupId]: { ...group, members: group.members.filter(m => m !== event.memberPeerId) } }
+      set({ groups: nextGroups })
+      persistGroups(myFingerprint, nextGroups).catch(() => {})
     }
   },
 }))

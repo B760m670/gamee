@@ -39,6 +39,14 @@ final class ChatManager {
     case fetchingCard
     case resolvingCardViaDht
     case sendingEnvelope
+    /// A group content envelope (see `GroupStore.OutboxItem`) is in
+    /// flight to this peer — shares this peer's single slot with
+    /// `sendingEnvelope` (never both at once) specifically because
+    /// `P2pEvent.EnvelopeDelivered`/`EnvelopeDeliveryFailed` only carry
+    /// `to: peerId`, not which envelope: at most one send may ever be
+    /// outstanding to a given peer at a time, group or 1:1, or a
+    /// delivery event could be attributed to the wrong one.
+    case sendingGroupEnvelope
   }
 
   /// The blob id this device's current contact card is registered under —
@@ -66,6 +74,8 @@ final class ChatManager {
   /// plaintext (see `groupControlAssociatedData`).
   private static let controlInviteTag: UInt8 = 0x01
   private static let controlDistributionTag: UInt8 = 0x02
+  private static let controlMemberAddedTag: UInt8 = 0x03
+  private static let controlMemberRemovedTag: UInt8 = 0x04
 
   /// Group control messages (an invite, or a member handing out their
   /// Sender Key chain — see `GroupStore`) travel through an *existing*
@@ -136,8 +146,11 @@ final class ChatManager {
 
     // Anything left over from a previous run (app killed mid-send, or the
     // recipient was offline) gets another chance now — the same dial/
-    // fetch/send path a brand new `sendMessage` call would go through.
-    for peerId in Set(ChatStore.loadOutbox(slot: slot).map(\.peerId)) {
+    // fetch/send path a brand new `sendMessage`/`sendGroupMessage` call
+    // would go through.
+    let pendingPeers = Set(ChatStore.loadOutbox(slot: slot).map(\.peerId))
+      .union(GroupStore.loadOutbox(slot: slot).map(\.memberPeerId))
+    for peerId in pendingPeers {
       attemptSend(peerId: peerId)
     }
 
@@ -221,13 +234,33 @@ final class ChatManager {
     try? ChatStore.saveOutbox(outbox, slot: slot)
   }
 
+  /// The oldest still-queued group envelope for `peerId` — same "one at
+  /// a time per peer" reasoning as `firstOutboxItem`, and sharing that
+  /// same peer's `peerStates` slot (see `PeerSendState.sendingGroupEnvelope`).
+  private func firstGroupOutboxItem(_ peerId: String) -> GroupStore.OutboxItem? {
+    GroupStore.loadOutbox(slot: slot).first(where: { $0.memberPeerId == peerId })
+  }
+
+  private func removeGroupOutboxItem(localId: String) {
+    var outbox = GroupStore.loadOutbox(slot: slot)
+    outbox.removeAll(where: { $0.localId == localId })
+    try? GroupStore.saveOutbox(outbox, slot: slot)
+  }
+
   /// Advances `peerId`'s outbox by exactly one step: dial if not
   /// connected, fetch a contact card if connected but no session exists
   /// yet, or encrypt-and-send if a session already exists. A no-op if
   /// nothing is queued for `peerId`, or a step is already outstanding
   /// (`peerStates`) — the event handlers below drive it forward from here.
+  /// Falls through to `attemptGroupDelivery` once the 1:1 outbox is empty
+  /// — a 1:1 message queued for `peerId` is always tried first, mirroring
+  /// how this method already prioritized itself over everything else
+  /// before group messages existed.
   private func attemptSend(peerId: String) {
-    guard let item = firstOutboxItem(peerId) else { return }
+    guard let item = firstOutboxItem(peerId) else {
+      attemptGroupDelivery(peerId: peerId)
+      return
+    }
 
     guard isConnected(peerId) else {
       guard beginState(.dialing, for: peerId) else { return }
@@ -246,6 +279,30 @@ final class ChatManager {
         endState(for: peerId)
         emit(failedEvent(item: item, reason: "\(error)"))
       }
+    }
+  }
+
+  /// The group-content counterpart of `attemptSend`'s dial/send steps —
+  /// no contact-card/X3DH step exists here, since a group member is
+  /// required to already have an established pairwise session (see the
+  /// "MARK: - Groups" doc comment). A no-op if nothing is queued for
+  /// `peerId`, or `peerId`'s single send slot is already taken (by a 1:1
+  /// send or an earlier group envelope).
+  private func attemptGroupDelivery(peerId: String) {
+    guard firstGroupOutboxItem(peerId) != nil else { return }
+
+    guard isConnected(peerId) else {
+      guard beginState(.dialing, for: peerId) else { return }
+      try? node.dial(peerId: peerId, knownAddresses: [])
+      return
+    }
+
+    guard let item = firstGroupOutboxItem(peerId), beginState(.sendingGroupEnvelope, for: peerId) else { return }
+    do {
+      try node.sendEnvelope(peerId: peerId, bytes: item.wireEnvelope)
+      // Stays `.sendingGroupEnvelope` until `envelopeDelivered`/`envelopeDeliveryFailed`.
+    } catch {
+      endState(for: peerId)
     }
   }
 
@@ -365,17 +422,24 @@ final class ChatManager {
   // itself, not here) proving *which* member actually sent it. See that
   // module's own doc comment for the scheme in full.
   //
-  // Deliberately v1-scoped: a group is created with a fixed initial
-  // member list (no add/remove afterward yet), and every member named at
-  // creation must already be an existing 1:1 contact (a group control
-  // message piggybacks on an *existing* pairwise ratchet session — it
-  // never triggers first-contact/X3DH establishment the way an ordinary
-  // `sendMessage` does). Both control-message delivery and group content
-  // fan-out are best-effort (direct send, falling back to a single
-  // mailbox deposit attempt) rather than the persistent retry queue
-  // 1:1 messages get — a member who's unreachable through both avenues
-  // simply won't have working group crypto until a later interaction
-  // gives another chance to catch up.
+  // Every member (named at creation, or added later via `addGroupMember`)
+  // must already be an existing 1:1 contact — a group control message
+  // piggybacks on an *existing* pairwise ratchet session, it never
+  // triggers first-contact/X3DH establishment the way an ordinary
+  // `sendMessage` does. Removing a member (`removeGroupMember`) rotates
+  // this device's own chain and every remaining member independently
+  // rotates its own too on hearing about it — forward secrecy against
+  // the removed member never depends on trusting whoever initiated the
+  // removal to have done it right.
+  //
+  // Group *content* gets the same durable, retried-on-reconnect delivery
+  // 1:1 messages do (`GroupStore.OutboxItem`, `attemptGroupDelivery`).
+  // Group *control* messages (invites, chain handouts, membership
+  // changes) remain best-effort (direct send, falling back to a single
+  // mailbox deposit attempt, no persistent queue of their own) — a member
+  // unreachable through both avenues at the moment one of these is sent
+  // simply misses it until a later interaction gives another chance to
+  // catch up.
 
   /// Creates a new group named `name` with `memberPeerIds` as its initial
   /// (non-self) members — every one of them must already have an
@@ -410,11 +474,12 @@ final class ChatManager {
   }
 
   /// Encrypts `plaintext` once under this device's own chain for `groupId`
-  /// and fans the same ciphertext out to every other member — returns a
-  /// local id (nothing currently tracks it against a delivery event, since
-  /// fan-out is best-effort; kept for symmetry with `sendMessage` and any
-  /// future UI that wants one). `nil` if this device isn't (or is no
-  /// longer) a member of `groupId`.
+  /// and queues the same ciphertext for delivery to every other member —
+  /// durable the instant this returns (one `GroupStore.OutboxItem` per
+  /// member, see `attemptGroupDelivery`), the same "queued before
+  /// anything is sent" guarantee `sendMessage` already gives 1:1 chats.
+  /// Returns a local id shared by every member's queued item; `nil` if
+  /// this device isn't (or is no longer) a member of `groupId`.
   @discardableResult
   func sendGroupMessage(groupId: String, plaintext: Data) -> String? {
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
@@ -428,37 +493,35 @@ final class ChatManager {
     session.ownSenderKeyStateBytes = ownState.toBytes()
     try? GroupStore.saveSession(session, slot: slot)
 
+    let localId = UUID().uuidString
     let wireEnvelope = Self.frameGroupMessage(groupId: groupIdBytes, signedEnvelope: signedEnvelope)
+    let createdAt = Date().timeIntervalSince1970
+    var outbox = GroupStore.loadOutbox(slot: slot)
     for member in session.members {
-      sendGroupContentBestEffort(peerId: member, wireEnvelope: wireEnvelope)
+      outbox.append(GroupStore.OutboxItem(localId: localId, groupId: groupId, memberPeerId: member, wireEnvelope: wireEnvelope, createdAt: createdAt))
     }
-    return UUID().uuidString
+    try? GroupStore.saveOutbox(outbox, slot: slot)
+
+    for member in session.members {
+      attemptSend(peerId: member)
+    }
+    return localId
   }
 
-  /// Delivers `wireEnvelope` to `peerId` right now if reachable, otherwise
-  /// falls back to a single mailbox deposit attempt using the *pairwise*
-  /// shared material already established with them (see
-  /// `mailboxSharedMaterial`) — reusing that same per-pair mailbox queue
-  /// for group content too, distinguished on retrieval purely by this
-  /// envelope's own leading tag byte, the same way every other kind of
-  /// envelope already is. Requires an existing pairwise session (to learn
-  /// `peerId`'s identity public key for the mailbox tag) — a group member
-  /// this device has literally never established one with can't be
-  /// reached this way, consistent with this section's own v1 scope.
-  private func sendGroupContentBestEffort(peerId: String, wireEnvelope: Data) {
-    if isConnected(peerId) {
-      do {
-        try node.sendEnvelope(peerId: peerId, bytes: wireEnvelope)
-        return
-      } catch {
-        // Fall through to the mailbox below.
-      }
-    }
-    guard let pairwiseSession = ChatStore.loadSession(slot: slot, peerId: peerId) else {
-      NSLog("[ChatManager] no pairwise session with group member \(peerId) — cannot deliver a group message to them right now")
+  /// Falls back here when a direct send to a group member couldn't be
+  /// delivered but a pairwise session with them exists — deposits the
+  /// same envelope into their mailbox queue (the same per-pair queue
+  /// `depositContinuing` already uses for 1:1 messages, distinguished on
+  /// retrieval purely by this envelope's own leading tag byte) instead of
+  /// giving up. The item stays queued either way (mirrors
+  /// `depositContinuing`'s own reasoning exactly): a future reconnect to
+  /// this member still retries a direct send too.
+  private func depositGroupItemToMailbox(_ item: GroupStore.OutboxItem) {
+    guard let pairwiseSession = ChatStore.loadSession(slot: slot, peerId: item.memberPeerId) else {
+      NSLog("[ChatManager] no pairwise session with group member \(item.memberPeerId) — cannot deliver a group message to them right now")
       return
     }
-    try? node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: pairwiseSession.peerPublicKey), envelope: wireEnvelope)
+    try? node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: pairwiseSession.peerPublicKey), envelope: item.wireEnvelope)
   }
 
   /// Encrypts `payload` (an invite or a member distribution) under the
@@ -508,6 +571,12 @@ final class ChatManager {
     case Self.controlDistributionTag:
       guard let (groupId, distribution) = Self.parseGroupMemberDistribution(body) else { return }
       handleGroupMemberDistribution(fromPeerId: fromPeerId, groupIdBytes: groupId, distributionBytes: distribution)
+    case Self.controlMemberAddedTag:
+      guard let (groupId, newMemberPeerId) = Self.parseGroupMembershipChange(body) else { return }
+      handleGroupMemberAdded(fromPeerId: fromPeerId, groupIdBytes: groupId, newMemberPeerId: newMemberPeerId)
+    case Self.controlMemberRemovedTag:
+      guard let (groupId, removedMemberPeerId) = Self.parseGroupMembershipChange(body) else { return }
+      handleGroupMemberRemoved(fromPeerId: fromPeerId, groupIdBytes: groupId, removedMemberPeerId: removedMemberPeerId)
     default:
       NSLog("[ChatManager] unrecognized group control message tag \(tag) from \(fromPeerId) — dropped")
     }
@@ -564,6 +633,110 @@ final class ChatManager {
     guard let receiverState = try? FfiSenderKeyReceiverState.fromDistributionBytes(bytes: distributionBytes) else { return }
     session.receiverStates[fromPeerId] = receiverState.toBytes()
     try? GroupStore.saveSession(session, slot: slot)
+  }
+
+  /// Adds `newMemberPeerId` (who must already be an existing 1:1 contact,
+  /// same requirement as `createGroup`) to `groupId`. Sends them an
+  /// ordinary group invite carrying the full, now-updated roster (so they
+  /// know to reach every other member too — no different from being
+  /// invited at creation time from their perspective), and tells every
+  /// other current member to also welcome the new one
+  /// (`handleGroupMemberAdded`). No chain rotation needed for an add: a
+  /// new member only ever receives each existing chain's *current*
+  /// position onward (see `SenderKeyState`'s own doc comment), so nothing
+  /// about the past is exposed by adding someone new.
+  func addGroupMember(groupId: String, newMemberPeerId: String) {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let myPeerId = try? node.localPeerId(),
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes),
+          !session.members.contains(newMemberPeerId)
+    else { return }
+
+    let previousMembers = session.members
+    session.members.append(newMemberPeerId)
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    emit(groupMemberAddedEvent(groupId: groupId, memberPeerId: newMemberPeerId))
+
+    let allMembers = previousMembers + [newMemberPeerId, myPeerId]
+    sendGroupControlMessageBestEffort(
+      peerId: newMemberPeerId,
+      payload: Self.frameGroupInvite(groupId: groupIdBytes, name: session.name, members: allMembers, distribution: ownState.toDistributionBytes())
+    )
+    for member in previousMembers {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMemberAdded(groupId: groupIdBytes, newMemberPeerId: newMemberPeerId))
+    }
+  }
+
+  /// `fromPeerId` (an existing member) reports that `newMemberPeerId` has
+  /// joined `groupId` — adds them locally and sends them this device's
+  /// own current chain directly, the same way any other member's
+  /// distribution already reaches a newly-invited member.
+  private func handleGroupMemberAdded(fromPeerId: String, groupIdBytes: Data, newMemberPeerId: String) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), !session.members.contains(newMemberPeerId),
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes)
+    else { return }
+    session.members.append(newMemberPeerId)
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    emit(groupMemberAddedEvent(groupId: groupId, memberPeerId: newMemberPeerId))
+    sendGroupControlMessageBestEffort(
+      peerId: newMemberPeerId,
+      payload: Self.frameGroupMemberDistribution(groupId: groupIdBytes, distribution: ownState.toDistributionBytes())
+    )
+  }
+
+  /// Removes `memberToRemove` from `groupId` and rotates this device's
+  /// own chain (a fresh `FfiSenderKeyState`, replacing the old one
+  /// outright) before redistributing it to whoever remains — the
+  /// removed member still holds the *old* chain key, and without
+  /// rotating, could keep ratcheting it forward on their own to decrypt
+  /// every future message despite no longer being sent anything directly.
+  /// Notifies every remaining member (`handleGroupMemberRemoved`), each of
+  /// which independently rotates its own chain the same way on receipt —
+  /// forward secrecy against the removed member must not depend on
+  /// trusting whoever initiated the removal to have done it right.
+  func removeGroupMember(groupId: String, memberToRemove: String) {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          session.members.contains(memberToRemove)
+    else { return }
+
+    session.members.removeAll { $0 == memberToRemove }
+    session.receiverStates.removeValue(forKey: memberToRemove)
+    let freshState = FfiSenderKeyState.generate()
+    session.ownSenderKeyStateBytes = freshState.toBytes()
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: memberToRemove))
+
+    let distribution = freshState.toDistributionBytes()
+    for member in session.members {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameGroupMemberDistribution(groupId: groupIdBytes, distribution: distribution))
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMemberRemoved(groupId: groupIdBytes, removedMemberPeerId: memberToRemove))
+    }
+  }
+
+  /// `fromPeerId` reports that `removedMemberPeerId` is no longer in
+  /// `groupId` — removes them locally and rotates this device's own
+  /// chain too, redistributing to whoever's left, mirroring
+  /// `removeGroupMember`'s own reasoning exactly (this device's forward
+  /// secrecy against the removed member doesn't depend on `fromPeerId`
+  /// having rotated correctly, only on this device doing its own part).
+  private func handleGroupMemberRemoved(fromPeerId: String, groupIdBytes: Data, removedMemberPeerId: String) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.members.contains(removedMemberPeerId) else { return }
+
+    session.members.removeAll { $0 == removedMemberPeerId }
+    session.receiverStates.removeValue(forKey: removedMemberPeerId)
+    let freshState = FfiSenderKeyState.generate()
+    session.ownSenderKeyStateBytes = freshState.toBytes()
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: removedMemberPeerId))
+
+    let distribution = freshState.toDistributionBytes()
+    for member in session.members {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameGroupMemberDistribution(groupId: groupIdBytes, distribution: distribution))
+    }
   }
 
   /// A group content envelope (`Self.groupMessageTag`) — arrived either
@@ -841,7 +1014,17 @@ final class ChatManager {
 
     case .dialFailed(let maybePeerId, let reason):
       guard let peerId = maybePeerId, state(for: peerId) == .dialing else { return }
-      guard let item = firstOutboxItem(peerId) else { endState(for: peerId); return }
+      guard let item = firstOutboxItem(peerId) else {
+        // No 1:1 item — this dial might have been for a queued group
+        // envelope instead (see `attemptGroupDelivery`).
+        if let groupItem = firstGroupOutboxItem(peerId) {
+          endState(for: peerId)
+          depositGroupItemToMailbox(groupItem)
+        } else {
+          endState(for: peerId)
+        }
+        return
+      }
       if let session = ChatStore.loadSession(slot: slot, peerId: peerId) {
         // An existing conversation — the peer just isn't reachable right
         // now. Deposit into the mailbox instead of giving up outright,
@@ -897,21 +1080,38 @@ final class ChatManager {
       onEnvelopeReceived(fromPeerId: fromPeerId, bytes: bytes)
 
     case .envelopeDelivered(let toPeerId):
-      guard state(for: toPeerId) == .sendingEnvelope else { return }
-      endState(for: toPeerId)
-      if let item = firstOutboxItem(toPeerId) {
-        removeOutboxItem(localId: item.localId)
-        emit(sentEvent(item: item))
+      switch state(for: toPeerId) {
+      case .sendingEnvelope:
+        endState(for: toPeerId)
+        if let item = firstOutboxItem(toPeerId) {
+          removeOutboxItem(localId: item.localId)
+          emit(sentEvent(item: item))
+        }
+        attemptSend(peerId: toPeerId)
+      case .sendingGroupEnvelope:
+        endState(for: toPeerId)
+        if let item = firstGroupOutboxItem(toPeerId) {
+          removeGroupOutboxItem(localId: item.localId)
+        }
+        attemptSend(peerId: toPeerId)
+      default:
+        return
       }
-      attemptSend(peerId: toPeerId)
 
     case .envelopeDeliveryFailed(let toPeerId, let reason):
-      guard state(for: toPeerId) == .sendingEnvelope else { return }
-      if let item = firstOutboxItem(toPeerId), let session = ChatStore.loadSession(slot: slot, peerId: toPeerId) {
-        depositContinuing(item: item, session: session)
-      } else {
-        endState(for: toPeerId)
-        if let item = firstOutboxItem(toPeerId) { emit(failedEvent(item: item, reason: reason)) }
+      switch state(for: toPeerId) {
+      case .sendingEnvelope:
+        if let item = firstOutboxItem(toPeerId), let session = ChatStore.loadSession(slot: slot, peerId: toPeerId) {
+          depositContinuing(item: item, session: session)
+        } else {
+          endState(for: toPeerId)
+          if let item = firstOutboxItem(toPeerId) { emit(failedEvent(item: item, reason: reason)) }
+        }
+      case .sendingGroupEnvelope:
+        defer { endState(for: toPeerId) }
+        if let item = firstGroupOutboxItem(toPeerId) { depositGroupItemToMailbox(item) }
+      default:
+        return
       }
 
     case .mailboxEnvelopeRetrieved(let envelope):
@@ -1023,6 +1223,37 @@ final class ChatManager {
     return (Data(body.prefix(16)), Data(body.dropFirst(16)))
   }
 
+  /// `[controlMemberAddedTag/controlMemberRemovedTag][groupId: 16 bytes]
+  /// [1-byte peer id length][peer id]` — shared framing for both "someone
+  /// joined" and "someone left" notifications, since both only ever name
+  /// one other member.
+  private static func frameGroupMembershipChange(tag: UInt8, groupId: Data, memberPeerId: String) -> Data {
+    var out = Data([tag])
+    out.append(groupId)
+    let memberBytes = Data(memberPeerId.utf8.prefix(255))
+    out.append(UInt8(memberBytes.count))
+    out.append(memberBytes)
+    return out
+  }
+
+  private static func frameMemberAdded(groupId: Data, newMemberPeerId: String) -> Data {
+    frameGroupMembershipChange(tag: controlMemberAddedTag, groupId: groupId, memberPeerId: newMemberPeerId)
+  }
+
+  private static func frameMemberRemoved(groupId: Data, removedMemberPeerId: String) -> Data {
+    frameGroupMembershipChange(tag: controlMemberRemovedTag, groupId: groupId, memberPeerId: removedMemberPeerId)
+  }
+
+  private static func parseGroupMembershipChange(_ body: Data) -> (groupId: Data, memberPeerId: String)? {
+    guard body.count >= 16 else { return nil }
+    let groupId = Data(body.prefix(16))
+    let rest = body.dropFirst(16)
+    guard let length = rest.first else { return nil }
+    let peerIdBytes = rest.dropFirst()
+    guard peerIdBytes.count == Int(length), let memberPeerId = String(data: Data(peerIdBytes), encoding: .utf8) else { return nil }
+    return (groupId, memberPeerId)
+  }
+
   private static func hexString(_ data: Data) -> String {
     data.map { String(format: "%02x", $0) }.joined()
   }
@@ -1073,5 +1304,13 @@ final class ChatManager {
       "plaintext": String(data: plaintext, encoding: .utf8) ?? "",
       "at": Date().timeIntervalSince1970,
     ]
+  }
+
+  private func groupMemberAddedEvent(groupId: String, memberPeerId: String) -> [String: Any?] {
+    ["type": "groupMemberAdded", "groupId": groupId, "memberPeerId": memberPeerId]
+  }
+
+  private func groupMemberRemovedEvent(groupId: String, memberPeerId: String) -> [String: Any?] {
+    ["type": "groupMemberRemoved", "groupId": groupId, "memberPeerId": memberPeerId]
   }
 }

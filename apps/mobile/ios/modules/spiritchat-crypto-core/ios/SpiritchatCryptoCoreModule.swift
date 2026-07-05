@@ -464,12 +464,11 @@ public class SpiritchatCryptoCoreModule: Module {
       return groupId
     }
 
-    // Encrypts `plaintext` once (Sender Keys) and fans it out to every
-    // other member of `groupId` — best-effort per member (direct send,
-    // falling back to a single mailbox deposit attempt), not the
-    // persistent retry queue `chatSendMessage` gets. Returns a local id;
-    // throws if this device isn't a member of `groupId` or its plaintext
-    // isn't valid UTF-8.
+    // Encrypts `plaintext` once (Sender Keys) and queues it for delivery
+    // to every other member of `groupId` — durable and retried on
+    // reconnect the same way `chatSendMessage` already is. Returns a
+    // local id; throws if this device isn't a member of `groupId` or its
+    // plaintext isn't valid UTF-8.
     Function("chatSendGroupMessage") { (groupId: String, plaintext: String) throws -> String in
       guard let plaintextBytes = plaintext.data(using: .utf8) else {
         throw ChatError.malformedPlaintext
@@ -478,6 +477,22 @@ public class SpiritchatCryptoCoreModule: Module {
         throw IdentitySessionError.notYetInitialized
       }
       return localId
+    }
+
+    // Adds `newMemberPeerId` (who must already be an existing 1:1
+    // contact) to `groupId`. `groupMemberAdded` on `onChatEvent` confirms
+    // it locally; the new member gets a `groupInvited` once their own
+    // invite arrives.
+    Function("chatAddGroupMember") { (groupId: String, newMemberPeerId: String) throws in
+      try requireP2pSession().chatManager.addGroupMember(groupId: groupId, newMemberPeerId: newMemberPeerId)
+    }
+
+    // Removes `memberToRemove` from `groupId` and rotates this device's
+    // own Sender Key chain (every remaining member does the same
+    // independently) so the removed member can't decrypt anything sent
+    // afterward. `groupMemberRemoved` on `onChatEvent` confirms it locally.
+    Function("chatRemoveGroupMember") { (groupId: String, memberToRemove: String) throws in
+      try requireP2pSession().chatManager.removeGroupMember(groupId: groupId, memberToRemove: memberToRemove)
     }
   }
 }

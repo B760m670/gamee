@@ -38,14 +38,14 @@ export default function GroupChatScreen() {
             <Ionicons name="chevron-back" size={22} color="#fff" />
           </GlassView>
         </Pressable>
-        <View style={s.headerCenter}>
+        <Pressable style={s.headerCenter} onPress={() => router.push({ pathname: '/group/[groupId]/members', params: { groupId } })}>
           <Text style={s.headerTitle} numberOfLines={1}>{group?.name ?? 'Группа'}</Text>
           {group ? (
             <Text style={s.headerSubtitle} numberOfLines={1}>
               {group.members.length + 1} участник{group.members.length === 0 ? '' : 'ов'}
             </Text>
           ) : null}
-        </View>
+        </Pressable>
         <View style={s.headerRight} />
       </View>
 

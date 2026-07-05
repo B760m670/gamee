@@ -67,6 +67,8 @@ export type ChatEvent =
   | { type: 'messageFailed'; peerId: string; localId: string; reason: string }
   | { type: 'groupInvited'; groupId: string; name: string; members: string[] }
   | { type: 'groupMessageReceived'; groupId: string; senderPeerId: string; plaintext: string; at: number }
+  | { type: 'groupMemberAdded'; groupId: string; memberPeerId: string }
+  | { type: 'groupMemberRemoved'; groupId: string; memberPeerId: string }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -118,6 +120,8 @@ const NativeCryptoCore = requireNativeModule<
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
     chatCreateGroup(name: string, memberPeerIds: string[]): string
     chatSendGroupMessage(groupId: string, plaintext: string): string
+    chatAddGroupMember(groupId: string, newMemberPeerId: string): void
+    chatRemoveGroupMember(groupId: string, memberToRemove: string): void
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -725,11 +729,10 @@ export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, pla
 
 /**
  * Creates a group named `name` with `memberPeerIds` as its initial
- * members. Every member must already be an existing 1:1 contact (a group
- * invite piggybacks on an *existing* pairwise session — it never triggers
- * first-contact/X3DH establishment the way `chatSendMessage` does); groups
- * can't yet have members added or removed after creation. Returns the new
- * group's id.
+ * members. Every member (here, or added later via `chatAddGroupMember`)
+ * must already be an existing 1:1 contact (a group invite piggybacks on
+ * an *existing* pairwise session — it never triggers first-contact/X3DH
+ * establishment the way `chatSendMessage` does). Returns the new group's id.
  */
 export function chatCreateGroup(name: string, memberPeerIds: string[]): string {
   return NativeCryptoCore.chatCreateGroup(name, memberPeerIds)
@@ -737,14 +740,30 @@ export function chatCreateGroup(name: string, memberPeerIds: string[]): string {
 
 /**
  * Encrypts `plaintext` once (Sender Keys — see
- * `spiritchat_crypto_core::sender_key`) and fans it out to every other
- * member of `groupId`. Delivery is best-effort per member (direct send,
- * falling back to a single mailbox deposit attempt) rather than
- * `chatSendMessage`'s persistent retry queue — a member unreachable
- * through both avenues simply misses this message. Returns a local id.
+ * `spiritchat_crypto_core::sender_key`) and queues it for delivery to
+ * every other member of `groupId` — durable and retried on reconnect the
+ * same way `chatSendMessage` already is. Returns a local id.
  */
 export function chatSendGroupMessage(groupId: string, plaintext: string): string {
   return NativeCryptoCore.chatSendGroupMessage(groupId, plaintext)
+}
+
+/**
+ * Adds `newMemberPeerId` (who must already be an existing 1:1 contact) to
+ * `groupId`. `groupMemberAdded` on `onChatEvent` confirms it locally.
+ */
+export function chatAddGroupMember(groupId: string, newMemberPeerId: string): void {
+  NativeCryptoCore.chatAddGroupMember(groupId, newMemberPeerId)
+}
+
+/**
+ * Removes `memberToRemove` from `groupId` and rotates this device's own
+ * Sender Key chain (every remaining member does the same independently)
+ * so the removed member can't decrypt anything sent afterward.
+ * `groupMemberRemoved` on `onChatEvent` confirms it locally.
+ */
+export function chatRemoveGroupMember(groupId: string, memberToRemove: string): void {
+  NativeCryptoCore.chatRemoveGroupMember(groupId, memberToRemove)
 }
 
 /** Subscribes to decrypted/queued-message events. Returns an unsubscribe function. */
