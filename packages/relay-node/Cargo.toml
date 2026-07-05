@@ -1,0 +1,14 @@
+[package]
+name = "spiritchat-relay-node"
+version = "0.1.0"
+edition = "2021"
+description = "A headless SpiritChat peer for always-on machines: the exact same node every phone runs, kept online so the network always has at least one reachable mix relay and mailbox cache. Sees only Sphinx layers and opaque tags, like any other hop — running one is a favor to the network's availability, not a position of trust."
+
+[[bin]]
+name = "spiritchat-relay"
+path = "src/main.rs"
+
+[dependencies]
+spiritchat-p2p-core = { path = "../p2p-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+rand = "0.8"
