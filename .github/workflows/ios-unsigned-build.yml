@@ -25,6 +25,7 @@ on:
       - 'packages/crypto-core/**'
       - 'packages/crypto-core-ffi/**'
       - 'packages/p2p-core/**'
+      - 'packages/ledger-core/**'
       - '.github/workflows/ios-unsigned-build.yml'
   workflow_dispatch:
 
