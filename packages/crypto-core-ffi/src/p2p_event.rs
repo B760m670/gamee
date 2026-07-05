@@ -33,6 +33,10 @@ pub enum FfiP2pEvent {
     AvatarPointerAnnouncementFailed { reason: String },
     AvatarPointerResolved { peer_id: String, avatar_content_id: Vec<u8> },
     AvatarPointerResolutionFailed { peer_id: String },
+    RecoveryBackupAnnounced,
+    RecoveryBackupAnnouncementFailed { reason: String },
+    RecoveryBackupResolved { owner_identity_public_key: Vec<u8>, backup: Vec<u8> },
+    RecoveryBackupResolutionFailed { owner_identity_public_key: Vec<u8> },
     UsernameResolved { username: String, claim: Vec<u8> },
     UsernameResolutionFailed { username: String },
     UsernameAnnounced { username: String },
@@ -104,6 +108,16 @@ impl From<P2pEvent> for FfiP2pEvent {
             }
             P2pEvent::AvatarPointerResolved { owner, avatar_content_id } => {
                 Self::AvatarPointerResolved { peer_id: owner.to_string(), avatar_content_id }
+            }
+            P2pEvent::RecoveryBackupAnnounced => Self::RecoveryBackupAnnounced,
+            P2pEvent::RecoveryBackupAnnouncementFailed { reason } => {
+                Self::RecoveryBackupAnnouncementFailed { reason }
+            }
+            P2pEvent::RecoveryBackupResolved { owner_identity_public_key, backup } => {
+                Self::RecoveryBackupResolved { owner_identity_public_key, backup }
+            }
+            P2pEvent::RecoveryBackupResolutionFailed { owner_identity_public_key } => {
+                Self::RecoveryBackupResolutionFailed { owner_identity_public_key }
             }
             P2pEvent::AvatarPointerResolutionFailed { owner } => {
                 Self::AvatarPointerResolutionFailed { peer_id: owner.to_string() }

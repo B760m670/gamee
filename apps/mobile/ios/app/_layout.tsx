@@ -14,7 +14,7 @@ import {
   addChatEventListener,
   requestLedgerChainSync,
 } from '../modules/spiritchat-crypto-core'
-import { useProfileStore } from '../store/profile'
+import { useProfileStore, handleRecoveryBackupEvent } from '../store/profile'
 import { useChatStore } from '../store/chat'
 import { useGroupStore } from '../store/groups'
 import { useContactsStore } from '../store/contacts'
@@ -147,6 +147,7 @@ export default function RootLayout() {
       }
 
       handlePeerAvatarEvent(event)
+      handleRecoveryBackupEvent(event)
     })
     return unsubscribe
   }, [])

@@ -32,6 +32,7 @@ mod mailbox_dht;
 mod mix;
 mod node;
 mod public_relay;
+mod recovery_backup;
 mod rendezvous;
 mod username;
 

@@ -6,6 +6,7 @@
 //! apps never re-implement (or subtly diverge on) the handshake or ratchet.
 
 mod agreement;
+mod backup;
 mod blob;
 mod contact_card;
 mod error;

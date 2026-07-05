@@ -321,6 +321,38 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().node.setLocalBlob(id: id, bytes: bytes)
     }
 
+    // Encrypts `json` (the active account's profile/contacts snapshot,
+    // assembled in JS — see store/profile.ts) under a key only this
+    // account's recovery-phrase holder can derive, and publishes the
+    // ciphertext into the public DHT keyed by the identity public key.
+    // What makes "restore from phrase" bring the account's *data* back,
+    // not just its keys — with no server holding anything readable.
+    // Re-run periodically and on every profile/contacts change. Answered
+    // by `recoveryBackupAnnounced`/`recoveryBackupAnnouncementFailed` on
+    // `onP2pEvent`.
+    Function("recoveryBackupPublish") { (json: String) throws in
+      let identity = try requireIdentity()
+      let ciphertext = try recoveryBackupEncrypt(
+        identitySeed: identity.identity.secretBytes(),
+        plaintext: Data(json.utf8)
+      )
+      try requireP2pSession().node.announceRecoveryBackup(
+        ownerIdentityPublicKey: identity.publicKeyBytes,
+        backup: ciphertext
+      )
+    }
+
+    // Asks the DHT for this account's own published recovery backup —
+    // what a fresh install runs right after restoring from a phrase. The
+    // event pump decrypts a found record natively and delivers it to JS
+    // as `recoveryBackupRestored` (already-decrypted JSON); a record that
+    // doesn't authenticate under this account's key surfaces as
+    // `recoveryBackupResolutionFailed`, same as none existing.
+    Function("recoveryBackupRequest") { () throws in
+      let identity = try requireIdentity()
+      try requireP2pSession().node.resolveRecoveryBackup(ownerIdentityPublicKey: identity.publicKeyBytes)
+    }
+
     // Publishes this device's own current avatar content id into the
     // public DHT, keyed by its own peer id — the pointer only, not the
     // avatar bytes (those still need `p2pFetchBlob` over a live
@@ -523,6 +555,19 @@ public class SpiritchatCryptoCoreModule: Module {
           session.recordListenAddress(address)
         }
         var encoded = P2pSession.encode(event)
+        if case .recoveryBackupResolved(_, let backup) = event {
+          // Decrypt natively — JS should only ever see the plaintext
+          // snapshot (or a clean failure), never ciphertext + key
+          // material. A record that doesn't authenticate under this
+          // account's key is someone else's or tampered: exactly
+          // equivalent to no backup existing.
+          if let plaintext = try? recoveryBackupDecrypt(identitySeed: session.identitySeed, backupBytes: backup),
+             let json = String(data: plaintext, encoding: .utf8) {
+            encoded = ["type": "recoveryBackupRestored", "json": json]
+          } else {
+            encoded = ["type": "recoveryBackupResolutionFailed"]
+          }
+        }
         encoded["slot"] = session.slot
         encoded["selfFingerprint"] = session.selfFingerprint
         self.sendEvent("onP2pEvent", encoded)

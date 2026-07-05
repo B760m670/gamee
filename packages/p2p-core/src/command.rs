@@ -75,6 +75,27 @@ pub enum Command {
     /// `P2pEvent::ContactCardResolved`/`ContactCardResolutionFailed`.
     ResolveContactCard { owner_identity_public_key: Vec<u8> },
 
+    /// Publishes this account's encrypted recovery backup into the public
+    /// DHT, keyed by `owner_identity_public_key` (see
+    /// `recovery_backup::record_key_for`). `backup` is opaque ciphertext
+    /// to this crate — encrypted by `spiritchat_crypto_core::backup` under
+    /// a key only the recovery-phrase holder can derive, so every DHT node
+    /// that stores or replicates it learns nothing. Re-run periodically
+    /// (DHT records expire) and whenever the backed-up data changes.
+    /// Answered by `P2pEvent::RecoveryBackupAnnounced`/
+    /// `RecoveryBackupAnnouncementFailed`.
+    AnnounceRecoveryBackup { owner_identity_public_key: Vec<u8>, backup: Vec<u8> },
+
+    /// Looks up whatever recovery backup is currently published for
+    /// `owner_identity_public_key` — what a fresh install runs right after
+    /// restoring an identity from its phrase, so profile/contacts come
+    /// back from the network instead of starting empty. Answered by
+    /// `P2pEvent::RecoveryBackupResolved`/`RecoveryBackupResolutionFailed`;
+    /// a record that fails to decrypt on the caller's side is treated the
+    /// same as no record (the DHT is a public, writable store — only the
+    /// AEAD tag decides what's really ours).
+    ResolveRecoveryBackup { owner_identity_public_key: Vec<u8> },
+
     /// Publishes this node's own current avatar *content id* (not the
     /// image bytes — those still need `SetLocalBlob`/`FetchBlob`, since
     /// they're genuinely content-addressed) into the public DHT, keyed by

@@ -41,6 +41,11 @@ final class P2pSession {
   /// This node's own PeerId — cached at spawn so `interconnect()` never
   /// needs a throwing FFI call mid-walk.
   let peerId: String
+  /// This account's 32-byte identity seed — what decrypts a recovery
+  /// backup fetched from the DHT (see the pump in
+  /// SpiritchatCryptoCoreModule). Exactly as sensitive as the Keychain
+  /// item it was read from; never crosses the JS bridge.
+  let identitySeed: Data
   let node: FfiP2pNode
   /// Owns end-to-end-encrypted messaging for this session — created fresh
   /// alongside `node` so it's always torn down and rebuilt together with
@@ -55,10 +60,11 @@ final class P2pSession {
   private var pumpClaimed = false
   private var listenAddresses: [String] = []
 
-  private init(slot: Int, selfFingerprint: String, peerId: String, node: FfiP2pNode, chatManager: ChatManager) {
+  private init(slot: Int, selfFingerprint: String, peerId: String, identitySeed: Data, node: FfiP2pNode, chatManager: ChatManager) {
     self.slot = slot
     self.selfFingerprint = selfFingerprint
     self.peerId = peerId
+    self.identitySeed = identitySeed
     self.node = node
     self.chatManager = chatManager
   }
@@ -185,6 +191,7 @@ final class P2pSession {
         slot: slot,
         selfFingerprint: identitySession.fingerprint,
         peerId: node.localPeerId(),
+        identitySeed: identitySession.identity.secretBytes(),
         node: node,
         chatManager: chatManager
       )
@@ -314,6 +321,21 @@ final class P2pSession {
       return ["type": "avatarPointerResolved", "peerId": peerId, "avatarContentId": avatarContentId]
     case .avatarPointerResolutionFailed(let peerId):
       return ["type": "avatarPointerResolutionFailed", "peerId": peerId]
+    case .recoveryBackupAnnounced:
+      return ["type": "recoveryBackupAnnounced"]
+    case .recoveryBackupAnnouncementFailed(let reason):
+      return ["type": "recoveryBackupAnnouncementFailed", "reason": reason]
+    case .recoveryBackupResolved(let ownerIdentityPublicKey, let backup):
+      // Normally intercepted (and decrypted) by the module's event pump
+      // before it ever reaches this generic encoder — kept here so the
+      // switch stays exhaustive and a stray event still crosses safely.
+      return [
+        "type": "recoveryBackupResolved",
+        "ownerIdentityPublicKeyBase64": ownerIdentityPublicKey.base64EncodedString(),
+        "backup": backup,
+      ]
+    case .recoveryBackupResolutionFailed(let ownerIdentityPublicKey):
+      return ["type": "recoveryBackupResolutionFailed", "ownerIdentityPublicKeyBase64": ownerIdentityPublicKey.base64EncodedString()]
     case .usernameResolved(let username, let claim):
       // Verify here, not in JS — the DHT is a public, untrusted store, so
       // an unverified claim must never reach the app as if it were

@@ -1,6 +1,10 @@
 import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import type { PeerInfo } from './chat'
+// Deferred-at-call-time import — profile.ts also imports this store, and
+// the cycle is safe precisely because neither touches the other during
+// module initialization.
+import { scheduleRecoveryBackupPublish } from './profile'
 
 /**
  * A saved contact — everything needed to open a chat with them later
@@ -56,6 +60,7 @@ export const useContactsStore = create<ContactsState>((set, get) => ({
     }
     set({ contacts: next })
     persistContacts(myFingerprint, next).catch(() => {})
+    scheduleRecoveryBackupPublish()
   },
 
   removeContact: (peerId) => {
@@ -65,5 +70,6 @@ export const useContactsStore = create<ContactsState>((set, get) => ({
     delete next[peerId]
     set({ contacts: next })
     persistContacts(myFingerprint, next).catch(() => {})
+    scheduleRecoveryBackupPublish()
   },
 }))

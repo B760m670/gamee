@@ -124,6 +124,15 @@ pub enum P2pEvent {
     /// for the ledger and the mailbox cache, would want to count).
     MixRelayDiscovered { peer: PeerId },
 
+    RecoveryBackupAnnounced,
+    RecoveryBackupAnnouncementFailed { reason: String },
+
+    /// A published recovery backup exists for this identity — `backup` is
+    /// still ciphertext at this layer; the caller decrypts it (or discards
+    /// it as not-ours if decryption fails).
+    RecoveryBackupResolved { owner_identity_public_key: Vec<u8>, backup: Vec<u8> },
+    RecoveryBackupResolutionFailed { owner_identity_public_key: Vec<u8> },
+
     /// This node's `Command::AnnouncePublicRelay` provider record reached
     /// the DHT — other nodes' `DiscoverPublicRelays` can now find it.
     PublicRelayAnnounced,

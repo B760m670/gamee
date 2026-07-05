@@ -68,6 +68,14 @@ export type P2pEvent = EventOrigin & (
   | { type: 'publicRelayDiscovered'; peerId: string }
   | { type: 'mailboxDepositStored' }
   | { type: 'mailboxEnvelopeRetrieved'; envelope: Uint8Array }
+  | { type: 'recoveryBackupAnnounced' }
+  | { type: 'recoveryBackupAnnouncementFailed'; reason: string }
+  // Raw form — normally never reaches JS: the native pump decrypts it
+  // and delivers `recoveryBackupRestored` instead.
+  | { type: 'recoveryBackupResolved'; ownerIdentityPublicKeyBase64: string; backup: Uint8Array }
+  | { type: 'recoveryBackupResolutionFailed'; ownerIdentityPublicKeyBase64?: string }
+  /** A found backup, already decrypted natively — `json` is the snapshot `recoveryBackupPublish` was given. */
+  | { type: 'recoveryBackupRestored'; json: string }
 )
 
 /**
@@ -94,6 +102,8 @@ type NativeEvents = {
 const NativeCryptoCore = requireNativeModule<
   {
     hasIdentity(): boolean
+    recoveryBackupPublish(json: string): void
+    recoveryBackupRequest(): void
     generateRecoveryPhrase(): string
     setIdentityFromWords(words: string): string
     recoveryPhraseWords(): string | null
@@ -386,6 +396,29 @@ export function p2pFetchBlob(peerId: string, idHex: string): void {
  */
 export function p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void {
   NativeCryptoCore.p2pSetLocalBlobRaw(idHex, bytes)
+}
+
+/**
+ * Encrypts `json` (the active account's profile/contacts snapshot) under
+ * a key only this account's recovery-phrase holder can derive, and
+ * publishes the ciphertext into the public DHT. What makes restoring
+ * from a phrase bring the account's data back — no server ever holds
+ * anything readable. Re-run periodically and on every profile/contacts
+ * change. Answered by `recoveryBackupAnnounced`/
+ * `recoveryBackupAnnouncementFailed` on `onP2pEvent`.
+ */
+export function recoveryBackupPublish(json: string): void {
+  NativeCryptoCore.recoveryBackupPublish(json)
+}
+
+/**
+ * Asks the DHT for this account's own published recovery backup — run
+ * after restoring an identity from its phrase. A found record is
+ * decrypted natively and arrives as `recoveryBackupRestored` (plain
+ * JSON); anything else surfaces as `recoveryBackupResolutionFailed`.
+ */
+export function recoveryBackupRequest(): void {
+  NativeCryptoCore.recoveryBackupRequest()
 }
 
 /**

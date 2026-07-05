@@ -39,6 +39,7 @@ use crate::identity;
 use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 use crate::mailbox;
 use crate::public_relay;
+use crate::recovery_backup;
 use crate::mailbox_dht;
 use crate::mix;
 use crate::rendezvous;
@@ -285,6 +286,11 @@ struct Pending {
     /// echo it back to the caller.
     resolve_contact_card: HashMap<QueryId, Vec<u8>>,
     announce_avatar_pointer: std::collections::HashSet<QueryId>,
+    announce_recovery_backup: std::collections::HashSet<QueryId>,
+    /// Keyed by the same `owner_identity_public_key` the original
+    /// `Command::ResolveRecoveryBackup` was given, echoed back in the
+    /// answering event — same shape as `resolve_contact_card`.
+    resolve_recovery_backup: HashMap<QueryId, Vec<u8>>,
     announce_public_relay: std::collections::HashSet<QueryId>,
     /// In-flight `DiscoverPublicRelays` provider lookups. Providers found
     /// get auto-dialed as they stream in (see `handle_kad_event`), so
@@ -633,6 +639,8 @@ fn needs_dht_peer(command: &Command) -> bool {
             | Command::ResolveContactCard { .. }
             | Command::AnnounceAvatarPointer { .. }
             | Command::ResolveAvatarPointer { .. }
+            | Command::AnnounceRecoveryBackup { .. }
+            | Command::ResolveRecoveryBackup { .. }
             | Command::AnnouncePublicRelay
             | Command::DiscoverPublicRelays
     )
@@ -734,6 +742,20 @@ fn handle_command(
             if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
                 pending.announce_contact_card.insert(query_id);
             }
+        }
+
+        Command::AnnounceRecoveryBackup { owner_identity_public_key, backup } => {
+            let key = recovery_backup::record_key_for(&owner_identity_public_key);
+            let record = Record::new(key, backup);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_recovery_backup.insert(query_id);
+            }
+        }
+
+        Command::ResolveRecoveryBackup { owner_identity_public_key } => {
+            let key = recovery_backup::record_key_for(&owner_identity_public_key);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_recovery_backup.insert(query_id, owner_identity_public_key);
         }
 
         Command::ResolveContactCard { owner_identity_public_key } => {
@@ -1093,6 +1115,11 @@ fn handle_kad_event(
                 });
             } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerResolved { owner, avatar_content_id: found.record.value });
+            } else if let Some(owner_identity_public_key) = pending.resolve_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupResolved {
+                    owner_identity_public_key,
+                    backup: found.record.value,
+                });
             } else if pending.mailbox_dht_retrieval.remove(&id) {
                 // One of a `RetrieveFromMailbox`'s per-slot DHT lookups
                 // (see `send_mailbox_retrieval_query`) found a replica —
@@ -1112,6 +1139,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardResolutionFailed { owner_identity_public_key });
             } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerResolutionFailed { owner });
+            } else if let Some(owner_identity_public_key) = pending.resolve_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupResolutionFailed { owner_identity_public_key });
             } else {
                 // An empty slot is the expected steady state, not a real
                 // failure — silence, same reasoning as a mailbox query
@@ -1128,6 +1157,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardAnnounced);
             } else if pending.announce_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerAnnounced);
+            } else if pending.announce_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupAnnounced);
             }
         }
         QueryResult::PutRecord(Err(err)) => {
@@ -1142,6 +1173,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardAnnouncementFailed { reason: err.to_string() });
             } else if pending.announce_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerAnnouncementFailed { reason: err.to_string() });
+            } else if pending.announce_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupAnnouncementFailed { reason: err.to_string() });
             }
         }
         _ => {}
