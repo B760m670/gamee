@@ -33,13 +33,19 @@ private func requireP2pSession() throws -> P2pSession {
 private func removeAccountSlot(_ slot: Int) throws {
   let wasActive = slot == IdentitySession.activeSlot
   if wasActive {
+    // Controllers gate the *active* node — stop them while that node is
+    // still the one `P2pSession.shared` resolves to, so stopMining/dummy
+    // traffic land on the right session.
     MiningController.shared.stop()
     MixRelayController.shared.stop()
-    P2pSession.signOut()
   }
+  P2pSession.stop(slot: slot)
   IdentitySession.removeSlot(slot)
   if wasActive, let fallback = IdentitySession.occupiedSlots().first {
     try IdentitySession.switchTo(slot: fallback)
+    // The fallback account's node is already running (every slot's is);
+    // the supervisor loop re-starts the controllers against it on its
+    // next pass.
   }
 }
 
@@ -123,14 +129,15 @@ public class SpiritchatCryptoCoreModule: Module {
     }
 
     // Switches to an already-registered `slot` — throws if it's empty.
-    // Tears down the current account's P2P node/mining first (each
-    // account has its own PeerId, so the swarm can't just be relabeled in
-    // place) and lets it lazily restart for the new identity, the same way
-    // it does on a normal launch.
+    // Every slot's node keeps running through a switch (that's the whole
+    // point of concurrent multi-account sessions — the outgoing account
+    // keeps receiving/retrying in the background); only the mining/mix
+    // policy controllers move: stopped here while the old node is still
+    // what `P2pSession.shared` resolves to, restarted by the supervisor
+    // loop against the new one.
     Function("switchAccount") { (slot: Int) throws in
       MiningController.shared.stop()
       MixRelayController.shared.stop()
-      P2pSession.signOut()
       try IdentitySession.switchTo(slot: slot)
     }
 
@@ -143,31 +150,33 @@ public class SpiritchatCryptoCoreModule: Module {
 
     Events("onP2pEvent", "onChatEvent")
 
-    // Starts pumping the P2P node's event loop as soon as an identity
-    // exists — immediately on launch if one was already on this device,
-    // or the moment onboarding finishes creating/restoring one — and goes
-    // back to waiting whenever a node stops (sign out), so a subsequent
-    // sign-in/restore within the same running app still gets its events
-    // pumped without needing a relaunch. Polls for readiness rather than
-    // being notified since "an identity now exists" is a simple, low-
-    // frequency state change; a callback/notification mechanism for it
-    // would be more machinery than the problem needs.
+    // The session supervisor: keeps one live node + event pump running
+    // per *occupied account slot* (not just the active one — the device
+    // being online means every account on it is online), starting new
+    // ones as slots appear (launch, onboarding, "add account") and
+    // re-starting any that stopped (sign-out then re-restore in the same
+    // run). Also keeps the policy controllers attached to whichever slot
+    // is currently active, and keeps this device's own nodes dialed into
+    // each other (see P2pSession.interconnect). Polls rather than being
+    // notified since "slots changed" is a simple, low-frequency state
+    // change; a callback mechanism for it would be more machinery than
+    // the problem needs.
     OnCreate {
       Task {
         while true {
-          while P2pSession.shared == nil {
-            try? await Task.sleep(nanoseconds: 200_000_000)
+          for slot in IdentitySession.occupiedSlots() {
+            guard let session = P2pSession.session(forSlot: slot), session.claimPump() else { continue }
+            self.startEventPump(for: session)
           }
-          guard let session = P2pSession.shared else { continue }
-          MiningController.shared.start()
-          MixRelayController.shared.start()
-          session.chatManager.emit = { event in self.sendEvent("onChatEvent", event) }
-          while let event = await session.node.nextEvent() {
-            self.sendEvent("onP2pEvent", P2pSession.encode(event))
-            session.chatManager.handleP2pEvent(event)
+          if P2pSession.shared != nil {
+            // Safe to call every pass — both controllers no-op once
+            // observing; after an account switch they were stopped, so
+            // this is what re-attaches them to the new active node.
+            MiningController.shared.start()
+            MixRelayController.shared.start()
           }
-          // The node shut down (sign out) — loop back and wait for the
-          // next one instead of letting this task end.
+          P2pSession.interconnect()
+          try? await Task.sleep(nanoseconds: 200_000_000)
         }
       }
     }
@@ -493,6 +502,35 @@ public class SpiritchatCryptoCoreModule: Module {
     // afterward. `groupMemberRemoved` on `onChatEvent` confirms it locally.
     Function("chatRemoveGroupMember") { (groupId: String, memberToRemove: String) throws in
       try requireP2pSession().chatManager.removeGroupMember(groupId: groupId, memberToRemove: memberToRemove)
+    }
+  }
+
+  /// One per `P2pSession`: drains that node's events until it shuts down.
+  /// Every event crossing to JS is tagged with the session's slot and
+  /// fingerprint, so the stores can route an inactive account's traffic
+  /// into that account's own namespaced storage (see store/chat.ts) and
+  /// the UI can ignore P2P events that aren't the active account's.
+  private func startEventPump(for session: P2pSession) {
+    session.chatManager.emit = { [weak self] event in
+      var tagged = event
+      tagged["slot"] = session.slot
+      tagged["selfFingerprint"] = session.selfFingerprint
+      self?.sendEvent("onChatEvent", tagged)
+    }
+    Task {
+      while let event = await session.node.nextEvent() {
+        if case .listeningOn(let address) = event {
+          session.recordListenAddress(address)
+        }
+        var encoded = P2pSession.encode(event)
+        encoded["slot"] = session.slot
+        encoded["selfFingerprint"] = session.selfFingerprint
+        self.sendEvent("onP2pEvent", encoded)
+        session.chatManager.handleP2pEvent(event)
+      }
+      // The node shut down (sign out / account removal) — this pump ends
+      // with it; a re-created slot gets a fresh session object and a
+      // fresh pump from the supervisor loop.
     }
   }
 }

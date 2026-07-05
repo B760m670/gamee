@@ -289,6 +289,15 @@ final class IdentitySession {
     return session
   }
 
+  /// Loads `slot`'s full key material *without* activating it — what
+  /// `P2pSession` uses to run every registered account's node
+  /// concurrently, not just the active one's. Unlike `switchTo` this
+  /// never touches `activeSlot`/`cached`, so which account the UI shows
+  /// is entirely unaffected. `nil` if the slot is empty or incomplete.
+  static func loadFor(slot: Int) -> IdentitySession? {
+    try? loadExisting(slot: slot)
+  }
+
   private static func loadExisting(slot: Int) throws -> IdentitySession {
     guard
       let identityBytes = try KeychainStore.load(account: identityAccount(slot)),

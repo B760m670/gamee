@@ -59,6 +59,54 @@ async function persistGroupMessages(myFingerprint: string, groupId: string, mess
   await AsyncStorage.setItem(groupMessagesKey(myFingerprint, groupId), JSON.stringify(messages))
 }
 
+// Serializes read-modify-write cycles per fingerprint for events arriving
+// on an account that isn't on screen — mirrors store/chat.ts's own
+// background routing exactly (see the comment there for why this exists).
+const backgroundWrites: Record<string, Promise<void>> = {}
+function enqueueBackgroundWrite(fingerprint: string, op: () => Promise<void>) {
+  const prev = backgroundWrites[fingerprint] ?? Promise.resolve()
+  backgroundWrites[fingerprint] = prev.then(op).catch(() => {})
+}
+
+async function applyGroupEventForInactive(fingerprint: string, event: ChatEvent) {
+  const rawGroups = await AsyncStorage.getItem(groupsKey(fingerprint))
+  const groups: GroupInfo[] = rawGroups ? JSON.parse(rawGroups) : []
+
+  if (event.type === 'groupInvited') {
+    const info: GroupInfo = { groupId: event.groupId, name: event.name, members: event.members }
+    const next = [...groups.filter(g => g.groupId !== event.groupId), info]
+    await AsyncStorage.setItem(groupsKey(fingerprint), JSON.stringify(next))
+    return
+  }
+
+  if (event.type === 'groupMessageReceived') {
+    const key = groupMessagesKey(fingerprint, event.groupId)
+    const raw = await AsyncStorage.getItem(key)
+    const list: GroupMessage[] = raw ? JSON.parse(raw) : []
+    const at = event.at * 1000
+    list.push({
+      localId: `in-${event.groupId}-${event.senderPeerId}-${event.at}`,
+      senderPeerId: event.senderPeerId,
+      outgoing: false,
+      text: event.plaintext,
+      at,
+      status: 'sent',
+    })
+    await AsyncStorage.setItem(key, JSON.stringify(list))
+    return
+  }
+
+  if (event.type === 'groupMemberAdded' || event.type === 'groupMemberRemoved') {
+    const group = groups.find(g => g.groupId === event.groupId)
+    if (!group) return
+    const members = event.type === 'groupMemberAdded'
+      ? (group.members.includes(event.memberPeerId) ? group.members : [...group.members, event.memberPeerId])
+      : group.members.filter(m => m !== event.memberPeerId)
+    const next = groups.map(g => (g.groupId === event.groupId ? { ...g, members } : g))
+    await AsyncStorage.setItem(groupsKey(fingerprint), JSON.stringify(next))
+  }
+}
+
 export const useGroupStore = create<GroupState>((set, get) => ({
   myFingerprint: '',
   myPeerId: '',
@@ -132,6 +180,23 @@ export const useGroupStore = create<GroupState>((set, get) => ({
   // way store/chat.ts ignores these two.
   handleChatEvent: (event) => {
     const myFingerprint = get().myFingerprint
+
+    if (
+      event.type !== 'groupInvited' &&
+      event.type !== 'groupMessageReceived' &&
+      event.type !== 'groupMemberAdded' &&
+      event.type !== 'groupMemberRemoved'
+    ) return
+
+    // A group event for an account that isn't on screen (every registered
+    // account's node runs concurrently) — persist into that account's own
+    // namespace, leave the active account's in-memory state alone.
+    if (event.selfFingerprint && event.selfFingerprint !== myFingerprint) {
+      const origin = event.selfFingerprint
+      enqueueBackgroundWrite(origin, () => applyGroupEventForInactive(origin, event))
+      return
+    }
+
     if (!myFingerprint) return
 
     if (event.type === 'groupInvited') {

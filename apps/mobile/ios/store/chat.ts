@@ -70,6 +70,64 @@ async function persistMessages(myFingerprint: string, peerId: string, messages: 
   await AsyncStorage.setItem(messagesKey(myFingerprint, peerId), JSON.stringify(messages))
 }
 
+// --- Inactive-account routing --------------------------------------------
+//
+// Every registered account's node runs concurrently now (see
+// P2pSession.swift), so chat events can arrive for an account that is NOT
+// the one on screen. Those never touch this store's in-memory state (that
+// is the active account's view) — they're persisted straight into the
+// owning fingerprint's own AsyncStorage namespace, so switching to that
+// account later loads them exactly as if it had been active all along.
+
+/**
+ * Serializes read-modify-write cycles per fingerprint — two events landing
+ * back-to-back for the same inactive account must not interleave their
+ * AsyncStorage round trips, or the first one's append gets lost.
+ */
+const backgroundWrites: Record<string, Promise<void>> = {}
+function enqueueBackgroundWrite(fingerprint: string, op: () => Promise<void>) {
+  const prev = backgroundWrites[fingerprint] ?? Promise.resolve()
+  backgroundWrites[fingerprint] = prev.then(op).catch(() => {})
+}
+
+async function appendIncomingForInactive(
+  fingerprint: string,
+  event: Extract<ChatEvent, { type: 'messageReceived' }>,
+) {
+  const at = event.at * 1000
+  const rawMessages = await AsyncStorage.getItem(messagesKey(fingerprint, event.peerId))
+  const list: ChatMessage[] = rawMessages ? JSON.parse(rawMessages) : []
+  list.push({ localId: `in-${event.peerId}-${event.at}`, outgoing: false, text: event.plaintext, at, status: 'sent' })
+  await AsyncStorage.setItem(messagesKey(fingerprint, event.peerId), JSON.stringify(list))
+
+  const rawConversations = await AsyncStorage.getItem(conversationsKey(fingerprint))
+  const conversations: Conversation[] = rawConversations ? JSON.parse(rawConversations) : []
+  const known = conversations.find(c => c.peerId === event.peerId)
+  const updated: Conversation = {
+    peerId: event.peerId,
+    peerFingerprint: event.peerFingerprint,
+    peerPublicKeyBase64: event.peerPublicKeyBase64,
+    peerUsername: known?.peerUsername ?? null,
+    lastMessageText: event.plaintext,
+    lastMessageAt: at,
+  }
+  const next = [...conversations.filter(c => c.peerId !== event.peerId), updated]
+  await AsyncStorage.setItem(conversationsKey(fingerprint), JSON.stringify(next))
+}
+
+async function updateStatusForInactive(
+  fingerprint: string,
+  event: Extract<ChatEvent, { type: 'messageSent' } | { type: 'messageFailed' }>,
+) {
+  const key = messagesKey(fingerprint, event.peerId)
+  const raw = await AsyncStorage.getItem(key)
+  if (!raw) return
+  const list: ChatMessage[] = JSON.parse(raw)
+  const status: ChatMessage['status'] = event.type === 'messageSent' ? 'sent' : 'queued'
+  const next = list.map(m => (m.localId === event.localId ? { ...m, status } : m))
+  await AsyncStorage.setItem(key, JSON.stringify(next))
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   myFingerprint: '',
   conversations: {},
@@ -147,7 +205,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // promoted into `conversations`.
   handleChatEvent: (event) => {
     const myFingerprint = get().myFingerprint
-    if (!myFingerprint) return // no account active right now — nothing to attribute this to
 
     // Group events are handled entirely in store/groups.ts — nothing to
     // do with them here.
@@ -157,6 +214,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
       event.type === 'groupMemberAdded' ||
       event.type === 'groupMemberRemoved'
     ) return
+
+    // An event from an account that isn't on screen right now (every
+    // registered account's node runs concurrently) — persist it into that
+    // account's own namespace and leave the active account's in-memory
+    // state alone.
+    if (event.selfFingerprint && event.selfFingerprint !== myFingerprint) {
+      const origin = event.selfFingerprint
+      if (event.type === 'messageReceived') {
+        enqueueBackgroundWrite(origin, () => appendIncomingForInactive(origin, event))
+      } else {
+        enqueueBackgroundWrite(origin, () => updateStatusForInactive(origin, event))
+      }
+      return
+    }
+
+    if (!myFingerprint) return // no account active right now — nothing to attribute this to
 
     if (event.type === 'messageReceived') {
       const known = get().conversations[event.peerId] ?? get().activePeers[event.peerId]

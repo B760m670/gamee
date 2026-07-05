@@ -1,11 +1,22 @@
 import { requireNativeModule } from 'expo-modules-core'
 
 /**
+ * Which account's node an event came from. Every registered account runs
+ * its own live node now (not just the active one), so every event that
+ * crosses the bridge is stamped with its session's slot + fingerprint by
+ * the native pump — `addP2pEventListener` uses `slot` to drop inactive
+ * accounts' node chatter before the active-account UI ever sees it, and
+ * store/chat.ts uses `selfFingerprint` to route an inactive account's
+ * messages into that account's own namespaced storage.
+ */
+export type EventOrigin = { slot?: number; selfFingerprint?: string }
+
+/**
  * Mirrors `spiritchat_crypto_core_ffi::FfiP2pEvent` — see p2p_event.rs.
  * Discriminated by `type` so the native side can stay a plain dictionary
  * instead of needing a second binding layer.
  */
-export type P2pEvent =
+export type P2pEvent = EventOrigin & (
   | { type: 'listeningOn'; address: string }
   | { type: 'peerDiscoveredLocally'; peerId: string }
   | { type: 'peerConnected'; peerId: string }
@@ -57,6 +68,7 @@ export type P2pEvent =
   | { type: 'publicRelayDiscovered'; peerId: string }
   | { type: 'mailboxDepositStored' }
   | { type: 'mailboxEnvelopeRetrieved'; envelope: Uint8Array }
+)
 
 /**
  * Synthesized by `ChatManager.swift` from decrypted/queued messages — not a
@@ -64,7 +76,7 @@ export type P2pEvent =
  * crypto/session logic behind these lives entirely on the Swift side (JS
  * never sees raw envelope bytes or handshake data, only these results).
  */
-export type ChatEvent =
+export type ChatEvent = EventOrigin & (
   | { type: 'messageReceived'; peerId: string; peerFingerprint: string; peerPublicKeyBase64: string; plaintext: string; at: number }
   | { type: 'messageSent'; peerId: string; localId: string }
   | { type: 'messageFailed'; peerId: string; localId: string; reason: string }
@@ -72,6 +84,7 @@ export type ChatEvent =
   | { type: 'groupMessageReceived'; groupId: string; senderPeerId: string; plaintext: string; at: number }
   | { type: 'groupMemberAdded'; groupId: string; memberPeerId: string }
   | { type: 'groupMemberRemoved'; groupId: string; memberPeerId: string }
+)
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -313,9 +326,21 @@ export function p2pReserveRelaySlot(relayAddress: string): void {
   NativeCryptoCore.p2pReserveRelaySlot(relayAddress)
 }
 
-/** Subscribes to the node's event stream (connections, envelopes, DHT results). Returns an unsubscribe function. */
+/**
+ * Subscribes to the node's event stream (connections, envelopes, DHT
+ * results). Returns an unsubscribe function. Only the *active* account's
+ * node events are delivered: every subscriber of this stream drives
+ * active-account UI state (profile, avatars, username lookups), and an
+ * inactive account's node answering e.g. a username query would corrupt
+ * it. Inactive accounts' *messages* still arrive — those flow through
+ * `addChatEventListener`, which deliberately does not filter (see
+ * store/chat.ts's fingerprint routing).
+ */
 export function addP2pEventListener(listener: (event: P2pEvent) => void): () => void {
-  const subscription = NativeCryptoCore.addListener('onP2pEvent', listener)
+  const subscription = NativeCryptoCore.addListener('onP2pEvent', (event: P2pEvent) => {
+    if (event.slot !== undefined && event.slot !== NativeCryptoCore.activeAccountSlot()) return
+    listener(event)
+  })
   return () => subscription.remove()
 }
 

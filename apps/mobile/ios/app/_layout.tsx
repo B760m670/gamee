@@ -76,9 +76,11 @@ export default function RootLayout() {
   // Chat events are handled entirely in the stores (see store/chat.ts and
   // store/groups.ts) — this just wires the native event stream to both,
   // once for the app's lifetime; each ignores whatever event type isn't
-  // its own. ChatManager.swift already only ever emits for whichever
-  // account is currently active, so nothing here needs to change on an
-  // account switch.
+  // its own. Every registered account's node runs concurrently now, so
+  // events arrive tagged with their owning account's fingerprint and the
+  // stores route inactive accounts' traffic into that account's own
+  // namespaced storage — nothing here needs to change on an account
+  // switch either way.
   useEffect(() => {
     return addChatEventListener((event) => {
       useChatStore.getState().handleChatEvent(event)
