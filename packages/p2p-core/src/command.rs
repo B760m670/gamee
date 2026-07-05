@@ -106,6 +106,32 @@ pub enum Command {
     /// to `first_hop`, same as `SendEnvelope`.
     SendMixPacket { first_hop: PeerId, packet_bytes: Vec<u8> },
 
+    /// Announces this node as a *standing* relay in the public DHT, under
+    /// the single well-known provider key every node discovers by (see
+    /// `public_relay.rs` for why gossip alone can't bootstrap a brand new
+    /// install into the mix). Kademlia keeps re-publishing the provider
+    /// record on its own schedule for as long as this node runs — this is
+    /// a one-shot opt-in, not something to re-issue on a timer the way
+    /// `AnnounceAddresses` is. Meant for nodes on always-on machines (see
+    /// `packages/relay-node`); a phone that's foreground-and-charging
+    /// gains nothing by announcing here that `AnnounceMixRelay` doesn't
+    /// already give it, and would only pollute the provider set with
+    /// entries that go dark minutes later. Answered by
+    /// `P2pEvent::PublicRelayAnnounced`/`PublicRelayAnnouncementFailed`.
+    AnnouncePublicRelay,
+
+    /// Enumerates currently-announced standing relays from the public DHT
+    /// and dials any that aren't already connected — the event loop also
+    /// runs this by itself whenever its mix-relay directory is empty (see
+    /// `run_event_loop`), so a fresh install converges on the mix without
+    /// the app layer doing anything; this command exists for the moments
+    /// the app *knows* a retry is warranted right now (a user pressing
+    /// "retry" on a stuck message) rather than on the next sweep. Each
+    /// relay found surfaces as `P2pEvent::PublicRelayDiscovered`; a
+    /// successful dial then flows through the ordinary
+    /// `PeerConnected`/gossip path that populates the mix-relay directory.
+    DiscoverPublicRelays,
+
     /// Broadcasts this node's own Sphinx routing public key to
     /// `behaviour::mix_relay_directory_topic()`, so other nodes can
     /// discover it as a usable mix hop even before ever directly
