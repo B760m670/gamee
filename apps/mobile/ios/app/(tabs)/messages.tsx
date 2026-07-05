@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import {
   View, Text, TextInput, FlatList, Pressable,
-  ActivityIndicator, Keyboard, StyleSheet,
+  ActivityIndicator, Keyboard, Alert, StyleSheet,
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { useRouter } from 'expo-router'
@@ -42,6 +42,18 @@ export default function ChatsScreen() {
   function openChat(peerId: string) {
     Keyboard.dismiss()
     router.push({ pathname: '/chat/[userId]', params: { userId: peerId } })
+  }
+
+  function confirmDeleteChat(item: { peerId: string; peerUsername: string | null; peerFingerprint: string }) {
+    const name = item.peerUsername ? `@${item.peerUsername}` : item.peerFingerprint
+    Alert.alert(
+      'Удалить чат?',
+      `Переписка с ${name} удалится только на этом устройстве. У собеседника она останется.`,
+      [
+        { text: 'Отмена', style: 'cancel' },
+        { text: 'Удалить', style: 'destructive', onPress: () => useChatStore.getState().deleteChat(item.peerId) },
+      ],
+    )
   }
 
   function openGroup(groupId: string) {
@@ -134,7 +146,7 @@ export default function ChatsScreen() {
           style={s.list}
           data={items}
           keyExtractor={c => c.peerId}
-          renderItem={({ item }) => <ConversationRow item={item} onPress={openChat} />}
+          renderItem={({ item }) => <ConversationRow item={item} onPress={openChat} onLongPress={confirmDeleteChat} />}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: insets.bottom + 20 }}
           ListHeaderComponent={

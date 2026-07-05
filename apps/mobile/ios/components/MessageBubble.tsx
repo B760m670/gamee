@@ -1,10 +1,12 @@
 import { memo } from 'react'
-import { View, Text, StyleSheet } from 'react-native'
+import { Pressable, View, Text, StyleSheet } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import type { ChatMessage } from '../store/chat'
 
 interface Props {
   msg: ChatMessage
+  /** Long-press on the bubble — e.g. the chat screen's delete menu. */
+  onLongPress?: (msg: ChatMessage) => void
 }
 
 function formatTime(epochMs: number): string {
@@ -14,10 +16,14 @@ function formatTime(epochMs: number): string {
   return `${hh}:${mm}`
 }
 
-function MessageBubbleBase({ msg }: Props) {
+function MessageBubbleBase({ msg, onLongPress }: Props) {
   return (
     <View style={[s.wrap, msg.outgoing ? s.wrapMine : s.wrapOther]}>
-      <View style={[s.bubble, msg.outgoing ? s.bubbleMine : s.bubbleOther]}>
+      <Pressable
+        style={[s.bubble, msg.outgoing ? s.bubbleMine : s.bubbleOther]}
+        onLongPress={onLongPress ? () => onLongPress(msg) : undefined}
+        delayLongPress={350}
+      >
         <Text style={s.text}>{msg.text}</Text>
         <View style={s.meta}>
           <Text style={s.time}>{formatTime(msg.at)}</Text>
@@ -29,7 +35,7 @@ function MessageBubbleBase({ msg }: Props) {
             )
           ) : null}
         </View>
-      </View>
+      </Pressable>
     </View>
   )
 }

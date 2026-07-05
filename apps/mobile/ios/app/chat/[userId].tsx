@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  View, Text, FlatList, Pressable,
+  View, Text, FlatList, Pressable, Alert,
   KeyboardAvoidingView, Platform, StyleSheet,
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
@@ -32,6 +32,7 @@ export default function ChatScreen() {
   const known = useChatStore(s => s.conversations[peerId] ?? s.activePeers[peerId])
   const openConversation = useChatStore(s => s.openConversation)
   const sendMessage = useChatStore(s => s.sendMessage)
+  const deleteMessage = useChatStore(s => s.deleteMessage)
   const messages = useChatStore(s => s.messages[peerId] ?? [])
 
   const [ready, setReady] = useState(false)
@@ -54,6 +55,13 @@ export default function ChatScreen() {
 
   function handleSend(text: string) {
     sendMessage(peerId, text)
+  }
+
+  function confirmDeleteMessage(msg: ChatMessage) {
+    Alert.alert('Удалить сообщение?', 'Оно удалится только на этом устройстве.', [
+      { text: 'Отмена', style: 'cancel' },
+      { text: 'Удалить', style: 'destructive', onPress: () => deleteMessage(peerId, msg.localId) },
+    ])
   }
 
   return (
@@ -83,7 +91,9 @@ export default function ChatScreen() {
         data={[...messages].reverse()}
         inverted
         keyExtractor={m => m.localId}
-        renderItem={({ item }: { item: ChatMessage }) => <MessageBubble msg={item} />}
+        renderItem={({ item }: { item: ChatMessage }) => (
+          <MessageBubble msg={item} onLongPress={confirmDeleteMessage} />
+        )}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         contentContainerStyle={{ paddingVertical: 10 }}

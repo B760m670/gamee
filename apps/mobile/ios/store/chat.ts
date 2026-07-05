@@ -59,6 +59,16 @@ interface ChatState {
   reset: () => void
   openConversation: (peer: PeerInfo) => Promise<ChatMessage[]>
   sendMessage: (peerId: string, text: string) => Promise<void>
+  /**
+   * Removes one message from this device's own copy of the history.
+   * Local-only by design (for now): the 1:1 wire format carries no shared
+   * message id both sides could agree on, so a cryptographically honest
+   * "delete for both" needs a framing change first — a local delete that
+   * *pretended* to be mutual would be worse than none.
+   */
+  deleteMessage: (peerId: string, localId: string) => Promise<void>
+  /** Removes the whole conversation (history + list entry) from this device only. */
+  deleteChat: (peerId: string) => Promise<void>
   handleChatEvent: (event: ChatEvent) => void
 }
 
@@ -195,6 +205,49 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await Promise.all([
       persistMessages(myFingerprint, peerId, nextMessages),
       persistConversations(myFingerprint, nextConversations),
+    ])
+  },
+
+  deleteMessage: async (peerId, localId) => {
+    const myFingerprint = get().myFingerprint
+    if (!myFingerprint) return
+    const list = get().messages[peerId]
+    if (!list) return
+    const next = list.filter(m => m.localId !== localId)
+    set(state => ({ messages: { ...state.messages, [peerId]: next } }))
+    await persistMessages(myFingerprint, peerId, next)
+
+    // Keep the conversation preview honest if the deleted message was the
+    // latest one.
+    const conversation = get().conversations[peerId]
+    if (conversation) {
+      const last = next[next.length - 1]
+      const updated = {
+        ...conversation,
+        lastMessageText: last?.text ?? '',
+        lastMessageAt: last?.at ?? conversation.lastMessageAt,
+      }
+      const nextConversations = { ...get().conversations, [peerId]: updated }
+      set({ conversations: nextConversations })
+      await persistConversations(myFingerprint, nextConversations)
+    }
+  },
+
+  deleteChat: async (peerId) => {
+    const myFingerprint = get().myFingerprint
+    if (!myFingerprint) return
+    const nextConversations = { ...get().conversations }
+    delete nextConversations[peerId]
+    set(state => {
+      const messages = { ...state.messages }
+      delete messages[peerId]
+      const activePeers = { ...state.activePeers }
+      delete activePeers[peerId]
+      return { conversations: nextConversations, messages, activePeers }
+    })
+    await Promise.all([
+      persistConversations(myFingerprint, nextConversations),
+      AsyncStorage.removeItem(messagesKey(myFingerprint, peerId)),
     ])
   },
 
