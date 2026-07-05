@@ -7,6 +7,7 @@ import { useRouter, useLocalSearchParams } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { PeerAvatar } from '../../components/PeerAvatar'
 import { useChatStore } from '../../store/chat'
+import { useContactsStore } from '../../store/contacts'
 
 const AVATAR_SIZE = 100
 const BTN_H = 44
@@ -32,7 +33,14 @@ export default function ProfileScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const { id } = useLocalSearchParams<{ id: string }>()
-  const peer = useChatStore(s => s.conversations[id] ?? s.activePeers[id])
+  const knownPeer = useChatStore(s => s.conversations[id] ?? s.activePeers[id])
+  const savedContact = useContactsStore(s => s.contacts[id])
+  const addContact = useContactsStore(s => s.addContact)
+  const removeContact = useContactsStore(s => s.removeContact)
+  // A profile can be reached from a conversation (chat store knows the
+  // peer) or straight from the Contacts tab (only the contacts store
+  // does) — either source has the full PeerInfo.
+  const peer = knownPeer ?? savedContact
 
   const title = peer?.peerUsername ? `@${peer.peerUsername}` : (peer?.peerFingerprint || 'Профиль')
 
@@ -83,6 +91,24 @@ export default function ProfileScreen() {
             </View>
           </View>
         ) : null}
+
+        {peer ? (
+          <View style={[s.group, { marginTop: 16 }]}>
+            <Pressable
+              style={({ pressed }) => [s.contactBtn, pressed && { opacity: 0.7 }]}
+              onPress={() => (savedContact ? removeContact(id) : addContact(peer))}
+            >
+              <Ionicons
+                name={savedContact ? 'person-remove-outline' : 'person-add-outline'}
+                size={20}
+                color={savedContact ? '#f87171' : '#2f7bff'}
+              />
+              <Text style={[s.contactBtnText, savedContact && { color: '#f87171' }]}>
+                {savedContact ? 'Убрать из контактов' : 'В контакты'}
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
       </ScrollView>
     </View>
   )
@@ -119,4 +145,10 @@ const s = StyleSheet.create({
   infoValue: { color: '#fff', fontSize: 16, lineHeight: 22 },
 
   errorText: { color: '#f87171', fontSize: 15 },
+
+  contactBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+    paddingVertical: 14,
+  },
+  contactBtnText: { color: '#2f7bff', fontSize: 16, fontWeight: '600' },
 })

@@ -17,6 +17,7 @@ import {
 import { useProfileStore } from '../store/profile'
 import { useChatStore } from '../store/chat'
 import { useGroupStore } from '../store/groups'
+import { useContactsStore } from '../store/contacts'
 import { handlePeerAvatarEvent } from '../store/peerAvatars'
 
 const queryClient = new QueryClient({
@@ -98,9 +99,11 @@ export default function RootLayout() {
     if (fingerprint) {
       useChatStore.getState().loadForFingerprint(fingerprint)
       useGroupStore.getState().loadForFingerprint(fingerprint, peerId)
+      useContactsStore.getState().loadForFingerprint(fingerprint)
     } else {
       useChatStore.getState().reset()
       useGroupStore.getState().reset()
+      useContactsStore.getState().reset()
     }
   }, [fingerprint])
 
