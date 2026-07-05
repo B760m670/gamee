@@ -47,6 +47,9 @@ pub enum FfiP2pEvent {
     MixPacketArrived { payload: Vec<u8> },
     MixForwardFailed { reason: String },
     MixRelayDiscovered { peer_id: String },
+    PublicRelayAnnounced,
+    PublicRelayAnnouncementFailed { reason: String },
+    PublicRelayDiscovered { peer_id: String },
     MailboxDepositStored,
     MailboxEnvelopeRetrieved { envelope: Vec<u8> },
 }
@@ -129,6 +132,9 @@ impl From<P2pEvent> for FfiP2pEvent {
             P2pEvent::MixPacketArrived { payload } => Self::MixPacketArrived { payload },
             P2pEvent::MixForwardFailed { reason } => Self::MixForwardFailed { reason },
             P2pEvent::MixRelayDiscovered { peer } => Self::MixRelayDiscovered { peer_id: peer.to_string() },
+            P2pEvent::PublicRelayAnnounced => Self::PublicRelayAnnounced,
+            P2pEvent::PublicRelayAnnouncementFailed { reason } => Self::PublicRelayAnnouncementFailed { reason },
+            P2pEvent::PublicRelayDiscovered { peer } => Self::PublicRelayDiscovered { peer_id: peer.to_string() },
             P2pEvent::MailboxDepositStored => Self::MailboxDepositStored,
             P2pEvent::MailboxEnvelopeRetrieved { envelope } => Self::MailboxEnvelopeRetrieved { envelope },
         }

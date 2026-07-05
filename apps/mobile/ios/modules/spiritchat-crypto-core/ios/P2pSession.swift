@@ -236,6 +236,12 @@ final class P2pSession {
       return ["type": "mixForwardFailed", "reason": reason]
     case .mixRelayDiscovered(let peerId):
       return ["type": "mixRelayDiscovered", "peerId": peerId]
+    case .publicRelayAnnounced:
+      return ["type": "publicRelayAnnounced"]
+    case .publicRelayAnnouncementFailed(let reason):
+      return ["type": "publicRelayAnnouncementFailed", "reason": reason]
+    case .publicRelayDiscovered(let peerId):
+      return ["type": "publicRelayDiscovered", "peerId": peerId]
     case .mailboxDepositStored:
       return ["type": "mailboxDepositStored"]
     case .mailboxEnvelopeRetrieved(let envelope):

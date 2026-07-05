@@ -52,6 +52,9 @@ export type P2pEvent =
   | { type: 'mixPacketArrived'; payload: Uint8Array }
   | { type: 'mixForwardFailed'; reason: string }
   | { type: 'mixRelayDiscovered'; peerId: string }
+  | { type: 'publicRelayAnnounced' }
+  | { type: 'publicRelayAnnouncementFailed'; reason: string }
+  | { type: 'publicRelayDiscovered'; peerId: string }
   | { type: 'mailboxDepositStored' }
   | { type: 'mailboxEnvelopeRetrieved'; envelope: Uint8Array }
 
