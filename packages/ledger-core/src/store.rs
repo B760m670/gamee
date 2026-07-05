@@ -16,8 +16,9 @@
 //! a P2P system; that's the normal, expected recovery path, not a bug).
 
 use std::path::Path;
+use std::time::Duration;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, DatabaseError, ReadableTable, TableDefinition};
 
 use crate::block::Block;
 use crate::chain_state::{ApplyOutcome, Chain, Checkpoint};
@@ -82,7 +83,7 @@ impl ChainStore {
     /// stored above it, ending up in exactly the state the chain was in
     /// when it was last closed.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::create(path).map_err(to_storage_err)?;
+        let db = Self::create_with_retry(path)?;
         Self::ensure_tables_exist(&db)?;
 
         let tip_hash_bytes = Self::read_singleton(&db, TIP_HASH_KEY)?;
@@ -97,6 +98,36 @@ impl ChainStore {
             store.persist_after_apply(&Block::genesis())?;
         }
         Ok(store)
+    }
+
+    /// `Database::create`, retrying briefly on `DatabaseAlreadyOpen`
+    /// specifically — this crate's own file lock, not a stale one left
+    /// by some other process. The previous owner of this same path
+    /// (e.g., on iOS, `FfiP2pNode::shutdown`'s background event loop
+    /// task, mid-way through actually stopping) can still hold it for a
+    /// short moment after a caller already considers that node "shut
+    /// down": `shutdown()` only *requests* the stop and returns
+    /// immediately, it doesn't wait for the task to finish dropping its
+    /// own `Database` handle. Retried, not treated as fatal on the first
+    /// failure, since that gap is normally milliseconds, not something a
+    /// caller (e.g. switching accounts right after signing out of the
+    /// last one) should have to work around itself. Any other error
+    /// (including `DatabaseAlreadyOpen` that still hasn't cleared after
+    /// the whole budget) is returned immediately/as the last attempt's
+    /// error, not retried indefinitely.
+    fn create_with_retry(path: &Path) -> Result<Database> {
+        const MAX_ATTEMPTS: u32 = 20;
+        const RETRY_DELAY: Duration = Duration::from_millis(50);
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Database::create(path) {
+                Ok(db) => return Ok(db),
+                Err(DatabaseError::DatabaseAlreadyOpen) if attempt < MAX_ATTEMPTS => {
+                    std::thread::sleep(RETRY_DELAY);
+                }
+                Err(err) => return Err(to_storage_err(err)),
+            }
+        }
+        unreachable!("the loop above always returns on its final attempt")
     }
 
     fn ensure_tables_exist(db: &Database) -> Result<()> {
@@ -335,6 +366,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ChainStore::open(&dir.path().join("chain.redb")).unwrap();
         assert_eq!(store.tip_height(), 0);
+    }
+
+    #[test]
+    fn open_retries_past_a_transient_database_already_open_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("chain.redb");
+        ChainStore::open(&db_path).unwrap();
+
+        // Hold the file's OS-level lock open on a background thread for a
+        // window that outlasts at least one retry attempt (50ms) but fits
+        // comfortably inside the retry budget (20 * 50ms = 1s) — mirrors
+        // the real account-switch race this fix targets: the previous
+        // owner (there, `FfiP2pNode::shutdown`'s event loop task, still
+        // mid-way through actually stopping; here, this thread) still
+        // holds the lock for a short moment after the next opener has
+        // already started trying. Without `create_with_retry`'s loop,
+        // `ChainStore::open` below would fail immediately with
+        // `DatabaseAlreadyOpen` instead of waiting this out.
+        let held = Database::create(&db_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+        });
+
+        let store = ChainStore::open(&db_path).unwrap();
+        assert_eq!(store.tip_height(), 0);
+
+        handle.join().unwrap();
     }
 
     #[test]
