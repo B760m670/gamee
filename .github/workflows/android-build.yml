@@ -8,6 +8,7 @@ on:
       - 'apps/android/**'
       - 'packages/crypto-core/**'
       - 'packages/crypto-core-ffi/**'
+      - 'packages/ledger-core/**'
       - '.github/workflows/android-build.yml'
   workflow_dispatch:
 

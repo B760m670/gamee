@@ -199,6 +199,44 @@ impl FfiP2pNode {
         self.send(Command::FetchBlob { peer, id })
     }
 
+    /// Publishes this node's own current contact card into the public
+    /// DHT, keyed by `owner_identity_public_key` — unlike `set_local_blob`
+    /// (which needs a live connection to fetch), this survives the
+    /// publisher going offline, which is what makes a *first* message to
+    /// someone currently offline possible at all. Re-run periodically
+    /// (DHT records expire). Answered by a
+    /// `ContactCardAnnounced`/`ContactCardAnnouncementFailed` event.
+    pub fn announce_contact_card(&self, owner_identity_public_key: Vec<u8>, card: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::AnnounceContactCard { owner_identity_public_key, card })
+    }
+
+    /// Looks up whatever contact card is currently published for
+    /// `owner_identity_public_key` — the fallback once a direct dial/blob
+    /// fetch has failed and no ratchet session exists yet. Answered by a
+    /// `ContactCardResolved`/`ContactCardResolutionFailed` event.
+    pub fn resolve_contact_card(&self, owner_identity_public_key: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::ResolveContactCard { owner_identity_public_key })
+    }
+
+    /// Publishes this node's own current avatar content id into the
+    /// public DHT, keyed by its own peer id — the pointer, not the avatar
+    /// bytes themselves (those still need a live connection via
+    /// `fetch_blob`, same as before). Re-run periodically (DHT records
+    /// expire) and whenever the avatar changes. Answered by an
+    /// `AvatarPointerAnnounced`/`AvatarPointerAnnouncementFailed` event.
+    pub fn announce_avatar_pointer(&self, avatar_content_id: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::AnnounceAvatarPointer { avatar_content_id })
+    }
+
+    /// Looks up whatever avatar content id is currently published for
+    /// `peer_id` — lets a caller learn which id to `fetch_blob` even while
+    /// `peer_id` is currently offline. Answered by an
+    /// `AvatarPointerResolved`/`AvatarPointerResolutionFailed` event.
+    pub fn resolve_avatar_pointer(&self, peer_id: String) -> FfiResult<()> {
+        let owner = parse_peer_id(&peer_id)?;
+        self.send(Command::ResolveAvatarPointer { owner })
+    }
+
     /// Publishes `claim` under the DHT key derived from `username`.
     /// `claim` should be self-certifying (e.g. a public key plus a
     /// signature over the username — see `identity_verify`) since this

@@ -149,6 +149,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const myFingerprint = get().myFingerprint
     if (!myFingerprint) return // no account active right now — nothing to attribute this to
 
+    // Group events are handled entirely in store/groups.ts — nothing to
+    // do with them here.
+    if (
+      event.type === 'groupInvited' ||
+      event.type === 'groupMessageReceived' ||
+      event.type === 'groupMemberAdded' ||
+      event.type === 'groupMemberRemoved'
+    ) return
+
     if (event.type === 'messageReceived') {
       const known = get().conversations[event.peerId] ?? get().activePeers[event.peerId]
       const peer: PeerInfo = {

@@ -16,6 +16,7 @@ import {
 } from '../modules/spiritchat-crypto-core'
 import { useProfileStore } from '../store/profile'
 import { useChatStore } from '../store/chat'
+import { useGroupStore } from '../store/groups'
 import { handlePeerAvatarEvent } from '../store/peerAvatars'
 
 const queryClient = new QueryClient({
@@ -70,28 +71,34 @@ function P2pStartupErrorBanner() {
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({ Nunito_700Bold, Nunito_800ExtraBold })
   const fingerprint = useProfileStore(s => s.fingerprint)
+  const peerId = useProfileStore(s => s.peerId)
 
-  // Chat events are handled entirely in the store (see store/chat.ts) —
-  // this just wires the native event stream to it, once for the app's
-  // lifetime; ChatManager.swift already only ever emits for whichever
+  // Chat events are handled entirely in the stores (see store/chat.ts and
+  // store/groups.ts) — this just wires the native event stream to both,
+  // once for the app's lifetime; each ignores whatever event type isn't
+  // its own. ChatManager.swift already only ever emits for whichever
   // account is currently active, so nothing here needs to change on an
   // account switch.
   useEffect(() => {
     return addChatEventListener((event) => {
       useChatStore.getState().handleChatEvent(event)
+      useGroupStore.getState().handleChatEvent(event)
     })
   }, [])
 
-  // Loads the active account's own conversations whenever `fingerprint`
-  // changes — on first bootstrap, and again on every account switch, since
-  // a different fingerprint means an entirely different, namespaced set of
-  // conversations (see store/chat.ts's AsyncStorage key helpers). Resets
-  // to empty when it goes blank (signed out of every account).
+  // Loads the active account's own conversations/groups whenever
+  // `fingerprint` changes — on first bootstrap, and again on every account
+  // switch, since a different fingerprint means an entirely different,
+  // namespaced set of both (see store/chat.ts's and store/groups.ts's own
+  // AsyncStorage key helpers). Resets to empty when it goes blank (signed
+  // out of every account).
   useEffect(() => {
     if (fingerprint) {
       useChatStore.getState().loadForFingerprint(fingerprint)
+      useGroupStore.getState().loadForFingerprint(fingerprint, peerId)
     } else {
       useChatStore.getState().reset()
+      useGroupStore.getState().reset()
     }
   }, [fingerprint])
 

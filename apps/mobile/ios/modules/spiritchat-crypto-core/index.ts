@@ -22,6 +22,14 @@ export type P2pEvent =
   | { type: 'addressAnnouncementFailed'; reason: string }
   | { type: 'blobFetched'; peerId: string; id: string; localPath: string }
   | { type: 'blobFetchFailed'; peerId: string; id: string; reason: string }
+  | { type: 'contactCardAnnounced' }
+  | { type: 'contactCardAnnouncementFailed'; reason: string }
+  | { type: 'contactCardResolved'; ownerIdentityPublicKeyBase64: string; card: Uint8Array }
+  | { type: 'contactCardResolutionFailed'; ownerIdentityPublicKeyBase64: string }
+  | { type: 'avatarPointerAnnounced' }
+  | { type: 'avatarPointerAnnouncementFailed'; reason: string }
+  | { type: 'avatarPointerResolved'; peerId: string; avatarContentId: Uint8Array }
+  | { type: 'avatarPointerResolutionFailed'; peerId: string }
   | { type: 'usernameResolved'; username: string; publicKeyBase64: string; fingerprint: string; peerId: string }
   | { type: 'usernameClaimInvalid'; username: string }
   | { type: 'usernameResolutionFailed'; username: string }
@@ -57,6 +65,10 @@ export type ChatEvent =
   | { type: 'messageReceived'; peerId: string; peerFingerprint: string; peerPublicKeyBase64: string; plaintext: string; at: number }
   | { type: 'messageSent'; peerId: string; localId: string }
   | { type: 'messageFailed'; peerId: string; localId: string; reason: string }
+  | { type: 'groupInvited'; groupId: string; name: string; members: string[] }
+  | { type: 'groupMessageReceived'; groupId: string; senderPeerId: string; plaintext: string; at: number }
+  | { type: 'groupMemberAdded'; groupId: string; memberPeerId: string }
+  | { type: 'groupMemberRemoved'; groupId: string; memberPeerId: string }
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -92,6 +104,8 @@ const NativeCryptoCore = requireNativeModule<
     blobReserve(idHex: string): boolean
     p2pFetchBlob(peerId: string, idHex: string): void
     p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void
+    p2pAnnounceAvatarPointer(avatarContentId: Uint8Array): void
+    p2pResolveAvatarPointer(peerId: string): void
     ledgerBuildUsernameClaim(username: string, anchorHeight: number, anchorBlockHash: Uint8Array, nonce: Uint8Array): Uint8Array
     p2pSubmitUsernameClaim(transactionBytes: Uint8Array): void
     p2pSubmitMinedBlock(blockBytes: Uint8Array): void
@@ -104,6 +118,10 @@ const NativeCryptoCore = requireNativeModule<
     setMixRelayParticipationEnabled(enabled: boolean): void
     mixDummyTrafficBytesPerHourEstimate(): number
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
+    chatCreateGroup(name: string, memberPeerIds: string[]): string
+    chatSendGroupMessage(groupId: string, plaintext: string): string
+    chatAddGroupMember(groupId: string, newMemberPeerId: string): void
+    chatRemoveGroupMember(groupId: string, memberToRemove: string): void
     addListener<EventName extends keyof NativeEvents>(
       eventName: EventName,
       listener: NativeEvents[EventName]
@@ -340,6 +358,27 @@ export function p2pFetchBlob(peerId: string, idHex: string): void {
  */
 export function p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void {
   NativeCryptoCore.p2pSetLocalBlobRaw(idHex, bytes)
+}
+
+/**
+ * Publishes this device's own current avatar content id into the public
+ * DHT, keyed by its own peer id — the pointer only, not the avatar bytes
+ * (those still need `p2pFetchBlob` over a live connection). Re-run
+ * periodically (DHT records expire) and whenever the avatar changes.
+ * Answered by `avatarPointerAnnounced`/`avatarPointerAnnouncementFailed`.
+ */
+export function p2pAnnounceAvatarPointer(avatarContentId: Uint8Array): void {
+  NativeCryptoCore.p2pAnnounceAvatarPointer(avatarContentId)
+}
+
+/**
+ * Looks up whatever avatar content id `peerId` currently has published in
+ * the DHT — lets a caller learn which id to `p2pFetchBlob` even while
+ * `peerId` is offline right now. Answered by `avatarPointerResolved`/
+ * `avatarPointerResolutionFailed`.
+ */
+export function p2pResolveAvatarPointer(peerId: string): void {
+  NativeCryptoCore.p2pResolveAvatarPointer(peerId)
 }
 
 export type UsernameLookup =
@@ -686,6 +725,45 @@ export function mixDummyTrafficBytesPerHourEstimate(): number {
  */
 export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string {
   return NativeCryptoCore.chatSendMessage(peerId, peerPublicKeyBase64, plaintext)
+}
+
+/**
+ * Creates a group named `name` with `memberPeerIds` as its initial
+ * members. Every member (here, or added later via `chatAddGroupMember`)
+ * must already be an existing 1:1 contact (a group invite piggybacks on
+ * an *existing* pairwise session — it never triggers first-contact/X3DH
+ * establishment the way `chatSendMessage` does). Returns the new group's id.
+ */
+export function chatCreateGroup(name: string, memberPeerIds: string[]): string {
+  return NativeCryptoCore.chatCreateGroup(name, memberPeerIds)
+}
+
+/**
+ * Encrypts `plaintext` once (Sender Keys — see
+ * `spiritchat_crypto_core::sender_key`) and queues it for delivery to
+ * every other member of `groupId` — durable and retried on reconnect the
+ * same way `chatSendMessage` already is. Returns a local id.
+ */
+export function chatSendGroupMessage(groupId: string, plaintext: string): string {
+  return NativeCryptoCore.chatSendGroupMessage(groupId, plaintext)
+}
+
+/**
+ * Adds `newMemberPeerId` (who must already be an existing 1:1 contact) to
+ * `groupId`. `groupMemberAdded` on `onChatEvent` confirms it locally.
+ */
+export function chatAddGroupMember(groupId: string, newMemberPeerId: string): void {
+  NativeCryptoCore.chatAddGroupMember(groupId, newMemberPeerId)
+}
+
+/**
+ * Removes `memberToRemove` from `groupId` and rotates this device's own
+ * Sender Key chain (every remaining member does the same independently)
+ * so the removed member can't decrypt anything sent afterward.
+ * `groupMemberRemoved` on `onChatEvent` confirms it locally.
+ */
+export function chatRemoveGroupMember(groupId: string, memberToRemove: string): void {
+  NativeCryptoCore.chatRemoveGroupMember(groupId, memberToRemove)
 }
 
 /** Subscribes to decrypted/queued-message events. Returns an unsubscribe function. */

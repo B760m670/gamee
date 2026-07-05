@@ -163,6 +163,33 @@ fn pow_hash(tag: &[u8], envelope: &[u8], deposited_at: u64, nonce: [u8; 8]) -> [
     Sha256::digest(pow_preimage(tag, envelope, deposited_at, nonce)).into()
 }
 
+/// Which of `slots` DHT replication slots (see `mailbox_dht.rs`) a given
+/// deposit's supplementary DHT replica belongs under — deterministic from
+/// the deposit's own already-validated content, never random: this node's
+/// own local copy (`MailboxStore::accept`) is always the primary record
+/// regardless, so nothing here needs to be reconstructible independently
+/// the way `mailbox_tag` itself does. Two different deposits under the
+/// same tag landing in the same slot only by the `1 in slots` coincidence
+/// simply overwrite each other's DHT replica, never either one's local
+/// copy — see `mailbox_dht.rs`'s own doc comment.
+///
+/// Deliberately its own hash, not a reuse of `pow_hash` — a *valid*
+/// deposit's PoW hash always has its leading `MAILBOX_POW_LEADING_ZERO_BITS`
+/// bits zeroed by construction (that's what makes it valid), which would
+/// make the leading byte of that hash a constant `0x00` for every real
+/// deposit at the current 20-bit difficulty, collapsing every deposit into
+/// the same slot regardless of `slots`.
+pub fn dht_replication_slot(deposit: &MailboxDeposit, slots: u8) -> u8 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"spiritchat-mailbox-dht-slot-v1");
+    hasher.update(deposit.tag);
+    hasher.update(&deposit.envelope);
+    hasher.update(deposit.deposited_at.to_le_bytes());
+    hasher.update(deposit.pow_nonce);
+    let hash: [u8; 32] = hasher.finalize().into();
+    hash[0] % slots
+}
+
 fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
     let mut count = 0;
     for byte in hash {
@@ -511,6 +538,33 @@ mod tests {
         assert_eq!(epoch_for(0), 0);
         assert_eq!(epoch_for(TAG_EPOCH_SECS - 1), 0);
         assert_eq!(epoch_for(TAG_EPOCH_SECS), 1);
+    }
+
+    #[test]
+    fn dht_replication_slot_is_deterministic_and_within_range() {
+        let tag = test_tag(1);
+        let deposit = make_valid_deposit(&tag, b"hello", 1_000_000);
+        let first = dht_replication_slot(&deposit, 4);
+        let second = dht_replication_slot(&deposit, 4);
+        assert_eq!(first, second);
+        assert!(first < 4);
+    }
+
+    #[test]
+    fn dht_replication_slot_uses_more_than_one_slot_across_many_deposits() {
+        let tag = test_tag(1);
+        // Not a strict per-pair guarantee (a collision is expected 1-in-4
+        // of the time by design — see this function's own doc comment),
+        // but across 20 distinct deposits it would be a suspicious
+        // coincidence if this weren't actually using the deposit's own
+        // content at all rather than secretly being constant.
+        let slots: std::collections::HashSet<u8> = (0..20u64)
+            .map(|i| {
+                let deposit = make_valid_deposit(&tag, format!("message {i}").as_bytes(), 1_000_000 + i);
+                dht_replication_slot(&deposit, 4)
+            })
+            .collect();
+        assert!(slots.len() > 1, "expected more than one distinct slot across 20 deposits, got {slots:?}");
     }
 
     #[test]

@@ -28,14 +28,17 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::avatar_pointer;
 use crate::behaviour::{self, Behaviour, BehaviourEvent, BlobResponse, MixMessage};
 use crate::bootstrap;
 use crate::command::Command;
+use crate::contact_card;
 use crate::error::{P2pError, Result};
 use crate::event::P2pEvent;
 use crate::identity;
 use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 use crate::mailbox;
+use crate::mailbox_dht;
 use crate::mix;
 use crate::rendezvous;
 use crate::username;
@@ -250,6 +253,20 @@ struct Pending {
     /// A `RequestChainSync`'s follow-up: waiting on a batch of blocks from
     /// `peer` after learning its tip is heavier than ours.
     chain_sync_blocks: HashMap<OutboundRequestId, PeerId>,
+    announce_contact_card: std::collections::HashSet<QueryId>,
+    /// Keyed by the same `owner_identity_public_key` the original
+    /// `Command::ResolveContactCard` was given, so the answering event can
+    /// echo it back to the caller.
+    resolve_contact_card: HashMap<QueryId, Vec<u8>>,
+    announce_avatar_pointer: std::collections::HashSet<QueryId>,
+    /// Keyed by the same `owner` `Command::ResolveAvatarPointer` was given.
+    resolve_avatar_pointer: HashMap<QueryId, PeerId>,
+    /// One entry per in-flight `mailbox_dht::record_key_for` slot lookup a
+    /// `Command::RetrieveFromMailbox` fired off — see
+    /// `send_mailbox_retrieval_query`. Just a marker (there's nothing to
+    /// echo back beyond the envelope bytes the record itself carries), so
+    /// a `HashSet` is enough, same as `announce`/`announce_contact_card`.
+    mailbox_dht_retrieval: std::collections::HashSet<QueryId>,
 }
 
 /// One in-flight `spawn_blocking` nonce search — tagged with a generation
@@ -549,7 +566,7 @@ async fn run_event_loop(
 }
 
 /// Whether `command` needs at least one connected peer to have any real
-/// chance of succeeding — the four commands that go straight to Kademlia's
+/// chance of succeeding — the commands that go straight to Kademlia's
 /// `put_record`/`get_record`. Dialing itself is excluded: it's how a
 /// connection gets made in the first place, so it must never be deferred.
 fn needs_dht_peer(command: &Command) -> bool {
@@ -559,6 +576,10 @@ fn needs_dht_peer(command: &Command) -> bool {
             | Command::AnnounceAddresses { .. }
             | Command::AnnounceUsername { .. }
             | Command::ResolveUsername { .. }
+            | Command::AnnounceContactCard { .. }
+            | Command::ResolveContactCard { .. }
+            | Command::AnnounceAvatarPointer { .. }
+            | Command::ResolveAvatarPointer { .. }
     )
 }
 
@@ -652,6 +673,34 @@ fn handle_command(
             pending.blob_fetch.insert(request_id, (peer, id));
         }
 
+        Command::AnnounceContactCard { owner_identity_public_key, card } => {
+            let key = contact_card::record_key_for(&owner_identity_public_key);
+            let record = Record::new(key, card);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_contact_card.insert(query_id);
+            }
+        }
+
+        Command::ResolveContactCard { owner_identity_public_key } => {
+            let key = contact_card::record_key_for(&owner_identity_public_key);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_contact_card.insert(query_id, owner_identity_public_key);
+        }
+
+        Command::AnnounceAvatarPointer { avatar_content_id } => {
+            let key = avatar_pointer::record_key_for(&local_peer_id);
+            let record = Record::new(key, avatar_content_id);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_avatar_pointer.insert(query_id);
+            }
+        }
+
+        Command::ResolveAvatarPointer { owner } => {
+            let key = avatar_pointer::record_key_for(&owner);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_avatar_pointer.insert(query_id, owner);
+        }
+
         Command::SendMixPacket { first_hop, packet_bytes } => {
             let message = MixMessage { packet_bytes, sender_routing_public_key: mix_public.to_bytes() };
             swarm.behaviour_mut().mix.send_request(&first_hop, message);
@@ -678,7 +727,7 @@ fn handle_command(
         }
 
         Command::RetrieveFromMailbox { shared_material } => {
-            send_mailbox_retrieval_query(swarm, known_mix_relays, known_mix_routing_keys, local_peer_id, mix_public, shared_material, events);
+            send_mailbox_retrieval_query(swarm, known_mix_relays, known_mix_routing_keys, local_peer_id, mix_public, pending, shared_material, events);
         }
 
         Command::AnnounceUsername { username, claim } => {
@@ -919,6 +968,21 @@ fn handle_kad_event(
                     username,
                     claim: found.record.value,
                 });
+            } else if let Some(owner_identity_public_key) = pending.resolve_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardResolved {
+                    owner_identity_public_key,
+                    card: found.record.value,
+                });
+            } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerResolved { owner, avatar_content_id: found.record.value });
+            } else if pending.mailbox_dht_retrieval.remove(&id) {
+                // One of a `RetrieveFromMailbox`'s per-slot DHT lookups
+                // (see `send_mailbox_retrieval_query`) found a replica —
+                // surfaced exactly like a mix-routed
+                // `MailboxEnvelopeRetrieved` so the app layer (and
+                // ChatManager.swift) needs no changes to benefit from
+                // this second delivery avenue.
+                let _ = events.send(P2pEvent::MailboxEnvelopeRetrieved { envelope: found.record.value });
             }
         }
         QueryResult::GetRecord(Err(_)) => {
@@ -926,6 +990,15 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::PeerAddressResolutionFailed { peer });
             } else if let Some(username) = pending.resolve_username.remove(&id) {
                 let _ = events.send(P2pEvent::UsernameResolutionFailed { username });
+            } else if let Some(owner_identity_public_key) = pending.resolve_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardResolutionFailed { owner_identity_public_key });
+            } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerResolutionFailed { owner });
+            } else {
+                // An empty slot is the expected steady state, not a real
+                // failure — silence, same reasoning as a mailbox query
+                // that simply finds nothing queued under a tag.
+                pending.mailbox_dht_retrieval.remove(&id);
             }
         }
         QueryResult::PutRecord(Ok(PutRecordOk { .. })) => {
@@ -933,6 +1006,10 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::AddressesAnnounced);
             } else if let Some(username) = pending.announce_username.remove(&id) {
                 let _ = events.send(P2pEvent::UsernameAnnounced { username });
+            } else if pending.announce_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardAnnounced);
+            } else if pending.announce_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerAnnounced);
             }
         }
         QueryResult::PutRecord(Err(err)) => {
@@ -943,6 +1020,10 @@ fn handle_kad_event(
                     username,
                     reason: err.to_string(),
                 });
+            } else if pending.announce_contact_card.remove(&id) {
+                let _ = events.send(P2pEvent::ContactCardAnnouncementFailed { reason: err.to_string() });
+            } else if pending.announce_avatar_pointer.remove(&id) {
+                let _ = events.send(P2pEvent::AvatarPointerAnnouncementFailed { reason: err.to_string() });
             }
         }
         _ => {}
@@ -1120,10 +1201,24 @@ fn handle_mix_event(
                             // sender who can already tell locally whether
                             // their own stamp/timestamp were valid before
                             // ever sending.
-                            if mailbox::validate(&deposit, mailbox::now_unix()).is_ok()
-                                && mailbox_store.accept(deposit).is_ok()
-                            {
-                                let _ = events.send(P2pEvent::MailboxDepositStored);
+                            if mailbox::validate(&deposit, mailbox::now_unix()).is_ok() {
+                                // Replicate into the public DHT before
+                                // `accept` consumes `deposit` — this
+                                // node's own local `MailboxStore` stays
+                                // the primary copy either way; the DHT
+                                // put is supplementary redundancy so a
+                                // recipient can still recover this
+                                // deposit even if a later mix-routed
+                                // query can't currently reach *this* node
+                                // specifically (see mailbox_dht.rs).
+                                let slot = mailbox::dht_replication_slot(&deposit, mailbox_dht::MAILBOX_DHT_SLOTS);
+                                let key = mailbox_dht::record_key_for(&deposit.tag, slot);
+                                let record = Record::new(key, deposit.envelope.clone());
+                                let _ = swarm.behaviour_mut().kad.put_record(record, Quorum::One);
+
+                                if mailbox_store.accept(deposit).is_ok() {
+                                    let _ = events.send(P2pEvent::MailboxDepositStored);
+                                }
                             }
                         } else if let Some((tag, surb)) = parse_mailbox_query(&payload) {
                             // This node is being asked, as an anonymous
@@ -1399,17 +1494,33 @@ fn send_mailbox_deposit(
 /// likely to reach whoever holds the match instead of depending on luck.
 /// See `Command::RetrieveFromMailbox`'s own doc comment for the full round
 /// trip this kicks off.
+#[allow(clippy::too_many_arguments)]
 fn send_mailbox_retrieval_query(
     swarm: &mut Swarm<Behaviour>,
     known_mix_relays: &HashMap<NodeAddressBytes, PeerId>,
     known_mix_routing_keys: &HashMap<PeerId, PublicKey>,
     local_peer_id: PeerId,
     mix_public: PublicKey,
+    pending: &mut Pending,
     shared_material: Vec<u8>,
     events: &mpsc::UnboundedSender<P2pEvent>,
 ) {
     let mut rng = rand::thread_rng();
     let tag = mailbox::mailbox_tag(&shared_material, mailbox::epoch_for(mailbox::now_unix()));
+
+    // Independent of the mix-routed query below, and fired regardless of
+    // whether a usable mix path even exists right now: any of the DHT's
+    // own replica nodes for one of this tag's slots (see
+    // `mailbox_dht.rs`) can answer, not just the one deterministic relay
+    // the mix path's final hop would be. This is what lets a retrieval
+    // succeed even while this node has no live mix relay connection at
+    // all, as long as *some* DHT peer does.
+    for slot in 0..mailbox_dht::MAILBOX_DHT_SLOTS {
+        let key = mailbox_dht::record_key_for(&tag, slot);
+        let query_id = swarm.behaviour_mut().kad.get_record(key);
+        pending.mailbox_dht_retrieval.insert(query_id);
+    }
+
     let Some(hops) = build_mix_path_to_tag(&tag, known_mix_relays, known_mix_routing_keys, &mut rng) else {
         let _ = events.send(P2pEvent::MixForwardFailed { reason: "no mix relay is currently known and reachable".into() });
         return;
@@ -1910,5 +2021,65 @@ mod tests {
     fn build_mix_path_to_tag_returns_nothing_when_no_relay_is_known_at_all() {
         let path = build_mix_path_to_tag(&[3u8; 32], &HashMap::new(), &HashMap::new(), &mut rand::thread_rng());
         assert!(path.is_none());
+    }
+
+    // Phase 8 hardening: a statistical check that a *minority* coalition
+    // of colluding relays essentially never ends up controlling every hop
+    // of a real path — the only way collusion could ever link sender to
+    // recipient by construction (see mix.rs's own
+    // `colluding_entry_and_exit_hops_cannot_bridge_an_honest_middle_hop`
+    // for why even a *partial* coalition, missing just the middle hop,
+    // already isn't enough). This doesn't re-derive the combinatorics by
+    // hand and assert an exact match (flaky, and re-implements the thing
+    // under test) — it just confirms `build_mix_path_to_tag`'s real,
+    // production path-selection isn't secretly biased toward reusing a
+    // small subset of relays, which is the one way this guarantee could
+    // quietly break without any single unit test of `pick_mix_path` in
+    // isolation catching it.
+    #[test]
+    fn a_minority_colluding_coalition_rarely_ends_up_controlling_every_hop_of_a_random_path() {
+        const TOTAL_RELAYS: u8 = 7;
+        const COLLUDING_RELAYS: u8 = 3; // a minority: 3 of 7
+
+        let mut relays = HashMap::new();
+        let mut keys = HashMap::new();
+        let mut colluding = std::collections::HashSet::new();
+        for seed in 1..=TOTAL_RELAYS {
+            let (address, peer, public) = usable_relay(seed);
+            relays.insert(address, peer);
+            keys.insert(peer, public);
+            if seed <= COLLUDING_RELAYS {
+                colluding.insert(peer);
+            }
+        }
+
+        const TRIALS: u32 = 500;
+        let mut fully_colluding_paths = 0u32;
+        let mut rng = rand::thread_rng();
+        for trial in 0..TRIALS {
+            let tag = {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&trial.to_le_bytes());
+                bytes
+            };
+            let path = build_mix_path_to_tag(&tag, &relays, &keys, &mut rng).unwrap();
+            assert_eq!(path.len(), MIX_PATH_HOPS, "the full relay pool is large enough that every trial should get a full-length path");
+            if path.iter().all(|&(_, peer, _)| colluding.contains(&peer)) {
+                fully_colluding_paths += 1;
+            }
+        }
+
+        // The true combinatorial rate (ignoring the deterministic final-hop
+        // pinning, which only makes a full-coalition path harder, never
+        // easier) is C(3,3)/C(7,3) = 1/35 ≈ 2.9%. Assert comfortably above
+        // that noise floor rather than pinning the exact figure — this is a
+        // regression guard against the selection becoming *biased* toward
+        // the same small subset, not a re-verification of the exact odds.
+        let rate = f64::from(fully_colluding_paths) / f64::from(TRIALS);
+        assert!(
+            rate < 0.15,
+            "a minority coalition of {COLLUDING_RELAYS}/{TOTAL_RELAYS} relays controlled every hop in {fully_colluding_paths}/{TRIALS} trials \
+             ({rate:.3}) — real routing should land far closer to the ~2.9% a fair random selection predicts"
+        );
     }
 }

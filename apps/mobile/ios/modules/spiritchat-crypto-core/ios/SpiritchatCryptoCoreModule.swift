@@ -312,6 +312,25 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().node.setLocalBlob(id: id, bytes: bytes)
     }
 
+    // Publishes this device's own current avatar content id into the
+    // public DHT, keyed by its own peer id — the pointer only, not the
+    // avatar bytes (those still need `p2pFetchBlob` over a live
+    // connection). `avatarContentId` is opaque bytes to this layer (see
+    // store/peerAvatars.ts for what it encodes). Answered by
+    // `avatarPointerAnnounced`/`avatarPointerAnnouncementFailed` on
+    // `onP2pEvent`.
+    Function("p2pAnnounceAvatarPointer") { (avatarContentId: Data) throws in
+      try requireP2pSession().node.announceAvatarPointer(avatarContentId: avatarContentId)
+    }
+
+    // Looks up whatever avatar content id `peerId` currently has published
+    // in the DHT — lets a caller learn which id to `p2pFetchBlob` even
+    // while `peerId` is offline right now. Answered by
+    // `avatarPointerResolved`/`avatarPointerResolutionFailed`.
+    Function("p2pResolveAvatarPointer") { (peerId: String) throws in
+      try requireP2pSession().node.resolveAvatarPointer(peerId: peerId)
+    }
+
     // Builds and signs a new @username ledger claim — pure (nothing sent
     // anywhere yet); pass the result to `p2pSubmitUsernameClaim`. Claim-
     // building lives in Rust (not hand-encoded here, unlike the old DHT
@@ -430,6 +449,50 @@ public class SpiritchatCryptoCoreModule: Module {
         throw ChatError.malformedPlaintext
       }
       return try requireP2pSession().chatManager.sendMessage(peerId: peerId, peerPublicKey: publicKey, plaintext: plaintextBytes)
+    }
+
+    // Creates a group named `name` with `memberPeerIds` as its initial
+    // members — every one of them must already be an existing 1:1 contact
+    // (see ChatManager's own "MARK: - Groups" doc comment for this v1's
+    // scope). Returns the new group's id, or throws if this device's own
+    // identity isn't ready yet. `groupInvited`/`groupMessageReceived` on
+    // `onChatEvent` answer what happens next for everyone else.
+    Function("chatCreateGroup") { (name: String, memberPeerIds: [String]) throws -> String in
+      guard let groupId = try requireP2pSession().chatManager.createGroup(name: name, memberPeerIds: memberPeerIds) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return groupId
+    }
+
+    // Encrypts `plaintext` once (Sender Keys) and queues it for delivery
+    // to every other member of `groupId` — durable and retried on
+    // reconnect the same way `chatSendMessage` already is. Returns a
+    // local id; throws if this device isn't a member of `groupId` or its
+    // plaintext isn't valid UTF-8.
+    Function("chatSendGroupMessage") { (groupId: String, plaintext: String) throws -> String in
+      guard let plaintextBytes = plaintext.data(using: .utf8) else {
+        throw ChatError.malformedPlaintext
+      }
+      guard let localId = try requireP2pSession().chatManager.sendGroupMessage(groupId: groupId, plaintext: plaintextBytes) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return localId
+    }
+
+    // Adds `newMemberPeerId` (who must already be an existing 1:1
+    // contact) to `groupId`. `groupMemberAdded` on `onChatEvent` confirms
+    // it locally; the new member gets a `groupInvited` once their own
+    // invite arrives.
+    Function("chatAddGroupMember") { (groupId: String, newMemberPeerId: String) throws in
+      try requireP2pSession().chatManager.addGroupMember(groupId: groupId, newMemberPeerId: newMemberPeerId)
+    }
+
+    // Removes `memberToRemove` from `groupId` and rotates this device's
+    // own Sender Key chain (every remaining member does the same
+    // independently) so the removed member can't decrypt anything sent
+    // afterward. `groupMemberRemoved` on `onChatEvent` confirms it locally.
+    Function("chatRemoveGroupMember") { (groupId: String, memberToRemove: String) throws in
+      try requireP2pSession().chatManager.removeGroupMember(groupId: groupId, memberToRemove: memberToRemove)
     }
   }
 }

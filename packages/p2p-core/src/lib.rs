@@ -18,14 +18,17 @@
 //! punching where possible (`dcutr`) — both are libp2p protocols any peer
 //! can run, not a role this project's infrastructure fills.
 
+mod avatar_pointer;
 mod behaviour;
 mod bootstrap;
 mod command;
+mod contact_card;
 mod error;
 mod event;
 mod identity;
 mod ledger;
 mod mailbox;
+mod mailbox_dht;
 mod mix;
 mod node;
 mod rendezvous;
