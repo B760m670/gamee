@@ -654,6 +654,7 @@ dependencies = [
  "digest 0.10.7",
  "fiat-crypto",
  "rustc_version",
+ "serde",
  "subtle 2.6.1",
  "zeroize",
 ]
@@ -769,6 +770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8",
+ "serde",
  "signature",
 ]
 
@@ -2949,6 +2951,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-big-array"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3122,14 +3133,17 @@ name = "spiritchat-crypto-core-ffi"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "ed25519-dalek",
  "rand_core 0.6.4",
  "sha2",
  "spiritchat-crypto-core",
  "spiritchat-ledger-core",
+ "spiritchat-mls-core",
  "spiritchat-p2p-core",
  "thiserror 2.0.18",
  "tokio",
  "uniffi",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -3142,6 +3156,23 @@ dependencies = [
  "sha2",
  "spiritchat-crypto-core",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "spiritchat-mls-core"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hkdf",
+ "hmac",
+ "rand_core 0.6.4",
+ "serde",
+ "serde-big-array",
+ "sha2",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
