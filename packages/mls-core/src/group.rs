@@ -47,6 +47,11 @@ pub enum Proposal {
 
 /// What a committer broadcasts to existing members.
 pub struct Commit {
+    /// The epoch this commit advances *from* — a commit is only valid
+    /// against a member sitting at exactly this epoch, which is also what
+    /// lets the arbiter (phase 5) group concurrent commits by the epoch
+    /// they contend for.
+    pub from_epoch: u64,
     pub committer: LeafIndex,
     pub proposals: Vec<Proposal>,
     pub update_path: UpdatePath,
@@ -81,6 +86,7 @@ pub struct CommitOutput {
     pub welcomes: Vec<(MemberIdentity, Welcome)>,
 }
 
+#[derive(Clone)]
 pub struct GroupState {
     group_id: Vec<u8>,
     epoch: u64,
@@ -90,6 +96,19 @@ pub struct GroupState {
     transcript: Transcript,
     signing_key: SigningKey,
     own_identity: MemberIdentity,
+}
+
+/// A stable, public identifier for a commit — every member computes the
+/// identical value from the same commit bytes, so it's what the P2P
+/// arbiter (phase 5) orders concurrent commits by. Not secret; it's a
+/// hash of already-public content plus the confirmation tag.
+pub fn commit_id(group_id: &[u8], commit: &Commit) -> [u8; 32] {
+    let content = GroupState::commit_content(group_id, commit.from_epoch, commit.committer, &commit.proposals, &commit.update_path);
+    let mut h = Sha256::new();
+    h.update(b"spiritchat-mls-commitid-v1:");
+    h.update(&content);
+    h.update(commit.confirmation_tag);
+    h.finalize().into()
 }
 
 impl GroupState {
@@ -122,6 +141,11 @@ impl GroupState {
         self.epoch
     }
 
+    /// This group's id — needed by the arbiter to compute commit ids.
+    pub fn group_id_bytes(&self) -> &[u8] {
+        &self.group_id
+    }
+
     pub fn own_leaf(&self) -> LeafIndex {
         self.tree.own_leaf()
     }
@@ -141,6 +165,12 @@ impl GroupState {
 
     pub fn roster(&self) -> &[Option<MemberIdentity>] {
         &self.roster
+    }
+
+    /// This member's own identity — which roster entry is "us", needed by
+    /// the app layer (phase 6) to attribute and render group messages.
+    pub fn own_identity(&self) -> MemberIdentity {
+        self.own_identity
     }
 
     /// The context used as HPKE aad when sealing/opening an update path —
@@ -243,6 +273,19 @@ impl GroupState {
     /// security). Advances *this* member's state to the new epoch and
     /// returns the messages others need.
     pub fn commit(&mut self, proposals: Vec<Proposal>, rng: &mut impl CryptoRngCore) -> Result<CommitOutput, GroupError> {
+        let (output, next) = self.build_commit(proposals, rng)?;
+        *self = next;
+        Ok(output)
+    }
+
+    /// Builds a commit **without mutating self**, returning both the
+    /// messages for others and the post-commit state this member *would*
+    /// move to if this commit becomes canonical. The P2P arbiter (phase 5)
+    /// needs this: when two members commit concurrently at the same epoch,
+    /// only one wins, and a member must not have already advanced on a
+    /// commit that loses. `commit` above is just this plus adopting the
+    /// new state immediately (the single-committer, no-contention case).
+    pub fn build_commit(&self, proposals: Vec<Proposal>, rng: &mut impl CryptoRngCore) -> Result<(CommitOutput, GroupState), GroupError> {
         let prev_init = self.secrets.init_secret;
         let new_epoch = self.epoch + 1;
 
@@ -309,15 +352,23 @@ impl GroupState {
             }));
         }
 
-        // Commit locally.
-        self.tree = tree;
-        self.roster = roster;
-        self.secrets = secrets;
-        self.transcript.advance(&confirmed, &tag);
-        self.epoch = new_epoch;
+        // Assemble the post-commit state without touching self.
+        let mut next = self.clone();
+        next.tree = tree;
+        next.roster = roster;
+        next.secrets = secrets;
+        next.transcript.advance(&confirmed, &tag);
+        next.epoch = new_epoch;
 
-        let commit = Commit { committer: self.own_leaf(), proposals, update_path, confirmation_tag: tag, signature };
-        Ok(CommitOutput { commit, welcomes })
+        let commit = Commit {
+            from_epoch: self.epoch,
+            committer: self.own_leaf(),
+            proposals,
+            update_path,
+            confirmation_tag: tag,
+            signature,
+        };
+        Ok((CommitOutput { commit, welcomes }, next))
     }
 
     fn signed_bytes(content: &[u8], confirmed: &[u8; 32], tag: &[u8; 32]) -> Vec<u8> {
@@ -335,6 +386,12 @@ impl GroupState {
     /// secrets matches the committer's. A mismatch means divergent state
     /// and the commit is rejected whole.
     pub fn process_commit(&mut self, commit: &Commit) -> Result<(), GroupError> {
+        // A commit is only meaningful against the exact epoch it was built
+        // on — the arbiter (phase 5) relies on this to reject a commit
+        // that lost its epoch race and should be re-based, not applied.
+        if commit.from_epoch != self.epoch {
+            return Err(GroupError::WrongEpoch);
+        }
         let committer_identity = self
             .roster
             .get(commit.committer as usize)
@@ -476,6 +533,8 @@ pub enum GroupError {
     WelcomeDerivation,
     WelcomeUndecryptable,
     WelcomeTreeMismatch,
+    WrongEpoch,
+    NoCommitToResolve,
 }
 
 #[cfg(test)]
