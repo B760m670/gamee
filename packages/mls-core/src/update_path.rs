@@ -23,6 +23,7 @@ use crate::tree_math::{self, common_ancestor, leaf_to_node, LeafIndex, NodeIndex
 
 /// One direct-path node's contribution: its fresh public key, and its
 /// path secret sealed to each recipient node in the copath resolution.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PathNode {
     pub node: NodeIndex,
     pub public: PublicKey,
@@ -35,6 +36,7 @@ pub struct PathNode {
 /// The published form of an update — everything a non-updating member
 /// needs to converge, and nothing they shouldn't have (no plaintext path
 /// secrets).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct UpdatePath {
     pub updater: LeafIndex,
     pub leaf_public: PublicKey,

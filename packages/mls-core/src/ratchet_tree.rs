@@ -29,14 +29,14 @@ use crate::tree_math::{
 
 /// One non-blank node: everyone in the group knows `public`; `secret` is
 /// populated only in the views of members whose leaf sits under it.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub public: PublicKey,
     pub secret: Option<StaticSecret>,
 }
 
 /// One member's view of the group's ratchet tree.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct RatchetTree {
     /// `tree_math` array layout — `None` is a blank node.
     nodes: Vec<Option<Node>>,

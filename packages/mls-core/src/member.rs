@@ -20,7 +20,7 @@ const KEY_PACKAGE_LABEL: &[u8] = b"spiritchat-mls-keypackage-v1";
 
 /// A member's public identity in the group: their long-term Ed25519
 /// verifying key. Equality is by key bytes.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberIdentity(pub [u8; 32]);
 
 impl MemberIdentity {
@@ -38,10 +38,11 @@ impl std::fmt::Debug for MemberIdentity {
 /// A signed offer to occupy a leaf: the fresh X25519 leaf public key this
 /// member will hold, bound to their identity. Verified before an Add
 /// proposal naming it can be committed.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeyPackage {
     pub identity: MemberIdentity,
     pub leaf_public: PublicKey,
+    #[serde(with = "serde_big_array::BigArray")]
     pub signature: [u8; 64],
 }
 

@@ -23,7 +23,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 /// A sealed secret: the ephemeral public key ("enc" in HPKE terms)
 /// followed by the AEAD ciphertext. Opaque bytes to the transport layer.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SealedSecret {
     pub enc: [u8; 32],
     pub ciphertext: Vec<u8>,

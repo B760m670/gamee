@@ -45,7 +45,7 @@ fn derive_secret(secret: &[u8; 32], label: &[u8], context: &[u8]) -> [u8; 32] {
 /// `epoch_secret`, so they're independent (learning one reveals nothing
 /// about the others) yet all reproducible by every member who reached
 /// this epoch's root secret.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, serde::Serialize, serde::Deserialize)]
 pub struct EpochSecrets {
     /// Feeds the *next* epoch's key schedule as the Extract salt — the
     /// link that makes epochs a forward-secret ratchet.

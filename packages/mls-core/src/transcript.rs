@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 /// The rolling transcript state a member carries between epochs — just the
 /// interim hash; the confirmed hash is transient per commit.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Transcript {
     interim: [u8; 32],
 }

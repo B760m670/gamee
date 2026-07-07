@@ -39,13 +39,14 @@ use crate::tree_math::{common_ancestor, leaf_to_node, LeafIndex};
 use crate::update_path::{build_update_path, process_update_path, UpdatePath};
 
 /// A change to the roster, to be carried in a commit.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Proposal {
     Add(KeyPackage),
     Remove(LeafIndex),
 }
 
 /// What a committer broadcasts to existing members.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Commit {
     /// The epoch this commit advances *from* — a commit is only valid
     /// against a member sitting at exactly this epoch, which is also what
@@ -58,12 +59,25 @@ pub struct Commit {
     pub confirmation_tag: [u8; 32],
     /// Ed25519 over the commit content under the committer's identity —
     /// so a commit can't be forged or altered by a relaying peer.
+    #[serde(with = "serde_big_array::BigArray")]
     pub signature: [u8; 64],
+}
+
+impl Commit {
+    /// Wire encoding for gossip/mailbox transport.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("a Commit serializes")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GroupError> {
+        bincode::deserialize(bytes).map_err(|_| GroupError::Malformed)
+    }
 }
 
 /// Everything a newly added member needs to join at the committed epoch.
 /// `group_secrets` is HPKE-sealed to the joiner's key package leaf key;
 /// the rest is public group state.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Welcome {
     pub group_id: Vec<u8>,
     pub epoch: u64,
@@ -79,6 +93,16 @@ pub struct Welcome {
     pub sealed_group_secrets: SealedSecret,
 }
 
+impl Welcome {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("a Welcome serializes")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GroupError> {
+        bincode::deserialize(bytes).map_err(|_| GroupError::Malformed)
+    }
+}
+
 /// The output of committing: the commit for existing members, plus one
 /// welcome per added member (paired with who it's for).
 pub struct CommitOutput {
@@ -86,7 +110,7 @@ pub struct CommitOutput {
     pub welcomes: Vec<(MemberIdentity, Welcome)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GroupState {
     group_id: Vec<u8>,
     epoch: u64,
@@ -171,6 +195,18 @@ impl GroupState {
     /// the app layer (phase 6) to attribute and render group messages.
     pub fn own_identity(&self) -> MemberIdentity {
         self.own_identity
+    }
+
+    /// The full persisted state — as secret as any signing key (it holds
+    /// this member's own signing key plus every private tree node they're
+    /// entitled to). The app stores this exactly as securely as a 1:1
+    /// ratchet session, and reloads it on launch.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("a GroupState serializes")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GroupError> {
+        bincode::deserialize(bytes).map_err(|_| GroupError::Malformed)
     }
 
     /// The context used as HPKE aad when sealing/opening an update path —
@@ -535,6 +571,7 @@ pub enum GroupError {
     WelcomeTreeMismatch,
     WrongEpoch,
     NoCommitToResolve,
+    Malformed,
 }
 
 #[cfg(test)]
@@ -655,6 +692,34 @@ mod tests {
         let mut out = alice.commit(vec![Proposal::Add(carol_kp)], &mut rng(3)).unwrap();
         out.commit.confirmation_tag[0] ^= 0x01;
         assert!(bob.process_commit(&out.commit).is_err());
+    }
+
+    #[test]
+    fn state_commit_and_welcome_survive_serialization() {
+        // Everything that crosses the FFI boundary or gets persisted must
+        // round-trip byte-for-byte in behavior. Reconstruct a whole join
+        // through serialized forms only.
+        let mut alice = GroupState::create(b"g".to_vec(), signing_key(1), &mut rng(1));
+        let (bob_sk, bob_ls, bob_kp) = new_candidate(2);
+
+        let out = alice.commit(vec![Proposal::Add(bob_kp)], &mut rng(2)).unwrap();
+
+        // Alice persists and reloads her own state mid-session.
+        let alice_reloaded = GroupState::from_bytes(&alice.to_bytes()).unwrap();
+        assert_eq!(alice_reloaded.epoch_authenticator(), alice.epoch_authenticator());
+
+        // Bob joins from a Welcome that was serialized and shipped.
+        let welcome_bytes = out.welcomes[0].1.to_bytes();
+        let welcome = Welcome::from_bytes(&welcome_bytes).unwrap();
+        let bob = GroupState::join(&welcome, bob_sk, bob_ls).unwrap();
+        assert_eq!(bob.epoch_authenticator(), alice.epoch_authenticator());
+
+        // A subsequent commit travels as bytes and still applies.
+        let mut bob_state = GroupState::from_bytes(&bob.to_bytes()).unwrap();
+        let out2 = alice.commit(vec![], &mut rng(3)).unwrap();
+        let commit = Commit::from_bytes(&out2.commit.to_bytes()).unwrap();
+        bob_state.process_commit(&commit).unwrap();
+        assert_eq!(bob_state.epoch_authenticator(), alice.epoch_authenticator());
     }
 
     #[test]

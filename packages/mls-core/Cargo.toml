@@ -7,12 +7,15 @@ description = "TreeKEM-based continuous group key agreement for SpiritChat, foll
 [dependencies]
 hkdf = "0.12"
 sha2 = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }
 rand_core = "0.6"
 chacha20poly1305 = "0.10"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 hmac = "0.12"
 zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+serde-big-array = "0.5"
 
 [dev-dependencies]
 rand_chacha = "0.3"
