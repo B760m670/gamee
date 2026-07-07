@@ -41,7 +41,7 @@ fn signing_key(identity_seed: &[u8]) -> FfiResult<SigningKey> {
 #[derive(uniffi::Record)]
 pub struct FfiMlsLeafKey {
     pub secret: Vec<u8>,
-    pub public: Vec<u8>,
+    pub public_key: Vec<u8>,
 }
 
 /// Generates a leaf keypair.
@@ -49,7 +49,7 @@ pub struct FfiMlsLeafKey {
 pub fn mls_generate_leaf_key() -> FfiMlsLeafKey {
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
-    FfiMlsLeafKey { secret: secret.to_bytes().to_vec(), public: public.to_bytes().to_vec() }
+    FfiMlsLeafKey { secret: secret.to_bytes().to_vec(), public_key: public.to_bytes().to_vec() }
 }
 
 /// Builds and self-signs a key package (a signed offer to occupy a leaf)

@@ -76,6 +76,14 @@ final class ChatManager {
   private static let controlDistributionTag: UInt8 = 0x02
   private static let controlMemberAddedTag: UInt8 = 0x03
   private static let controlMemberRemovedTag: UInt8 = 0x04
+  // MLS group control (new groups). Distinct tags in the same inner
+  // control-message namespace as the Sender Keys ones above, so both
+  // schemes share one transport (pairwise ratchet sessions) without
+  // colliding. See the "Groups (MLS)" section.
+  private static let controlMlsInviteRequestTag: UInt8 = 0x05
+  private static let controlMlsKeyPackageTag: UInt8 = 0x06
+  private static let controlMlsWelcomeTag: UInt8 = 0x07
+  private static let controlMlsCommitTag: UInt8 = 0x08
 
   /// Group control messages (an invite, or a member handing out their
   /// Sender Key chain — see `GroupStore`) travel through an *existing*
@@ -448,29 +456,10 @@ final class ChatManager {
   /// isn't available yet or the group couldn't be persisted.
   @discardableResult
   func createGroup(name: String, memberPeerIds: [String]) -> String? {
-    guard let myPeerId = try? node.localPeerId() else { return nil }
-    let groupIdBytes = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
-    let groupId = Self.hexString(groupIdBytes)
-
-    let ownState = FfiSenderKeyState.generate()
-    let session = GroupStore.Session(
-      groupId: groupId, name: name, members: memberPeerIds,
-      ownSenderKeyStateBytes: ownState.toBytes(), receiverStates: [:]
-    )
-    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return nil }
-
-    // The invite's own member list includes this device (the creator) —
-    // every recipient needs to know to also send *it* their distribution,
-    // not just each other.
-    let allMembers = memberPeerIds + [myPeerId]
-    let distribution = ownState.toDistributionBytes()
-    for member in memberPeerIds {
-      sendGroupControlMessageBestEffort(
-        peerId: member,
-        payload: Self.frameGroupInvite(groupId: groupIdBytes, name: name, members: allMembers, distribution: distribution)
-      )
-    }
-    return groupId
+    // New groups are always MLS/TreeKEM (see the "Groups (MLS)" section);
+    // existing Sender Keys groups keep working through the legacy paths,
+    // which every method below routes to via `session.isMls`.
+    return createGroupMls(name: name, memberPeerIds: memberPeerIds)
   }
 
   /// Encrypts `plaintext` once under this device's own chain for `groupId`
@@ -482,9 +471,14 @@ final class ChatManager {
   /// this device isn't (or is no longer) a member of `groupId`.
   @discardableResult
   func sendGroupMessage(groupId: String, plaintext: Data) -> String? {
+    guard let session = GroupStore.loadSession(slot: slot, groupId: groupId) else { return nil }
+    if session.isMls {
+      return sendGroupMessageMls(groupId: groupId, plaintext: plaintext)
+    }
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
           let groupIdBytes = Self.data(fromHex: groupId),
-          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes)
+          let ownStateBytes = session.ownSenderKeyStateBytes,
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: ownStateBytes)
     else { return nil }
 
     guard let signedEnvelope = try? ownState.encrypt(plaintext: plaintext, associatedData: groupIdBytes) else {
@@ -577,6 +571,18 @@ final class ChatManager {
     case Self.controlMemberRemovedTag:
       guard let (groupId, removedMemberPeerId) = Self.parseGroupMembershipChange(body) else { return }
       handleGroupMemberRemoved(fromPeerId: fromPeerId, groupIdBytes: groupId, removedMemberPeerId: removedMemberPeerId)
+    case Self.controlMlsInviteRequestTag:
+      guard let (groupId, name, members) = Self.parseMlsInviteRequest(body) else { return }
+      handleMlsInviteRequest(fromPeerId: fromPeerId, groupIdBytes: groupId, name: name, memberPeerIds: members)
+    case Self.controlMlsKeyPackageTag:
+      guard let (groupId, keyPackage) = Self.parseMlsBlob(body) else { return }
+      handleMlsKeyPackage(fromPeerId: fromPeerId, groupIdBytes: groupId, keyPackageBytes: keyPackage)
+    case Self.controlMlsWelcomeTag:
+      guard let (groupId, welcome) = Self.parseMlsBlob(body) else { return }
+      handleMlsWelcome(fromPeerId: fromPeerId, groupIdBytes: groupId, welcomeBytes: welcome)
+    case Self.controlMlsCommitTag:
+      guard let (groupId, commit) = Self.parseMlsBlob(body) else { return }
+      handleMlsCommit(fromPeerId: fromPeerId, groupIdBytes: groupId, commitBytes: commit)
     default:
       NSLog("[ChatManager] unrecognized group control message tag \(tag) from \(fromPeerId) — dropped")
     }
@@ -603,6 +609,7 @@ final class ChatManager {
     let ownState = FfiSenderKeyState.generate()
     let session = GroupStore.Session(
       groupId: groupId, name: name, members: otherMembers,
+      mlsStateBytes: nil,
       ownSenderKeyStateBytes: ownState.toBytes(),
       receiverStates: [fromPeerId: creatorReceiverState.toBytes()]
     )
@@ -631,7 +638,9 @@ final class ChatManager {
       return
     }
     guard let receiverState = try? FfiSenderKeyReceiverState.fromDistributionBytes(bytes: distributionBytes) else { return }
-    session.receiverStates[fromPeerId] = receiverState.toBytes()
+    var receiverStates = session.receiverStates ?? [:]
+    receiverStates[fromPeerId] = receiverState.toBytes()
+    session.receiverStates = receiverStates
     try? GroupStore.saveSession(session, slot: slot)
   }
 
@@ -646,10 +655,15 @@ final class ChatManager {
   /// position onward (see `SenderKeyState`'s own doc comment), so nothing
   /// about the past is exposed by adding someone new.
   func addGroupMember(groupId: String, newMemberPeerId: String) {
+    if let session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls {
+      addGroupMemberMls(groupId: groupId, newMemberPeerId: newMemberPeerId)
+      return
+    }
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
           let groupIdBytes = Self.data(fromHex: groupId),
           let myPeerId = try? node.localPeerId(),
-          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes),
+          let ownStateBytes = session.ownSenderKeyStateBytes,
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: ownStateBytes),
           !session.members.contains(newMemberPeerId)
     else { return }
 
@@ -675,7 +689,8 @@ final class ChatManager {
   private func handleGroupMemberAdded(fromPeerId: String, groupIdBytes: Data, newMemberPeerId: String) {
     let groupId = Self.hexString(groupIdBytes)
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), !session.members.contains(newMemberPeerId),
-          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes)
+          let ownStateBytes = session.ownSenderKeyStateBytes,
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: ownStateBytes)
     else { return }
     session.members.append(newMemberPeerId)
     guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
@@ -697,13 +712,17 @@ final class ChatManager {
   /// forward secrecy against the removed member must not depend on
   /// trusting whoever initiated the removal to have done it right.
   func removeGroupMember(groupId: String, memberToRemove: String) {
+    if let session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls {
+      removeGroupMemberMls(groupId: groupId, memberToRemove: memberToRemove)
+      return
+    }
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
           let groupIdBytes = Self.data(fromHex: groupId),
           session.members.contains(memberToRemove)
     else { return }
 
     session.members.removeAll { $0 == memberToRemove }
-    session.receiverStates.removeValue(forKey: memberToRemove)
+    session.receiverStates?.removeValue(forKey: memberToRemove)
     let freshState = FfiSenderKeyState.generate()
     session.ownSenderKeyStateBytes = freshState.toBytes()
     guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
@@ -727,7 +746,7 @@ final class ChatManager {
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.members.contains(removedMemberPeerId) else { return }
 
     session.members.removeAll { $0 == removedMemberPeerId }
-    session.receiverStates.removeValue(forKey: removedMemberPeerId)
+    session.receiverStates?.removeValue(forKey: removedMemberPeerId)
     let freshState = FfiSenderKeyState.generate()
     session.ownSenderKeyStateBytes = freshState.toBytes()
     guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
@@ -758,16 +777,250 @@ final class ChatManager {
       return
     }
 
-    for (memberPeerId, receiverStateBytes) in session.receiverStates {
+    if session.isMls {
+      handleIncomingGroupMessageMls(groupId: groupId, session: session, wire: signedEnvelope)
+      return
+    }
+
+    for (memberPeerId, receiverStateBytes) in (session.receiverStates ?? [:]) {
       guard let receiverState = try? FfiSenderKeyReceiverState.fromBytes(bytes: receiverStateBytes) else { continue }
       guard let plaintext = try? receiverState.decrypt(message: signedEnvelope, associatedData: groupIdBytes) else { continue }
       var updated = session
-      updated.receiverStates[memberPeerId] = receiverState.toBytes()
+      updated.receiverStates?[memberPeerId] = receiverState.toBytes()
       try? GroupStore.saveSession(updated, slot: slot)
       emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: memberPeerId, plaintext: plaintext))
       return
     }
     NSLog("[ChatManager] a group message for \(groupId) matched no known member's chain — dropped")
+  }
+
+  // MARK: - Groups (MLS/TreeKEM)
+  //
+  // New groups use MLS/TreeKEM (`spiritchat_mls_core` via `FfiMlsGroup`)
+  // instead of Sender Keys: O(log N) membership changes (a removal is one
+  // logarithmic commit, not everyone re-keying with everyone), post-
+  // compromise security (a self-update re-randomizes the epoch), and
+  // cryptographic agreement on the roster (the transcript-bound
+  // confirmation tag). Existing Sender Keys groups keep working through
+  // the legacy methods above; `session.isMls` is what every entry point
+  // routes on.
+  //
+  // MLS needs a joiner's *key package* (a signed leaf public key) before
+  // they can be added — a step Sender Keys didn't have. This is carried
+  // over the same pairwise ratchet sessions the Sender Keys control
+  // messages already used, so no new transport: a committer sends an
+  // invite request, the invitee replies with a key package, the committer
+  // commits the Add and returns a Welcome (to the joiner) plus a Commit
+  // (broadcast to existing members). Every member still has to be a 1:1
+  // contact first, exactly as before.
+
+  private var identitySeed: Data { identity.secretBytes() }
+
+  /// A roster leaf's identity public key resolved to a peer id, or nil for
+  /// a blank leaf (empty identity bytes).
+  private func mlsPeerId(forIdentity identityBytes: Data) -> String? {
+    guard !identityBytes.isEmpty else { return nil }
+    return try? p2pPeerIdFromPublicKey(publicKey: identityBytes)
+  }
+
+  /// Every *other* current member's peer id, from an MLS group's roster —
+  /// what content and commit fan-out address.
+  private func mlsMemberPeerIds(_ group: FfiMlsGroup, myPeerId: String) -> [String] {
+    group.roster().compactMap { mlsPeerId(forIdentity: $0) }.filter { $0 != myPeerId }
+  }
+
+  /// The leaf a given peer id occupies in a roster, or nil if absent.
+  private func mlsLeaf(forPeerId peerId: String, roster: [Data]) -> Int? {
+    for (leaf, identityBytes) in roster.enumerated() {
+      if let candidate = mlsPeerId(forIdentity: identityBytes), candidate == peerId { return leaf }
+    }
+    return nil
+  }
+
+  @discardableResult
+  private func createGroupMls(name: String, memberPeerIds: [String]) -> String? {
+    guard let myPeerId = try? node.localPeerId() else { return nil }
+    let groupIdBytes = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+    let groupId = Self.hexString(groupIdBytes)
+
+    guard let group = try? FfiMlsGroup.create(groupId: groupIdBytes, identitySeed: identitySeed) else { return nil }
+    let session = GroupStore.Session(
+      groupId: groupId, name: name, members: memberPeerIds,
+      mlsStateBytes: group.toBytes(), ownSenderKeyStateBytes: nil, receiverStates: nil
+    )
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return nil }
+
+    // Ask each initial member for a key package; their reply drives an
+    // Add commit (see handleMlsKeyPackage). The roster list includes this
+    // device so a joiner knows to reach it too.
+    let roster = memberPeerIds + [myPeerId]
+    for member in memberPeerIds {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMlsInviteRequest(groupId: groupIdBytes, name: name, members: roster))
+    }
+    return groupId
+  }
+
+  @discardableResult
+  private func sendGroupMessageMls(groupId: String, plaintext: Data) -> String? {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes)
+    else { return nil }
+
+    let wire = group.encryptMessage(plaintext: plaintext)
+    session.mlsStateBytes = group.toBytes()
+    try? GroupStore.saveSession(session, slot: slot)
+
+    let localId = UUID().uuidString
+    let wireEnvelope = Self.frameGroupMessage(groupId: groupIdBytes, signedEnvelope: wire)
+    let createdAt = Date().timeIntervalSince1970
+    var outbox = GroupStore.loadOutbox(slot: slot)
+    for member in session.members {
+      outbox.append(GroupStore.OutboxItem(localId: localId, groupId: groupId, memberPeerId: member, wireEnvelope: wireEnvelope, createdAt: createdAt))
+    }
+    try? GroupStore.saveOutbox(outbox, slot: slot)
+    for member in session.members { attemptSend(peerId: member) }
+    return localId
+  }
+
+  private func handleIncomingGroupMessageMls(groupId: String, session: GroupStore.Session, wire: Data) {
+    guard let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes)
+    else { return }
+    guard let message = try? group.decryptMessage(wire: wire) else {
+      NSLog("[ChatManager] an MLS group message for \(groupId) failed to decrypt — dropped")
+      return
+    }
+    // decrypt_message doesn't advance persisted state, so nothing to save.
+    let roster = group.roster()
+    let senderLeaf = Int(message.senderLeaf)
+    guard senderLeaf < roster.count, let senderPeerId = mlsPeerId(forIdentity: roster[senderLeaf]) else { return }
+    emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: senderPeerId, plaintext: message.plaintext))
+  }
+
+  private func addGroupMemberMls(groupId: String, newMemberPeerId: String) {
+    guard let session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let myPeerId = try? node.localPeerId(),
+          !session.members.contains(newMemberPeerId)
+    else { return }
+    // Same shape as creation: ask for a key package; the reply drives the
+    // Add commit + Welcome in handleMlsKeyPackage.
+    let roster = session.members + [newMemberPeerId, myPeerId]
+    sendGroupControlMessageBestEffort(peerId: newMemberPeerId, payload: Self.frameMlsInviteRequest(groupId: groupIdBytes, name: session.name, members: roster))
+  }
+
+  private func removeGroupMemberMls(groupId: String, memberToRemove: String) {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes),
+          let myPeerId = try? node.localPeerId()
+    else { return }
+    guard let leaf = mlsLeaf(forPeerId: memberToRemove, roster: group.roster()) else { return }
+    guard let output = try? group.commit(addKeyPackages: [], removeLeaves: [UInt32(leaf)]) else { return }
+
+    session.mlsStateBytes = group.toBytes()
+    session.members = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    try? GroupStore.saveSession(session, slot: slot)
+
+    // One logarithmic commit to everyone still in the group — the O(log N)
+    // removal that motivated MLS. The removed member simply can't process
+    // it (they hold no key the new epoch's path was sealed to).
+    for member in session.members {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMlsBlob(tag: Self.controlMlsCommitTag, groupId: groupIdBytes, blob: output.commitBytes))
+    }
+    emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: memberToRemove))
+  }
+
+  /// A member asked this device for a key package to add it to a group.
+  /// Generates a leaf key, remembers its secret (needed to open the
+  /// forthcoming Welcome), and replies. Ignored if this device is already
+  /// in the group (a duplicate request).
+  private func handleMlsInviteRequest(fromPeerId: String, groupIdBytes: Data, name: String, memberPeerIds: [String]) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard GroupStore.loadSession(slot: slot, groupId: groupId) == nil else { return }
+
+    let leaf = mlsGenerateLeafKey()
+    guard let keyPackage = try? mlsKeyPackage(identitySeed: identitySeed, leafPublic: leaf.publicKey) else { return }
+    let pending = GroupStore.PendingJoin(groupId: groupId, name: name, leafSecret: leaf.secret)
+    try? GroupStore.savePendingJoin(pending, slot: slot)
+    sendGroupControlMessageBestEffort(peerId: fromPeerId, payload: Self.frameMlsBlob(tag: Self.controlMlsKeyPackageTag, groupId: groupIdBytes, blob: keyPackage))
+  }
+
+  /// A member sent this device (the committer) their key package. Commits
+  /// the Add, sends them the Welcome, and broadcasts the Commit to every
+  /// existing member.
+  private func handleMlsKeyPackage(fromPeerId: String, groupIdBytes: Data, keyPackageBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls,
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes),
+          let myPeerId = try? node.localPeerId()
+    else { return }
+
+    guard let output = try? group.commit(addKeyPackages: [keyPackageBytes], removeLeaves: []) else {
+      NSLog("[ChatManager] failed to commit an MLS add for \(groupId) — dropped")
+      return
+    }
+    session.mlsStateBytes = group.toBytes()
+    session.members = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    try? GroupStore.saveSession(session, slot: slot)
+
+    for welcome in output.welcomes {
+      sendGroupControlMessageBestEffort(peerId: fromPeerId, payload: Self.frameMlsBlob(tag: Self.controlMlsWelcomeTag, groupId: groupIdBytes, blob: welcome.welcomeBytes))
+    }
+    // Every already-joined member (not the new one) processes the commit.
+    for member in session.members where member != fromPeerId {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMlsBlob(tag: Self.controlMlsCommitTag, groupId: groupIdBytes, blob: output.commitBytes))
+    }
+    emit(groupMemberAddedEvent(groupId: groupId, memberPeerId: fromPeerId))
+  }
+
+  /// This device was welcomed into an MLS group it earlier sent a key
+  /// package for. Joins using the leaf secret stashed at invite time.
+  private func handleMlsWelcome(fromPeerId: String, groupIdBytes: Data, welcomeBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard GroupStore.loadSession(slot: slot, groupId: groupId) == nil else { return }
+    guard let pending = GroupStore.loadPendingJoin(slot: slot, groupId: groupId),
+          let myPeerId = try? node.localPeerId(),
+          let group = try? FfiMlsGroup.join(welcomeBytes: welcomeBytes, identitySeed: identitySeed, leafSecret: pending.leafSecret)
+    else { return }
+
+    let members = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    let session = GroupStore.Session(
+      groupId: groupId, name: pending.name, members: members,
+      mlsStateBytes: group.toBytes(), ownSenderKeyStateBytes: nil, receiverStates: nil
+    )
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    GroupStore.deletePendingJoin(slot: slot, groupId: groupId)
+    emit(groupInvitedEvent(groupId: groupId, name: pending.name, members: members))
+  }
+
+  /// An existing member applies a commit (an add or removal someone else
+  /// committed). Emits roster diffs so the UI membership stays live.
+  private func handleMlsCommit(fromPeerId: String, groupIdBytes: Data, commitBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls,
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes),
+          let myPeerId = try? node.localPeerId()
+    else { return }
+
+    let before = Set(session.members)
+    guard (try? group.processCommit(commitBytes: commitBytes)) != nil else {
+      NSLog("[ChatManager] failed to process an MLS commit for \(groupId) — dropped")
+      return
+    }
+    session.mlsStateBytes = group.toBytes()
+    let after = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    session.members = after
+    try? GroupStore.saveSession(session, slot: slot)
+
+    let afterSet = Set(after)
+    for added in afterSet.subtracting(before) { emit(groupMemberAddedEvent(groupId: groupId, memberPeerId: added)) }
+    for removed in before.subtracting(afterSet) { emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: removed)) }
   }
 
   // MARK: - Receiving
@@ -1252,6 +1505,73 @@ final class ChatManager {
     let peerIdBytes = rest.dropFirst()
     guard peerIdBytes.count == Int(length), let memberPeerId = String(data: Data(peerIdBytes), encoding: .utf8) else { return nil }
     return (groupId, memberPeerId)
+  }
+
+  // --- MLS control framing ---
+  //
+  // `[controlMlsInviteRequestTag][groupId: 16][1-byte name len][name]
+  //  [1-byte member count][for each: 1-byte peer id len, peer id]` — the
+  // creator's ask for a key package. Carries the roster peer ids so the
+  // invitee learns who else is (or will be) in the group, same as a
+  // Sender Keys invite did.
+  private static func frameMlsInviteRequest(groupId: Data, name: String, members: [String]) -> Data {
+    var out = Data([controlMlsInviteRequestTag])
+    out.append(groupId)
+    let nameBytes = Data(name.utf8.prefix(255))
+    out.append(UInt8(nameBytes.count))
+    out.append(nameBytes)
+    let clamped = members.prefix(255)
+    out.append(UInt8(clamped.count))
+    for member in clamped {
+      let b = Data(member.utf8.prefix(255))
+      out.append(UInt8(b.count))
+      out.append(b)
+    }
+    return out
+  }
+
+  private static func parseMlsInviteRequest(_ body: Data) -> (groupId: Data, name: String, members: [String])? {
+    var offset = body.startIndex
+    guard body.distance(from: offset, to: body.endIndex) >= 16 else { return nil }
+    let groupId = Data(body[offset..<body.index(offset, offsetBy: 16)])
+    offset = body.index(offset, offsetBy: 16)
+
+    guard offset < body.endIndex else { return nil }
+    let nameLength = Int(body[offset]); offset = body.index(after: offset)
+    guard body.distance(from: offset, to: body.endIndex) >= nameLength else { return nil }
+    let nameEnd = body.index(offset, offsetBy: nameLength)
+    let name = String(data: Data(body[offset..<nameEnd]), encoding: .utf8) ?? ""
+    offset = nameEnd
+
+    guard offset < body.endIndex else { return nil }
+    let memberCount = Int(body[offset]); offset = body.index(after: offset)
+    var members: [String] = []
+    for _ in 0..<memberCount {
+      guard offset < body.endIndex else { return nil }
+      let length = Int(body[offset]); offset = body.index(after: offset)
+      guard body.distance(from: offset, to: body.endIndex) >= length else { return nil }
+      let end = body.index(offset, offsetBy: length)
+      guard let member = String(data: Data(body[offset..<end]), encoding: .utf8) else { return nil }
+      members.append(member)
+      offset = end
+    }
+    return (groupId, name, members)
+  }
+
+  /// `[tag][groupId: 16][opaque blob]` — shared framing for the three MLS
+  /// control payloads that carry one length-implicit byte blob (a key
+  /// package, a Welcome, or a Commit); the blob runs to the end, so no
+  /// length prefix is needed.
+  private static func frameMlsBlob(tag: UInt8, groupId: Data, blob: Data) -> Data {
+    var out = Data([tag])
+    out.append(groupId)
+    out.append(blob)
+    return out
+  }
+
+  private static func parseMlsBlob(_ body: Data) -> (groupId: Data, blob: Data)? {
+    guard body.count >= 16 else { return nil }
+    return (Data(body.prefix(16)), Data(body.dropFirst(16)))
   }
 
   private static func hexString(_ data: Data) -> String {
