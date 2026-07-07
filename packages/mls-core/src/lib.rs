@@ -35,6 +35,7 @@ pub mod group;
 pub mod hpke;
 pub mod key_schedule;
 pub mod member;
+pub mod message;
 pub mod transcript;
 pub mod ratchet_tree;
 pub mod secrets;

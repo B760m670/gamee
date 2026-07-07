@@ -120,6 +120,11 @@ pub struct GroupState {
     transcript: Transcript,
     signing_key: SigningKey,
     own_identity: MemberIdentity,
+    /// This member's next application-message generation within the
+    /// current epoch — reset to 0 whenever the epoch advances, so every
+    /// (sender, generation) message key is unique per epoch.
+    #[serde(default)]
+    own_generation: u32,
 }
 
 /// A stable, public identifier for a commit — every member computes the
@@ -158,7 +163,7 @@ impl GroupState {
         let group_context = Self::compute_group_context(&group_id, 0, &tree, transcript.interim());
         let secrets = EpochSecrets::derive(&EpochSecrets::initial_init_secret(), &genesis_commit, &group_context);
 
-        GroupState { group_id, epoch: 0, tree, roster: vec![Some(own_identity)], secrets, transcript, signing_key, own_identity }
+        GroupState { group_id, epoch: 0, tree, roster: vec![Some(own_identity)], secrets, transcript, signing_key, own_identity, own_generation: 0 }
     }
 
     pub fn epoch(&self) -> u64 {
@@ -395,6 +400,7 @@ impl GroupState {
         next.secrets = secrets;
         next.transcript.advance(&confirmed, &tag);
         next.epoch = new_epoch;
+        next.own_generation = 0; // fresh epoch key -> restart message keys
 
         let commit = Commit {
             from_epoch: self.epoch,
@@ -469,6 +475,7 @@ impl GroupState {
         self.secrets = secrets;
         self.transcript.advance(&confirmed, &commit.confirmation_tag);
         self.epoch = new_epoch;
+        self.own_generation = 0; // fresh epoch key -> restart message keys
         Ok(())
     }
 
@@ -535,7 +542,43 @@ impl GroupState {
             transcript,
             signing_key,
             own_identity,
+            own_generation: 0,
         })
+    }
+
+    /// Encrypts a group message under the current epoch, signed by this
+    /// member. Advances this member's own generation counter, so each
+    /// message this epoch gets a distinct key. The returned bytes are the
+    /// self-contained wire message to fan out to the group.
+    pub fn encrypt_message(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        let generation = self.own_generation;
+        self.own_generation = self.own_generation.wrapping_add(1);
+        crate::message::seal_message(
+            &self.secrets.encryption_secret,
+            &self.group_id,
+            self.epoch,
+            self.own_leaf(),
+            generation,
+            &self.signing_key,
+            plaintext,
+        )
+    }
+
+    /// Verifies and decrypts a group message against this epoch. Returns
+    /// the sender's leaf and the plaintext; rejects a message whose
+    /// signature doesn't match the identity the roster records for its
+    /// claimed sender, even though the epoch key is shared group-wide.
+    pub fn decrypt_message(&self, wire: &[u8]) -> Result<(LeafIndex, Vec<u8>), GroupError> {
+        let roster = &self.roster;
+        let opened = crate::message::open_message(
+            &self.secrets.encryption_secret,
+            &self.group_id,
+            self.epoch,
+            wire,
+            |leaf| roster.get(leaf as usize).copied().flatten(),
+        )
+        .map_err(|_| GroupError::MessageRejected)?;
+        Ok((opened.sender, opened.plaintext))
     }
 
     /// Absorbs the welcome's path secret by trying each other occupied
@@ -572,6 +615,7 @@ pub enum GroupError {
     WrongEpoch,
     NoCommitToResolve,
     Malformed,
+    MessageRejected,
 }
 
 #[cfg(test)]
@@ -692,6 +736,37 @@ mod tests {
         let mut out = alice.commit(vec![Proposal::Add(carol_kp)], &mut rng(3)).unwrap();
         out.commit.confirmation_tag[0] ^= 0x01;
         assert!(bob.process_commit(&out.commit).is_err());
+    }
+
+    #[test]
+    fn members_exchange_encrypted_group_messages_within_an_epoch() {
+        let mut alice = GroupState::create(b"g".to_vec(), signing_key(1), &mut rng(1));
+        let (bsk, bls, bkp) = new_candidate(2);
+        let out = alice.commit(vec![Proposal::Add(bkp)], &mut rng(2)).unwrap();
+        let bob = GroupState::join(&out.welcomes[0].1, bsk, bls).unwrap();
+
+        // Alice sends two; Bob decrypts both and attributes them to Alice.
+        let m1 = alice.encrypt_message(b"first");
+        let m2 = alice.encrypt_message(b"second");
+        assert_eq!(bob.decrypt_message(&m1).unwrap(), (alice.own_leaf(), b"first".to_vec()));
+        assert_eq!(bob.decrypt_message(&m2).unwrap(), (alice.own_leaf(), b"second".to_vec()));
+        // Distinct generations -> distinct ciphertext bodies.
+        assert_ne!(m1[72..], m2[72..]);
+    }
+
+    #[test]
+    fn a_message_from_a_past_epoch_no_longer_decrypts_after_a_commit() {
+        let mut alice = GroupState::create(b"g".to_vec(), signing_key(1), &mut rng(1));
+        let (bsk, bls, bkp) = new_candidate(2);
+        let out = alice.commit(vec![Proposal::Add(bkp)], &mut rng(2)).unwrap();
+        let mut bob = GroupState::join(&out.welcomes[0].1, bsk, bls).unwrap();
+
+        let stale = alice.encrypt_message(b"epoch-1 message");
+        // Alice self-updates; both roll to a new epoch key.
+        let out = alice.commit(vec![], &mut rng(3)).unwrap();
+        bob.process_commit(&out.commit).unwrap();
+        // The pre-update ciphertext can't be read under the new epoch key.
+        assert!(bob.decrypt_message(&stale).is_err());
     }
 
     #[test]
