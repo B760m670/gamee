@@ -5,5 +5,11 @@ edition = "2021"
 description = "TreeKEM-based continuous group key agreement for SpiritChat, following RFC 9420 (MLS)'s constructions with a fixed ciphersuite and no interop machinery — the eventual replacement for the Sender Keys scheme, bringing O(log N) membership changes and post-compromise security to groups. Pure logic: no networking, no storage, same discipline as spiritchat-crypto-core."
 
 [dependencies]
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = "0.6"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+rand_chacha = "0.3"
