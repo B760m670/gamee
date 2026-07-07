@@ -30,8 +30,11 @@
 //! 5. Deterministic P2P commit arbitration + transport wiring.
 //! 6. FFI/Swift/TS + migration of existing Sender Keys groups.
 
+pub mod group;
 pub mod hpke;
 pub mod key_schedule;
+pub mod member;
+pub mod transcript;
 pub mod ratchet_tree;
 pub mod secrets;
 pub mod tree_math;

@@ -81,8 +81,24 @@ impl EpochSecrets {
     /// assembles the real thing — any stable per-epoch context works
     /// here and is tested as such).
     pub fn derive(prev_init_secret: &[u8; 32], commit_secret: &[u8; 32], group_context: &[u8]) -> Self {
-        let joiner_secret = extract(prev_init_secret, commit_secret);
-        let epoch_secret = derive_secret(&joiner_secret, b"epoch", group_context);
+        Self::from_joiner(&Self::joiner_secret(prev_init_secret, commit_secret), group_context)
+    }
+
+    /// The intermediate `joiner_secret` = Extract(prev init_secret,
+    /// commit_secret). A *new* member can't compute this (they never held
+    /// the previous epoch's `init_secret`), so a Welcome hands it to them
+    /// directly, sealed to their key package — from it plus the group
+    /// context they derive the identical epoch, without ever learning the
+    /// commit secret or any path secret they weren't entitled to.
+    pub fn joiner_secret(prev_init_secret: &[u8; 32], commit_secret: &[u8; 32]) -> [u8; 32] {
+        extract(prev_init_secret, commit_secret)
+    }
+
+    /// Derives the epoch from an already-computed `joiner_secret` — the
+    /// path both existing members (via `derive`) and freshly welcomed
+    /// members reach the same epoch through.
+    pub fn from_joiner(joiner_secret: &[u8; 32], group_context: &[u8]) -> Self {
+        let epoch_secret = derive_secret(joiner_secret, b"epoch", group_context);
         EpochSecrets {
             init_secret: derive_secret(&epoch_secret, b"init", &[]),
             encryption_secret: derive_secret(&epoch_secret, b"encryption", &[]),
