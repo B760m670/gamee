@@ -1023,6 +1023,102 @@ final class ChatManager {
     for removed in before.subtracting(afterSet) { emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: removed)) }
   }
 
+  // MARK: - Media messages (photo / video / voice)
+  //
+  // A media message is an ordinary end-to-end chat message whose plaintext
+  // is not text but a `mediaFrameMagic`-tagged manifest (see
+  // `spiritchat_crypto_core::media` + `FfiMediaManifest`): the small
+  // manifest travels encrypted over the same ratchet/MLS channel as any
+  // message, while the media bytes travel separately as content-addressed
+  // blobs — one blob per encrypted chunk, so a large video reuses the
+  // existing blob protocol unchanged and never loads whole into memory.
+  // The magic prefix begins with a NUL byte, which valid UTF-8 chat text
+  // never starts with, so text messages stay byte-for-byte unchanged and
+  // the receive side (next) tells the two apart unambiguously.
+  //
+  // This section is the send half: encrypt the file chunk by chunk,
+  // register each encrypted chunk as a local blob, and send the manifest.
+  // The receive half (fetching the chunks and reassembling) and the native
+  // recorder / UI land alongside it.
+
+  /// Prefix marking a decrypted plaintext as a media manifest rather than
+  /// text. Leading NUL guarantees it can never collide with real text.
+  private static let mediaFrameMagic = Data([0x00]) + Data("SCMEDIA1".utf8)
+
+  private static func frameMediaPlaintext(_ manifestBytes: Data) -> Data {
+    mediaFrameMagic + manifestBytes
+  }
+
+  /// Encrypts `mediaData` under a fresh per-file key, registers each
+  /// encrypted chunk as a content-addressed local blob so peers can fetch
+  /// them, and returns the framed manifest plaintext to send as a message.
+  /// `nil` only if blob registration fails outright.
+  private func registerMediaAndFrame(
+    mediaData: Data, mime: String, filename: String?, durationMs: UInt32?, thumbnail: Data?
+  ) -> Data? {
+    let keyBytes = mediaGenerateKey()
+    let chunkSize = Int(mediaChunkSize())
+    // At least one (possibly empty) chunk, so an empty file still has a
+    // final chunk and can't be forged as "no chunks".
+    let chunkCount = max(1, (mediaData.count + chunkSize - 1) / chunkSize)
+    var chunkIds: [Data] = []
+    chunkIds.reserveCapacity(chunkCount)
+
+    for i in 0..<chunkCount {
+      let start = i * chunkSize
+      let end = min(start + chunkSize, mediaData.count)
+      let plainChunk = start < end ? mediaData.subdata(in: start..<end) : Data()
+      let isLast = i == chunkCount - 1
+      guard let ciphertext = try? mediaEncryptChunk(key: keyBytes, chunkIndex: UInt32(i), isLast: isLast, plaintext: plainChunk) else {
+        return nil
+      }
+      let id = blobContentId(bytes: ciphertext)
+      do {
+        try node.setLocalBlob(id: id, bytes: ciphertext)
+      } catch {
+        NSLog("[ChatManager] failed to register a media chunk blob: \(error)")
+        return nil
+      }
+      chunkIds.append(id)
+    }
+
+    let manifest = FfiMediaManifest(
+      key: keyBytes,
+      mime: mime,
+      totalSize: UInt64(mediaData.count),
+      chunkIds: chunkIds,
+      filename: filename,
+      durationMs: durationMs,
+      thumbnail: thumbnail
+    )
+    return Self.frameMediaPlaintext(mediaManifestEncode(manifest: manifest))
+  }
+
+  /// Sends a media file to a 1:1 peer — mirrors `sendMessage`, only the
+  /// plaintext is a framed media manifest instead of text.
+  @discardableResult
+  func sendMediaMessage(
+    peerId: String, peerPublicKey: Data, mediaData: Data,
+    mime: String, filename: String?, durationMs: UInt32?, thumbnail: Data?
+  ) -> String? {
+    guard let framed = registerMediaAndFrame(mediaData: mediaData, mime: mime, filename: filename, durationMs: durationMs, thumbnail: thumbnail) else {
+      return nil
+    }
+    return sendMessage(peerId: peerId, peerPublicKey: peerPublicKey, plaintext: framed)
+  }
+
+  /// Sends a media file to a group — registers the same content-addressed
+  /// chunk blobs, then rides the existing group send path.
+  @discardableResult
+  func sendGroupMediaMessage(
+    groupId: String, mediaData: Data, mime: String, filename: String?, durationMs: UInt32?, thumbnail: Data?
+  ) -> String? {
+    guard let framed = registerMediaAndFrame(mediaData: mediaData, mime: mime, filename: filename, durationMs: durationMs, thumbnail: thumbnail) else {
+      return nil
+    }
+    return sendGroupMessage(groupId: groupId, plaintext: framed)
+  }
+
   // MARK: - Receiving
 
   private func onEnvelopeReceived(fromPeerId: String, bytes: Data) {

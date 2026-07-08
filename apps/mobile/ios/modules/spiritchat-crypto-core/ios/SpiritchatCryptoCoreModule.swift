@@ -492,6 +492,51 @@ public class SpiritchatCryptoCoreModule: Module {
       return try requireP2pSession().chatManager.sendMessage(peerId: peerId, peerPublicKey: publicKey, plaintext: plaintextBytes)
     }
 
+    // Sends a media file (photo/video/voice) to a 1:1 peer. `fileUri` is a
+    // local file already on disk (a recorded voice note, a picked image) —
+    // read straight off the filesystem here, never round-tripped through
+    // JS as bytes, the same way `blobSaveFromFile` avoids a second copy.
+    // The file is encrypted chunk by chunk under a fresh per-file key,
+    // each chunk registered as a content-addressed blob, and a small
+    // manifest (key + chunk ids + metadata) sent as the message. Returns a
+    // local id; the recipient sees a `mediaReceived` event once they've
+    // fetched and decrypted it (receive half lands next).
+    Function("chatSendMedia") { (
+      peerId: String, peerPublicKeyBase64: String, fileUri: String,
+      mime: String, filename: String?, durationMs: Int?
+    ) throws -> String in
+      guard let publicKey = Data(base64Encoded: peerPublicKeyBase64) else {
+        throw ChatError.malformedPublicKey(peerPublicKeyBase64)
+      }
+      guard let url = URL(string: fileUri), let bytes = try? Data(contentsOf: url) else {
+        throw BlobStoreError.unreadableFile(fileUri)
+      }
+      guard let localId = try requireP2pSession().chatManager.sendMediaMessage(
+        peerId: peerId, peerPublicKey: publicKey, mediaData: bytes,
+        mime: mime, filename: filename, durationMs: durationMs.map { UInt32($0) }, thumbnail: nil
+      ) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return localId
+    }
+
+    // Sends a media file to a group — same as `chatSendMedia`, fanned out
+    // to every member the way `chatSendGroupMessage` already is.
+    Function("chatSendGroupMedia") { (
+      groupId: String, fileUri: String, mime: String, filename: String?, durationMs: Int?
+    ) throws -> String in
+      guard let url = URL(string: fileUri), let bytes = try? Data(contentsOf: url) else {
+        throw BlobStoreError.unreadableFile(fileUri)
+      }
+      guard let localId = try requireP2pSession().chatManager.sendGroupMediaMessage(
+        groupId: groupId, mediaData: bytes, mime: mime, filename: filename,
+        durationMs: durationMs.map { UInt32($0) }, thumbnail: nil
+      ) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return localId
+    }
+
     // Creates a group named `name` with `memberPeerIds` as its initial
     // members — every one of them must already be an existing 1:1 contact
     // (see ChatManager's own "MARK: - Groups" doc comment for this v1's

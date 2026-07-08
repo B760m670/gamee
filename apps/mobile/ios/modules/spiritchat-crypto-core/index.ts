@@ -144,6 +144,8 @@ const NativeCryptoCore = requireNativeModule<
     setMixRelayParticipationEnabled(enabled: boolean): void
     mixDummyTrafficBytesPerHourEstimate(): number
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
+    chatSendMedia(peerId: string, peerPublicKeyBase64: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
+    chatSendGroupMedia(groupId: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
     chatCreateGroup(name: string, memberPeerIds: string[]): string
     chatSendGroupMessage(groupId: string, plaintext: string): string
     chatAddGroupMember(groupId: string, newMemberPeerId: string): void
@@ -786,6 +788,29 @@ export function mixDummyTrafficBytesPerHourEstimate(): number {
  */
 export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string {
   return NativeCryptoCore.chatSendMessage(peerId, peerPublicKeyBase64, plaintext)
+}
+
+/**
+ * Sends a media file (photo/video/voice) to a 1:1 peer. `fileUri` is a
+ * local file on disk (a recorded note, a picked image); it's encrypted
+ * chunk by chunk under a fresh per-file key, each chunk registered as a
+ * content-addressed blob, and a small manifest sent as the message. The
+ * recipient sees a `mediaReceived` event once fetched and decrypted.
+ * Returns a local id to correlate with `messageSent`/`messageFailed`.
+ */
+export function chatSendMedia(
+  peerId: string, peerPublicKeyBase64: string, fileUri: string,
+  mime: string, filename: string | null = null, durationMs: number | null = null,
+): string {
+  return NativeCryptoCore.chatSendMedia(peerId, peerPublicKeyBase64, fileUri, mime, filename, durationMs)
+}
+
+/** Sends a media file to a group — see `chatSendMedia`. */
+export function chatSendGroupMedia(
+  groupId: string, fileUri: string, mime: string,
+  filename: string | null = null, durationMs: number | null = null,
+): string {
+  return NativeCryptoCore.chatSendGroupMedia(groupId, fileUri, mime, filename, durationMs)
 }
 
 /**
