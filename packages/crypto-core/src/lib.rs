@@ -11,6 +11,7 @@ pub mod backup;
 pub mod encoding;
 pub mod identity;
 pub mod media;
+pub mod pqkem;
 pub mod prekey;
 
 pub mod handshake;

@@ -26,6 +26,12 @@ pub enum CryptoError {
 
     #[error("invalid recovery phrase: {0}")]
     InvalidRecoveryPhrase(String),
+
+    #[error("ML-KEM encapsulation failed")]
+    PqEncapsulationFailed,
+
+    #[error("ML-KEM decapsulation failed")]
+    PqDecapsulationFailed,
 }
 
 pub type Result<T> = core::result::Result<T, CryptoError>;

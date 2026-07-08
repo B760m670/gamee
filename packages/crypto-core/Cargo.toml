@@ -23,6 +23,10 @@ zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
 base64 = "0.22"
 bip39 = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
+# ML-KEM-768 (FIPS 203) for the post-quantum half of the hybrid PQXDH
+# handshake. Pure Rust (no C) so it cross-compiles cleanly to iOS/Android;
+# 0.2.x shares rand_core 0.6 with the rest of the crate.
+ml-kem = { version = "=0.2.3", features = ["zeroize"] }
 
 [dev-dependencies]
 # Deterministic RNG for reproducible tests.
