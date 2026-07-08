@@ -82,6 +82,18 @@ interface ChatState {
   /** Sends a recorded voice note (from ChatInputBar) to `peerId`. */
   sendVoice: (peerId: string, fileUri: string, durationMs: number) => Promise<void>
   /**
+   * Sends a photo or video (from the attach picker) to `peerId`. `fileUri`
+   * points at the picked file on disk; `mime` is its content type
+   * (e.g. image/jpeg, video/mp4) and drives how the bubble renders it.
+   */
+  sendMedia: (
+    peerId: string,
+    fileUri: string,
+    mime: string,
+    filename: string | null,
+    durationMs: number | null,
+  ) => Promise<void>
+  /**
    * Removes one message from this device's own copy of the history.
    * Local-only by design (for now): the 1:1 wire format carries no shared
    * message id both sides could agree on, so a cryptographically honest
@@ -231,15 +243,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   sendVoice: async (peerId, fileUri, durationMs) => {
+    await get().sendMedia(peerId, fileUri, VOICE_MIME, null, durationMs)
+  },
+
+  sendMedia: async (peerId, fileUri, mime, filename, durationMs) => {
     const peer = get().activePeers[peerId] ?? get().conversations[peerId]
     if (!peer) return
 
-    const localId = chatSendMedia(peerId, peer.peerPublicKeyBase64, fileUri, VOICE_MIME, null, durationMs)
+    const localId = chatSendMedia(peerId, peer.peerPublicKeyBase64, fileUri, mime, filename, durationMs)
     const at = Date.now()
-    const label = '🎤 Голосовое'
+    const label = mediaLabel(mime)
     const message: ChatMessage = {
       localId, outgoing: true, text: label,
-      media: { localPath: fileUri, mime: VOICE_MIME, filename: null, durationMs, totalSize: 0 },
+      media: { localPath: fileUri, mime, filename, durationMs, totalSize: 0 },
       at, status: 'sending',
     }
 

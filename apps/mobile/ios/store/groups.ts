@@ -3,8 +3,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 import {
   chatCreateGroup,
   chatSendGroupMessage,
+  chatSendGroupMedia,
   chatAddGroupMember,
   chatRemoveGroupMember,
+  VOICE_MIME,
   type ChatEvent,
 } from '../modules/spiritchat-crypto-core'
 import type { ChatMessage } from './chat'
@@ -46,6 +48,10 @@ interface GroupState {
   /** Every named member must already be an existing 1:1 contact — see `chatCreateGroup`'s own doc comment. Returns the new group's id, or `null` if `name`/`memberPeerIds` were empty. */
   createGroup: (name: string, memberPeerIds: string[]) => string | null
   sendMessage: (groupId: string, text: string) => void
+  /** Sends a recorded voice note to every group member. */
+  sendVoice: (groupId: string, fileUri: string, durationMs: number) => void
+  /** Sends a photo or video to every group member. `mime` drives how the bubble renders it. */
+  sendMedia: (groupId: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null) => void
   /** `newMemberPeerId` must already be an existing 1:1 contact — see `chatAddGroupMember`'s own doc comment. */
   addMember: (groupId: string, newMemberPeerId: string) => void
   removeMember: (groupId: string, memberToRemove: string) => void
@@ -161,6 +167,25 @@ export const useGroupStore = create<GroupState>((set, get) => ({
     const localId = chatSendGroupMessage(groupId, trimmed)
     const at = Date.now()
     const message: GroupMessage = { localId, senderPeerId: get().myPeerId, outgoing: true, text: trimmed, at, status: 'sent' }
+    const myFingerprint = get().myFingerprint
+    const nextMessages = [...(get().messages[groupId] ?? []), message]
+    set(state => ({ messages: { ...state.messages, [groupId]: nextMessages } }))
+    persistGroupMessages(myFingerprint, groupId, nextMessages).catch(() => {})
+  },
+
+  sendVoice: (groupId, fileUri, durationMs) => {
+    get().sendMedia(groupId, fileUri, VOICE_MIME, null, durationMs)
+  },
+
+  sendMedia: (groupId, fileUri, mime, filename, durationMs) => {
+    const localId = chatSendGroupMedia(groupId, fileUri, mime, filename, durationMs)
+    const at = Date.now()
+    const message: GroupMessage = {
+      localId, senderPeerId: get().myPeerId, outgoing: true,
+      text: mediaLabel(mime),
+      media: { localPath: fileUri, mime, filename, durationMs, totalSize: 0 },
+      at, status: 'sent',
+    }
     const myFingerprint = get().myFingerprint
     const nextMessages = [...(get().messages[groupId] ?? []), message]
     set(state => ({ messages: { ...state.messages, [groupId]: nextMessages } }))

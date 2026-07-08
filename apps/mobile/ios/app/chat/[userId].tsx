@@ -10,6 +10,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { PeerAvatar } from '../../components/PeerAvatar'
 import { MessageBubble } from '../../components/MessageBubble'
 import { ChatInputBar } from '../../components/ChatInputBar'
+import { useMediaAttach } from '../../hooks/useMediaAttach'
 import { useChatStore, type ChatMessage, type PeerInfo } from '../../store/chat'
 
 const BTN_H = 44
@@ -33,6 +34,7 @@ export default function ChatScreen() {
   const openConversation = useChatStore(s => s.openConversation)
   const sendMessage = useChatStore(s => s.sendMessage)
   const sendVoice = useChatStore(s => s.sendVoice)
+  const sendMedia = useChatStore(s => s.sendMedia)
   const deleteMessage = useChatStore(s => s.deleteMessage)
   const messages = useChatStore(s => s.messages[peerId] ?? [])
 
@@ -61,6 +63,10 @@ export default function ChatScreen() {
   function handleSendVoice(fileUri: string, durationMs: number) {
     sendVoice(peerId, fileUri, durationMs)
   }
+
+  const handleAttach = useMediaAttach(m =>
+    sendMedia(peerId, m.fileUri, m.mime, m.filename, m.durationMs),
+  )
 
   function confirmDeleteMessage(msg: ChatMessage) {
     Alert.alert('Удалить сообщение?', 'Оно удалится только на этом устройстве.', [
@@ -112,7 +118,7 @@ export default function ChatScreen() {
       />
 
       <View style={{ paddingBottom: insets.bottom + 6 }}>
-        <ChatInputBar onSend={handleSend} onSendVoice={handleSendVoice} />
+        <ChatInputBar onSend={handleSend} onSendVoice={handleSendVoice} onAttach={handleAttach} />
       </View>
     </KeyboardAvoidingView>
   )
