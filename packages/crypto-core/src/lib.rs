@@ -10,6 +10,7 @@ pub mod error;
 pub mod backup;
 pub mod encoding;
 pub mod identity;
+pub mod media;
 pub mod prekey;
 
 pub mod handshake;
