@@ -13,6 +13,7 @@ mod error;
 mod handshake;
 mod identity;
 mod ledger;
+mod media;
 mod mls;
 mod p2p_event;
 mod p2p_node;
