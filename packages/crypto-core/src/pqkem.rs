@@ -43,6 +43,21 @@ pub const PQ_SHARED_SECRET_LEN: usize = 32;
 #[derive(Clone)]
 pub struct PqKemPublicKey(Ek);
 
+impl core::fmt::Debug for PqKemPublicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Public, but 1184 bytes — elide the body.
+        f.write_str("PqKemPublicKey(ml-kem-768)")
+    }
+}
+
+impl PartialEq for PqKemPublicKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_bytes() == other.to_bytes()
+    }
+}
+
+impl Eq for PqKemPublicKey {}
+
 impl PqKemPublicKey {
     pub fn to_bytes(&self) -> [u8; PQ_PUBLIC_KEY_LEN] {
         let encoded = self.0.as_bytes();
@@ -139,6 +154,12 @@ impl PqKemKeyPair {
 /// An ML-KEM-768 ciphertext — public, sent from initiator to responder.
 #[derive(Clone)]
 pub struct PqCiphertext(pub [u8; PQ_CIPHERTEXT_LEN]);
+
+impl core::fmt::Debug for PqCiphertext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PqCiphertext(ml-kem-768)")
+    }
+}
 
 impl PqCiphertext {
     pub fn as_bytes(&self) -> &[u8; PQ_CIPHERTEXT_LEN] {
