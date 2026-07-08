@@ -8,6 +8,7 @@ import {
   type ChatEvent,
 } from '../modules/spiritchat-crypto-core'
 import type { ChatMessage } from './chat'
+import { mediaLabel } from './chat'
 
 /**
  * A group message reuses `ChatMessage`'s exact shape (so `MessageBubble`
@@ -181,23 +182,45 @@ export const useGroupStore = create<GroupState>((set, get) => ({
   handleChatEvent: (event) => {
     const myFingerprint = get().myFingerprint
 
+    const isGroupMedia = event.type === 'mediaReceived' && !!event.groupId
     if (
       event.type !== 'groupInvited' &&
       event.type !== 'groupMessageReceived' &&
       event.type !== 'groupMemberAdded' &&
-      event.type !== 'groupMemberRemoved'
+      event.type !== 'groupMemberRemoved' &&
+      !isGroupMedia
     ) return
 
     // A group event for an account that isn't on screen (every registered
     // account's node runs concurrently) — persist into that account's own
-    // namespace, leave the active account's in-memory state alone.
+    // namespace, leave the active account's in-memory state alone. Media
+    // is re-fetched when that account is next opened, not persisted here.
     if (event.selfFingerprint && event.selfFingerprint !== myFingerprint) {
-      const origin = event.selfFingerprint
-      enqueueBackgroundWrite(origin, () => applyGroupEventForInactive(origin, event))
+      if (event.type !== 'mediaReceived') {
+        const origin = event.selfFingerprint
+        enqueueBackgroundWrite(origin, () => applyGroupEventForInactive(origin, event))
+      }
       return
     }
 
     if (!myFingerprint) return
+
+    if (event.type === 'mediaReceived' && event.groupId) {
+      const at = event.at
+      const message: GroupMessage = {
+        localId: `media-${event.groupId}-${event.peerId}-${event.at}`,
+        senderPeerId: event.peerId,
+        outgoing: false,
+        text: mediaLabel(event.mime),
+        media: { localPath: event.localPath, mime: event.mime, filename: event.filename, durationMs: event.durationMs, totalSize: event.totalSize },
+        at,
+        status: 'sent',
+      }
+      const nextMessages = [...(get().messages[event.groupId] ?? []), message]
+      set(state => ({ messages: { ...state.messages, [event.groupId as string]: nextMessages } }))
+      persistGroupMessages(myFingerprint, event.groupId, nextMessages).catch(() => {})
+      return
+    }
 
     if (event.type === 'groupInvited') {
       const info: GroupInfo = { groupId: event.groupId, name: event.name, members: event.members }

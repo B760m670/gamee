@@ -2,10 +2,22 @@ import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import { chatSendMessage, type ChatEvent } from '../modules/spiritchat-crypto-core'
 
+/** Attached media on a message (photo/video/voice), once downloaded. */
+export interface ChatMedia {
+  /** file:// path to the decrypted media on disk. */
+  localPath: string
+  mime: string
+  filename: string | null
+  durationMs: number | null
+  totalSize: number
+}
+
 export interface ChatMessage {
   localId: string
   outgoing: boolean
   text: string
+  /** Present when this message carries media instead of (or besides) text. */
+  media?: ChatMedia
   /** Epoch milliseconds. */
   at: number
   /**
@@ -37,6 +49,14 @@ export interface Conversation extends PeerInfo {
 // store/profile.ts already uses for displayName/bio/etc — a different
 // account on this device reads under its own, empty namespace and can
 // never see another account's conversations.
+/** A short human label + icon for a media message, used as its conversation preview. */
+export function mediaLabel(mime: string): string {
+  if (mime.startsWith('image/')) return '📷 Фото'
+  if (mime.startsWith('video/')) return '🎥 Видео'
+  if (mime.startsWith('audio/')) return '🎤 Голосовое'
+  return '📎 Файл'
+}
+
 const conversationsKey = (myFingerprint: string) => `chat.${myFingerprint}.conversations`
 const messagesKey = (myFingerprint: string, peerId: string) => `chat.${myFingerprint}.messages.${peerId}`
 
@@ -276,13 +296,47 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const origin = event.selfFingerprint
       if (event.type === 'messageReceived') {
         enqueueBackgroundWrite(origin, () => appendIncomingForInactive(origin, event))
-      } else {
+      } else if (event.type === 'messageSent' || event.type === 'messageFailed') {
         enqueueBackgroundWrite(origin, () => updateStatusForInactive(origin, event))
       }
+      // Media for an inactive account is re-fetched when it's next opened;
+      // nothing to persist here in this first cut.
       return
     }
 
     if (!myFingerprint) return // no account active right now — nothing to attribute this to
+
+    // A finished 1:1 media download. Group media (groupId set) is the
+    // groups store's concern; skip it here.
+    if (event.type === 'mediaReceived') {
+      if (event.groupId) return
+      const known = get().conversations[event.peerId] ?? get().activePeers[event.peerId]
+      const peer: PeerInfo = {
+        peerId: event.peerId,
+        peerFingerprint: known?.peerFingerprint ?? '',
+        peerPublicKeyBase64: known?.peerPublicKeyBase64 ?? '',
+        peerUsername: known?.peerUsername ?? null,
+      }
+      const label = mediaLabel(event.mime)
+      const message: ChatMessage = {
+        localId: `media-${event.peerId}-${event.at}`,
+        outgoing: false,
+        text: label,
+        media: { localPath: event.localPath, mime: event.mime, filename: event.filename, durationMs: event.durationMs, totalSize: event.totalSize },
+        at: event.at,
+        status: 'sent',
+      }
+      const nextMessages = [...(get().messages[event.peerId] ?? []), message]
+      const nextConversations = { ...get().conversations, [event.peerId]: { ...peer, lastMessageText: label, lastMessageAt: event.at } }
+      set(state => ({
+        activePeers: { ...state.activePeers, [event.peerId]: peer },
+        messages: { ...state.messages, [event.peerId]: nextMessages },
+        conversations: nextConversations,
+      }))
+      persistMessages(myFingerprint, event.peerId, nextMessages).catch(() => {})
+      persistConversations(myFingerprint, nextConversations).catch(() => {})
+      return
+    }
 
     if (event.type === 'messageReceived') {
       const known = get().conversations[event.peerId] ?? get().activePeers[event.peerId]

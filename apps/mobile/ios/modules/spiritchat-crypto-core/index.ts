@@ -92,6 +92,20 @@ export type ChatEvent = EventOrigin & (
   | { type: 'groupMessageReceived'; groupId: string; senderPeerId: string; plaintext: string; at: number }
   | { type: 'groupMemberAdded'; groupId: string; memberPeerId: string }
   | { type: 'groupMemberRemoved'; groupId: string; memberPeerId: string }
+  // A media message (photo/video/voice) that finished downloading and
+  // decrypting — `localPath` is a file:// URL to the decrypted media on
+  // disk. `groupId` is set for group media, null for 1:1.
+  | {
+      type: 'mediaReceived'
+      peerId: string
+      groupId: string | null
+      localPath: string
+      mime: string
+      filename: string | null
+      durationMs: number | null
+      totalSize: number
+      at: number
+    }
 )
 
 type NativeEvents = {

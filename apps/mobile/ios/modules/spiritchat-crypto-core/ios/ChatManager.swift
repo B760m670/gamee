@@ -112,6 +112,12 @@ final class ChatManager {
   private let lock = NSLock()
   private var peerStates: [String: PeerSendState] = [:]
   private var connectedPeers: Set<String> = []
+  /// In-flight media downloads, keyed by an internal download id (see the
+  /// "Media receive" section). Guarded by `lock`.
+  private var mediaDownloads: [String: MediaDownload] = [:]
+  /// chunk content-id (hex) -> the downloads waiting on that chunk, so a
+  /// `blobFetched` event routes to whoever needs it. Guarded by `lock`.
+  private var mediaChunkWaiters: [String: [(String, Int)]] = [:]
   private var retrievalTimer: Timer?
   private var contactCardAnnounceTimer: Timer?
 
@@ -788,7 +794,7 @@ final class ChatManager {
       var updated = session
       updated.receiverStates?[memberPeerId] = receiverState.toBytes()
       try? GroupStore.saveSession(updated, slot: slot)
-      emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: memberPeerId, plaintext: plaintext))
+      deliverIncomingGroup(groupId: groupId, senderPeerId: memberPeerId, plaintext: plaintext)
       return
     }
     NSLog("[ChatManager] a group message for \(groupId) matched no known member's chain — dropped")
@@ -896,7 +902,7 @@ final class ChatManager {
     let roster = group.roster()
     let senderLeaf = Int(message.senderLeaf)
     guard senderLeaf < roster.count, let senderPeerId = mlsPeerId(forIdentity: roster[senderLeaf]) else { return }
-    emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: senderPeerId, plaintext: message.plaintext))
+    deliverIncomingGroup(groupId: groupId, senderPeerId: senderPeerId, plaintext: message.plaintext)
   }
 
   private func addGroupMemberMls(groupId: String, newMemberPeerId: String) {
@@ -1119,6 +1125,175 @@ final class ChatManager {
     return sendGroupMessage(groupId: groupId, plaintext: framed)
   }
 
+  // --- Media receive ----------------------------------------------------
+
+  /// An in-flight media download: the manifest plus the chunk plaintexts
+  /// as they arrive, and where to attribute the finished media.
+  private struct MediaDownload {
+    let senderPeerId: String
+    let groupId: String?
+    let manifest: FfiMediaManifest
+    var chunks: [Data?]
+  }
+
+  /// Whether a decrypted plaintext is a media manifest rather than text.
+  private static func isMediaFrame(_ plaintext: Data) -> Bool {
+    plaintext.starts(with: mediaFrameMagic)
+  }
+
+  /// The single point every decrypted 1:1 plaintext flows through — text
+  /// emits as before, a media frame kicks off a chunk download instead.
+  private func deliverIncoming(peerId: String, peerFingerprint: String, peerPublicKey: Data, plaintext: Data) {
+    if Self.isMediaFrame(plaintext) {
+      handleIncomingMedia(fetchFromPeerId: peerId, senderPeerId: peerId, groupId: nil, plaintext: plaintext)
+    } else {
+      emit(receivedEvent(peerId: peerId, peerFingerprint: peerFingerprint, peerPublicKey: peerPublicKey, plaintext: plaintext))
+    }
+  }
+
+  /// The same, for group messages.
+  private func deliverIncomingGroup(groupId: String, senderPeerId: String, plaintext: Data) {
+    if Self.isMediaFrame(plaintext) {
+      handleIncomingMedia(fetchFromPeerId: senderPeerId, senderPeerId: senderPeerId, groupId: groupId, plaintext: plaintext)
+    } else {
+      emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: senderPeerId, plaintext: plaintext))
+    }
+  }
+
+  /// Parses a media manifest and starts fetching its chunk blobs from the
+  /// sender. Each chunk arrives as a `blobFetched` event routed through
+  /// `handleMediaBlobFetched`; once all are in, the file is reassembled
+  /// and a `mediaReceived` event fires.
+  private func handleIncomingMedia(fetchFromPeerId: String, senderPeerId: String, groupId: String?, plaintext: Data) {
+    let manifestBytes = Data(plaintext.dropFirst(Self.mediaFrameMagic.count))
+    guard let manifest = try? mediaManifestDecode(bytes: manifestBytes), !manifest.chunkIds.isEmpty else {
+      NSLog("[ChatManager] a media message with an unreadable manifest — dropped")
+      return
+    }
+
+    let downloadId = UUID().uuidString
+    let download = MediaDownload(
+      senderPeerId: senderPeerId, groupId: groupId, manifest: manifest,
+      chunks: Array(repeating: nil, count: manifest.chunkIds.count)
+    )
+    lock.lock()
+    mediaDownloads[downloadId] = download
+    for (index, id) in manifest.chunkIds.enumerated() {
+      let idHex = Self.hexString(id)
+      mediaChunkWaiters[idHex, default: []].append((downloadId, index))
+    }
+    lock.unlock()
+
+    // Fetch every chunk. A blob already cached locally (e.g. media this
+    // device also holds) still resolves via the same blobFetched path.
+    for id in manifest.chunkIds {
+      do {
+        try node.fetchBlob(peerId: fetchFromPeerId, id: id)
+      } catch {
+        NSLog("[ChatManager] failed to request a media chunk from \(fetchFromPeerId): \(error)")
+      }
+    }
+  }
+
+  /// Routes a fetched blob into any waiting media download. Returns true
+  /// if the blob was a media chunk (so the generic blob handler skips it).
+  private func handleMediaBlobFetched(id: Data, bytes: Data) -> Bool {
+    let idHex = Self.hexString(id)
+    lock.lock()
+    guard let waiters = mediaChunkWaiters[idHex] else { lock.unlock(); return false }
+    mediaChunkWaiters.removeValue(forKey: idHex)
+    var completed: [MediaDownload] = []
+    for (downloadId, index) in waiters {
+      guard var download = mediaDownloads[downloadId] else { continue }
+      let isLast = index == download.manifest.chunkIds.count - 1
+      guard let plain = try? mediaDecryptChunk(key: download.manifest.key, chunkIndex: UInt32(index), isLast: isLast, ciphertext: bytes) else {
+        // A chunk that won't decrypt means a corrupt or wrong blob — drop
+        // the whole download rather than deliver a half-broken file.
+        mediaDownloads.removeValue(forKey: downloadId)
+        continue
+      }
+      download.chunks[index] = plain
+      if download.chunks.allSatisfy({ $0 != nil }) {
+        mediaDownloads.removeValue(forKey: downloadId)
+        completed.append(download)
+      } else {
+        mediaDownloads[downloadId] = download
+      }
+    }
+    lock.unlock()
+
+    for download in completed { finishMediaDownload(download) }
+    return true
+  }
+
+  /// A media chunk fetch failed outright — abandon its download (the
+  /// message simply doesn't render its media until re-sent/re-tried).
+  private func handleMediaBlobFailed(id: Data) -> Bool {
+    let idHex = Self.hexString(id)
+    lock.lock()
+    guard let waiters = mediaChunkWaiters[idHex] else { lock.unlock(); return false }
+    mediaChunkWaiters.removeValue(forKey: idHex)
+    for (downloadId, _) in waiters { mediaDownloads.removeValue(forKey: downloadId) }
+    lock.unlock()
+    NSLog("[ChatManager] a media chunk fetch failed — media download abandoned")
+    return true
+  }
+
+  /// Reassembles a completed download to a local file and emits it.
+  private func finishMediaDownload(_ download: MediaDownload) {
+    var data = Data()
+    for chunk in download.chunks { data.append(chunk ?? Data()) }
+
+    let ext = Self.fileExtension(forMime: download.manifest.mime)
+    let dir = Self.mediaDirectory(slot: slot)
+    let localName = "\(UUID().uuidString).\(ext)"
+    let url = dir.appendingPathComponent(localName)
+    do {
+      try data.write(to: url, options: .atomic)
+    } catch {
+      NSLog("[ChatManager] failed to write received media: \(error)")
+      return
+    }
+    emit(mediaReceivedEvent(download: download, localPath: url.absoluteString))
+  }
+
+  private static func mediaDirectory(slot: Int) -> URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    let dir = base
+      .appendingPathComponent("Chats", isDirectory: true)
+      .appendingPathComponent("\(slot)", isDirectory: true)
+      .appendingPathComponent("Media", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  private static func fileExtension(forMime mime: String) -> String {
+    switch mime {
+    case "audio/opus", "audio/ogg": return "opus"
+    case "audio/mp4", "audio/aac", "audio/m4a": return "m4a"
+    case "image/jpeg": return "jpg"
+    case "image/png": return "png"
+    case "image/gif": return "gif"
+    case "video/mp4": return "mp4"
+    case "video/quicktime": return "mov"
+    default: return "bin"
+    }
+  }
+
+  private func mediaReceivedEvent(download: MediaDownload, localPath: String) -> [String: Any?] {
+    [
+      "type": "mediaReceived",
+      "peerId": download.senderPeerId,
+      "groupId": download.groupId,
+      "localPath": localPath,
+      "mime": download.manifest.mime,
+      "filename": download.manifest.filename,
+      "durationMs": download.manifest.durationMs.map { Int($0) },
+      "totalSize": Int(download.manifest.totalSize),
+      "at": Int(Date().timeIntervalSince1970 * 1000),
+    ]
+  }
+
   // MARK: - Receiving
 
   private func onEnvelopeReceived(fromPeerId: String, bytes: Data) {
@@ -1163,7 +1338,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: response.initiatorIdentityBytes)) ?? ""
-      emit(receivedEvent(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext))
+      deliverIncoming(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext)
     } catch {
       NSLog("[ChatManager] failed to accept a handshake from \(fromPeerId): \(error)")
     }
@@ -1182,7 +1357,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
-      emit(receivedEvent(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
+      deliverIncoming(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext)
     } catch {
       // Might actually be a group control message sent through this same
       // session instead — see `groupControlAssociatedData`'s own doc
@@ -1255,7 +1430,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: response.initiatorIdentityBytes)) ?? ""
-      emit(receivedEvent(peerId: peerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext))
+      deliverIncoming(peerId: peerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext)
     } catch {
       NSLog("[ChatManager] failed to accept a mailbox-retrieved handshake: \(error)")
     }
@@ -1276,7 +1451,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
-      emit(receivedEvent(peerId: session.peerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
+      deliverIncoming(peerId: session.peerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext)
       return
     }
     for session in ChatStore.loadAllSessions(slot: slot) {
@@ -1394,10 +1569,14 @@ final class ChatManager {
       }
 
     case .blobFetched(let peerId, let id, let bytes):
+      // A media chunk takes priority — it's addressed by its own content
+      // id, never the fixed contact-card id, so the two never overlap.
+      if handleMediaBlobFetched(id: id, bytes: bytes) { return }
       guard id == Self.contactCardBlobId, state(for: peerId) == .fetchingCard else { return }
       handleCardFetched(peerId: peerId, cardBytes: bytes, delivery: .sendDirectly)
 
     case .blobFetchFailed(let peerId, let id, let reason):
+      if handleMediaBlobFailed(id: id) { return }
       guard id == Self.contactCardBlobId, state(for: peerId) == .fetchingCard else { return }
       guard let item = firstOutboxItem(peerId) else { endState(for: peerId); return }
       // `attemptSend` only ever calls `fetchBlob` when no session exists
