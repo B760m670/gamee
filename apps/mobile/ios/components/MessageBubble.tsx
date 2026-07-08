@@ -2,6 +2,7 @@ import { memo } from 'react'
 import { Pressable, View, Text, StyleSheet } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import type { ChatMessage } from '../store/chat'
+import { VoiceNote } from './VoiceNote'
 
 interface Props {
   msg: ChatMessage
@@ -17,6 +18,7 @@ function formatTime(epochMs: number): string {
 }
 
 function MessageBubbleBase({ msg, onLongPress }: Props) {
+  const voice = msg.media && msg.media.mime.startsWith('audio/') && msg.media.localPath
   return (
     <View style={[s.wrap, msg.outgoing ? s.wrapMine : s.wrapOther]}>
       <Pressable
@@ -24,7 +26,11 @@ function MessageBubbleBase({ msg, onLongPress }: Props) {
         onLongPress={onLongPress ? () => onLongPress(msg) : undefined}
         delayLongPress={350}
       >
-        <Text style={s.text}>{msg.text}</Text>
+        {voice ? (
+          <VoiceNote media={msg.media!} outgoing={msg.outgoing} />
+        ) : (
+          <Text style={s.text}>{msg.text}</Text>
+        )}
         <View style={s.meta}>
           <Text style={s.time}>{formatTime(msg.at)}</Text>
           {msg.outgoing ? (

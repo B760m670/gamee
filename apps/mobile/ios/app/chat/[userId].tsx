@@ -32,6 +32,7 @@ export default function ChatScreen() {
   const known = useChatStore(s => s.conversations[peerId] ?? s.activePeers[peerId])
   const openConversation = useChatStore(s => s.openConversation)
   const sendMessage = useChatStore(s => s.sendMessage)
+  const sendVoice = useChatStore(s => s.sendVoice)
   const deleteMessage = useChatStore(s => s.deleteMessage)
   const messages = useChatStore(s => s.messages[peerId] ?? [])
 
@@ -55,6 +56,10 @@ export default function ChatScreen() {
 
   function handleSend(text: string) {
     sendMessage(peerId, text)
+  }
+
+  function handleSendVoice(fileUri: string, durationMs: number) {
+    sendVoice(peerId, fileUri, durationMs)
   }
 
   function confirmDeleteMessage(msg: ChatMessage) {
@@ -107,7 +112,7 @@ export default function ChatScreen() {
       />
 
       <View style={{ paddingBottom: insets.bottom + 6 }}>
-        <ChatInputBar onSend={handleSend} />
+        <ChatInputBar onSend={handleSend} onSendVoice={handleSendVoice} />
       </View>
     </KeyboardAvoidingView>
   )

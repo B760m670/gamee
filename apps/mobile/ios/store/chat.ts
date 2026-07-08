@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import AsyncStorage from '@react-native-async-storage/async-storage'
-import { chatSendMessage, type ChatEvent } from '../modules/spiritchat-crypto-core'
+import { chatSendMessage, chatSendMedia, VOICE_MIME, type ChatEvent } from '../modules/spiritchat-crypto-core'
 
 /** Attached media on a message (photo/video/voice), once downloaded. */
 export interface ChatMedia {
@@ -79,6 +79,8 @@ interface ChatState {
   reset: () => void
   openConversation: (peer: PeerInfo) => Promise<ChatMessage[]>
   sendMessage: (peerId: string, text: string) => Promise<void>
+  /** Sends a recorded voice note (from ChatInputBar) to `peerId`. */
+  sendVoice: (peerId: string, fileUri: string, durationMs: number) => Promise<void>
   /**
    * Removes one message from this device's own copy of the history.
    * Local-only by design (for now): the 1:1 wire format carries no shared
@@ -222,6 +224,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: { ...get().messages, [peerId]: nextMessages },
       conversations: nextConversations,
     })
+    await Promise.all([
+      persistMessages(myFingerprint, peerId, nextMessages),
+      persistConversations(myFingerprint, nextConversations),
+    ])
+  },
+
+  sendVoice: async (peerId, fileUri, durationMs) => {
+    const peer = get().activePeers[peerId] ?? get().conversations[peerId]
+    if (!peer) return
+
+    const localId = chatSendMedia(peerId, peer.peerPublicKeyBase64, fileUri, VOICE_MIME, null, durationMs)
+    const at = Date.now()
+    const label = '🎤 Голосовое'
+    const message: ChatMessage = {
+      localId, outgoing: true, text: label,
+      media: { localPath: fileUri, mime: VOICE_MIME, filename: null, durationMs, totalSize: 0 },
+      at, status: 'sending',
+    }
+
+    const myFingerprint = get().myFingerprint
+    const nextMessages = [...(get().messages[peerId] ?? []), message]
+    const nextConversations = { ...get().conversations, [peerId]: { ...peer, lastMessageText: label, lastMessageAt: at } }
+    set({ messages: { ...get().messages, [peerId]: nextMessages }, conversations: nextConversations })
     await Promise.all([
       persistMessages(myFingerprint, peerId, nextMessages),
       persistConversations(myFingerprint, nextConversations),
