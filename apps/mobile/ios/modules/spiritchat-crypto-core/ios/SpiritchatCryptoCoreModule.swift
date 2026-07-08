@@ -537,6 +537,38 @@ public class SpiritchatCryptoCoreModule: Module {
       return localId
     }
 
+    // --- Voice recording (see VoiceRecorder.swift) ---
+
+    // Whether microphone access is already granted.
+    Function("hasMicrophonePermission") { () -> Bool in
+      VoiceRecorder.shared.hasPermission
+    }
+
+    // Asks for microphone permission, resolving true/false. Call before
+    // `voiceRecordingStart` the first time.
+    AsyncFunction("requestMicrophonePermission") { (promise: Promise) in
+      VoiceRecorder.shared.requestPermission { granted in promise.resolve(granted) }
+    }
+
+    // Starts recording a voice note to a temp .m4a file; returns its
+    // file:// URL. Throws if permission isn't granted or a recording is
+    // already running.
+    Function("voiceRecordingStart") { () throws -> String in
+      try VoiceRecorder.shared.start()
+    }
+
+    // Finishes recording, returning { fileUri, durationMs } — hand the
+    // fileUri to `chatSendMedia`/`chatSendGroupMedia` with mime
+    // "audio/mp4". Returns nil if nothing was recording.
+    Function("voiceRecordingStop") { () -> [String: Any]? in
+      VoiceRecorder.shared.stop()
+    }
+
+    // Aborts and discards the current recording (swipe-to-cancel).
+    Function("voiceRecordingCancel") { () in
+      VoiceRecorder.shared.cancel()
+    }
+
     // Creates a group named `name` with `memberPeerIds` as its initial
     // members — every one of them must already be an existing 1:1 contact
     // (see ChatManager's own "MARK: - Groups" doc comment for this v1's

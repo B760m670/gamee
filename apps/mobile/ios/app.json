@@ -19,7 +19,8 @@
       "bundleIdentifier": "com.mysocialapp.mobile",
       "buildNumber": "1",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "$(PRODUCT_NAME) запрашивает доступ к микрофону для записи голосовых сообщений."
       }
     },
     "android": {

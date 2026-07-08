@@ -160,6 +160,11 @@ const NativeCryptoCore = requireNativeModule<
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
     chatSendMedia(peerId: string, peerPublicKeyBase64: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
     chatSendGroupMedia(groupId: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
+    hasMicrophonePermission(): boolean
+    requestMicrophonePermission(): Promise<boolean>
+    voiceRecordingStart(): string
+    voiceRecordingStop(): { fileUri: string; durationMs: number } | null
+    voiceRecordingCancel(): void
     chatCreateGroup(name: string, memberPeerIds: string[]): string
     chatSendGroupMessage(groupId: string, plaintext: string): string
     chatAddGroupMember(groupId: string, newMemberPeerId: string): void
@@ -825,6 +830,35 @@ export function chatSendGroupMedia(
   filename: string | null = null, durationMs: number | null = null,
 ): string {
   return NativeCryptoCore.chatSendGroupMedia(groupId, fileUri, mime, filename, durationMs)
+}
+
+// --- Voice recording (see VoiceRecorder.swift) ---
+
+/** MIME to pass to `chatSendMedia` for a recorded voice note. */
+export const VOICE_MIME = 'audio/mp4'
+
+export function hasMicrophonePermission(): boolean {
+  return NativeCryptoCore.hasMicrophonePermission()
+}
+
+/** Asks for microphone access. Call before the first recording. */
+export function requestMicrophonePermission(): Promise<boolean> {
+  return NativeCryptoCore.requestMicrophonePermission()
+}
+
+/** Starts recording a voice note; returns the temp file's `file://` URL. */
+export function voiceRecordingStart(): string {
+  return NativeCryptoCore.voiceRecordingStart()
+}
+
+/** Finishes recording — `{ fileUri, durationMs }`, or null if none was active. */
+export function voiceRecordingStop(): { fileUri: string; durationMs: number } | null {
+  return NativeCryptoCore.voiceRecordingStop()
+}
+
+/** Discards the current recording (swipe-to-cancel). */
+export function voiceRecordingCancel(): void {
+  NativeCryptoCore.voiceRecordingCancel()
 }
 
 /**
