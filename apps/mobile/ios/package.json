@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "main": "expo-router/entry",
   "scripts": {
+    "postinstall": "node scripts/patch-expo-modules-jsi.mjs",
     "start": "expo start",
     "start:cs": "bash start-cs.sh",
     "tunnel": "bash tunnel.sh",
@@ -56,9 +57,7 @@
     "typescript": "^5.3.0"
   },
   "overrides": {
-    "react": "19.2.3",
-    "expo-modules-jsi": "57.0.1",
-    "expo-modules-core": "57.0.3"
+    "react": "19.2.3"
   },
   "expo": {
     "autolinking": {
