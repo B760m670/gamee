@@ -744,6 +744,15 @@ export function requestLedgerChainSync(peerId: string, timeoutMs = 30_000): Prom
  * toggle, if one is ever needed — not for product UI to call directly.
  * Successful blocks surface as `newBlockMined` on the event stream,
  * alongside the `chainTipChanged` every new tip fires.
+ *
+ * **Throws on App Store builds**, which mine nothing on the device at all
+ * (see `DistributionPolicy.swift`): App Review allows mining only where the
+ * processing happens off device, so that binary is compiled without the
+ * ability rather than merely configured not to use it — including through
+ * this function, since a JS bundle is the one part of the app that can
+ * change after review. On those builds the `@username` ledger is mined by
+ * standing relays (`packages/relay-node`) instead, and claims confirm when
+ * a relay includes them in a block.
  */
 export function startLedgerMining(publicKeyBase64Value: string = publicKeyBase64()): void {
   NativeCryptoCore.p2pStartMining(publicKeyBase64Value)

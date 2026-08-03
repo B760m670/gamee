@@ -7,6 +7,10 @@ enum BlobStoreError: Error {
 
 enum MiningError: Error {
   case malformedPublicKey(String)
+  /// This binary was built for a channel that forbids mining on the device —
+  /// see `DistributionPolicy`. Surfaced rather than silently ignored so
+  /// tooling that calls `p2pStartMining` gets told why nothing happened.
+  case notPermittedInThisBuild
 }
 
 enum ChatError: Error {
@@ -436,6 +440,14 @@ public class SpiritchatCryptoCoreModule: Module {
     // involvement. Successful blocks surface as `newBlockMined` on
     // `onP2pEvent`.
     Function("p2pStartMining") { (publicKeyBase64: String) throws in
+      // The compile-time policy has to hold here too, not just in
+      // `MiningController`. This function is reachable from JS, and a JS
+      // bundle is the one part of the app that can change after review — so
+      // if this were left open, "an App Store build does not mine" would be a
+      // property of the current bundle rather than of the binary.
+      guard DistributionPolicy.allowsOnDeviceMining else {
+        throw MiningError.notPermittedInThisBuild
+      }
       guard let publicKey = Data(base64Encoded: publicKeyBase64) else {
         throw MiningError.malformedPublicKey(publicKeyBase64)
       }

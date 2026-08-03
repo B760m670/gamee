@@ -19,6 +19,23 @@ pub fn peer_id_from_seed(seed: &[u8; 32]) -> Result<PeerId> {
     Ok(keypair_from_seed(seed)?.public().to_peer_id())
 }
 
+/// The raw 32-byte Ed25519 *public* key for a seed — the public half of the
+/// identity `keypair_from_seed` builds.
+///
+/// Exists so a headless node (see `packages/relay-node`) can name itself in
+/// data it publishes — a mined block's `miner_public_key`, for instance —
+/// without depending on `libp2p` directly just to unwrap a `PublicKey`, and,
+/// more importantly, without ever being tempted to reach for the seed itself:
+/// the seed is the relay's private identity, and putting it in a block header
+/// would publish its secret key to the whole network.
+pub fn public_key_bytes_from_seed(seed: &[u8; 32]) -> Result<[u8; 32]> {
+    let public = keypair_from_seed(seed)?
+        .public()
+        .try_into_ed25519()
+        .map_err(|err| P2pError::InvalidSeed(err.to_string()))?;
+    Ok(public.to_bytes())
+}
+
 /// Derives the `PeerId` a raw 32-byte Ed25519 public key would produce as a
 /// libp2p identity — used to turn a username claim's public key (resolved
 /// from the DHT, see `crate::username`) into something dialable, without
@@ -33,6 +50,21 @@ pub fn peer_id_from_public_key(public_key: &[u8]) -> Result<PeerId> {
 #[cfg(test)]
 mod public_key_tests {
     use super::*;
+
+    #[test]
+    fn public_key_bytes_match_the_keypairs_own_public_half() {
+        let seed = [11u8; 32];
+        let expected = keypair_from_seed(&seed).unwrap().public().try_into_ed25519().unwrap().to_bytes();
+        assert_eq!(public_key_bytes_from_seed(&seed).unwrap(), expected);
+    }
+
+    #[test]
+    fn public_key_bytes_are_never_the_seed_itself() {
+        // Guards the one mistake that would be catastrophic here: publishing
+        // the private seed as if it were an identifier.
+        let seed = [13u8; 32];
+        assert_ne!(public_key_bytes_from_seed(&seed).unwrap(), seed);
+    }
 
     #[test]
     fn matches_the_peer_id_derived_from_the_same_seed() {

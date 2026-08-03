@@ -9,7 +9,20 @@
 //! - re-broadcasts its mix routing key on a short cadence
 //!   (`Command::AnnounceMixRelay`) so every newly connected peer hears it;
 //! - keeps Loopix cover traffic on by default (phones gate this behind
-//!   foreground-and-charging; a plugged-in machine has no such concern).
+//!   foreground-and-charging; a plugged-in machine has no such concern);
+//! - mines the `@username` ledger by default, which is what lets phones
+//!   stop mining entirely (see `--no-mine`).
+//!
+//! That last point is load-bearing, not a nicety. A `@username` claim is
+//! only ever *confirmed* by being mined into a block, so the ledger needs
+//! someone grinding SHA-256 or every claim sits in the mempool forever.
+//! Historically the phones were the only miners, which is both a poor use
+//! of a battery-powered device and something the App Store does not allow
+//! (guideline 3.1.5(b) permits mining only when "performed off device").
+//! Moving the work here resolves both at once: the phones submit claims,
+//! standing relays turn them into blocks. A network with no relay running
+//! still delivers messages — mailboxes, mixnet and chat are independent of
+//! the ledger — it simply cannot confirm new usernames until one appears.
 //!
 //! Deliberately **not** a server: it holds no accounts, sees no
 //! plaintext, learns no sender/recipient identities (deposits are keyed
@@ -22,7 +35,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use spiritchat_p2p_core::{public_dht_bootstrap_addresses, Command, Multiaddr, P2pEvent, P2pNode};
+use spiritchat_p2p_core::{
+    public_dht_bootstrap_addresses, public_key_bytes_from_seed, Command, Multiaddr, P2pEvent,
+    P2pNode,
+};
 
 /// How often the mix routing key is re-broadcast to the gossip directory.
 /// Gossip only reaches peers connected *at broadcast time*, so a standing
@@ -40,6 +56,7 @@ struct Config {
     port: Option<u16>,
     bootstrap: Vec<Multiaddr>,
     cover_traffic: bool,
+    mine: bool,
 }
 
 const USAGE: &str = "\
@@ -63,6 +80,14 @@ OPTIONS:
                           useful for a private/test network.
   --no-cover-traffic      Disable Loopix cover/loop traffic (on by default here,
                           since a standing relay pays no battery cost).
+  --no-mine               Don't mine the @username ledger. Mining is ON by default:
+                          it is how claims get confirmed, and relays are the only
+                          miners left now that the app no longer mines on phones.
+                          Expect one core's worth of sustained CPU. Turning it off
+                          is fine for a relay run purely for message delivery —
+                          mailboxes, mixnet and chat don't involve the ledger — but
+                          if no relay anywhere is mining, no new username can be
+                          registered.
   --help                  This text.
 ";
 
@@ -72,6 +97,7 @@ fn parse_args() -> Result<Config, String> {
         port: None,
         bootstrap: Vec::new(),
         cover_traffic: true,
+        mine: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -89,6 +115,7 @@ fn parse_args() -> Result<Config, String> {
                 config.bootstrap.push(value.parse().map_err(|_| format!("not a valid multiaddr: {value}"))?);
             }
             "--no-cover-traffic" => config.cover_traffic = false,
+            "--no-mine" => config.mine = false,
             "--help" | "-h" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -184,6 +211,25 @@ async fn main() {
     if config.cover_traffic {
         let _ = node.command(Command::SetMixDummyTrafficActive { enabled: true });
     }
+    if config.mine {
+        // Blocks are attributed to the *public* half of this relay's
+        // identity — never the seed, which is its private key and would be
+        // published to the network in every block header we mined.
+        match public_key_bytes_from_seed(&seed) {
+            Ok(public_key) => {
+                let _ = node.command(Command::StartMining { public_key });
+                log("mining the @username ledger (one core; --no-mine to disable)");
+            }
+            Err(err) => {
+                // Not fatal: a relay that can't mine is still a useful relay,
+                // and refusing to start would take message delivery down over
+                // a feature that is strictly additive.
+                log(&format!("not mining — cannot derive this relay's public key: {err}"));
+            }
+        }
+    } else {
+        log("mining disabled (--no-mine) — this relay won't confirm @username claims");
+    }
 
     let mut listen_addresses: Vec<Multiaddr> = Vec::new();
     let mut mix_announce_ticker = tokio::time::interval(MIX_RELAY_ANNOUNCE_INTERVAL);
@@ -238,6 +284,11 @@ async fn main() {
                     P2pEvent::MixForwardFailed { reason } => log(&format!("mix forward failed: {reason}")),
                     P2pEvent::AddressAnnouncementFailed { reason } => log(&format!("address announcement failed: {reason}")),
                     P2pEvent::ChainTipChanged { height, .. } => log(&format!("ledger tip now at height {height}")),
+                    // Distinct from the tip moving, which also fires for blocks
+                    // received from other peers: this one is a block *this*
+                    // relay found, so it's the only line that tells an operator
+                    // their mining is actually contributing.
+                    P2pEvent::NewBlockMined { height } => log(&format!("mined block at height {height}")),
                     _ => {}
                 }
             }

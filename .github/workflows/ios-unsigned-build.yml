@@ -28,6 +28,16 @@ on:
       - 'packages/ledger-core/**'
       - '.github/workflows/ios-unsigned-build.yml'
   workflow_dispatch:
+    inputs:
+      distribution:
+        description: >-
+          Distribution channel to build for. "app-store" defines the
+          SPIRITCHAT_APP_STORE Swift condition, which disables on-device
+          ledger mining (App Review 3.1.5(b) — standing relays mine instead).
+          "direct" is the sideload/LiveContainer build, which keeps mining.
+        type: choice
+        options: [direct, app-store]
+        default: direct
 
 concurrency:
   group: ios-build-${{ github.ref }}
@@ -48,6 +58,13 @@ env:
 jobs:
   build:
     runs-on: macos-15
+    env:
+      # Read by SpiritchatCryptoCore.podspec at `pod install` time to decide
+      # whether to define the SPIRITCHAT_APP_STORE Swift condition. Defaults to
+      # the sideload channel, so a plain push or a manual run with nothing
+      # selected builds exactly what it built before. Job-level rather than
+      # workflow-level so it can read the dispatch input.
+      SPIRITCHAT_DISTRIBUTION: ${{ github.event.inputs.distribution || 'direct' }}
     defaults:
       run:
         working-directory: apps/mobile/ios
@@ -147,7 +164,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: apps/mobile/ios/ios
-          key: native-ios-project-${{ runner.os }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/app.json', 'apps/mobile/ios/modules/**/*.podspec', 'apps/mobile/ios/modules/**/expo-module.config.json', 'apps/mobile/ios/modules/**/*.swift', 'packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml') }}
+          # The distribution channel belongs in the key: it changes the Swift
+          # compilation conditions baked into the generated Pods project while
+          # leaving every hashed file byte-identical, so without it an
+          # app-store run could restore — and ship — a project configured for
+          # the mining-enabled channel.
+          key: native-ios-project-${{ runner.os }}-${{ env.SPIRITCHAT_DISTRIBUTION }}-${{ hashFiles('apps/mobile/ios/package.json', 'apps/mobile/ios/app.json', 'apps/mobile/ios/modules/**/*.podspec', 'apps/mobile/ios/modules/**/expo-module.config.json', 'apps/mobile/ios/modules/**/*.swift', 'packages/crypto-core/**/*.rs', 'packages/crypto-core/Cargo.toml', 'packages/crypto-core-ffi/**/*.rs', 'packages/crypto-core-ffi/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml') }}
 
       - name: Prebuild native iOS project
         if: steps.native-project-cache.outputs.cache-hit != 'true'
@@ -173,6 +195,33 @@ jobs:
         working-directory: apps/mobile/ios/ios
         run: pod install --repo-update
 
+      # Deliberately not conditional on the pod-install step above: the case
+      # worth catching is precisely the one where install was skipped and the
+      # generated project came from a cache, since that is the only way a run
+      # could end up archiving a project configured for the other channel.
+      # Reads the same file Xcode will read, so this asserts what actually
+      # reaches the compiler rather than what we intended to set.
+      - name: Verify the distribution policy reached the project
+        working-directory: apps/mobile/ios/ios
+        run: |
+          CONFIG="Pods/Target Support Files/SpiritchatCryptoCore/SpiritchatCryptoCore.release.xcconfig"
+          if [ ! -f "$CONFIG" ]; then
+            echo "::error::$CONFIG is missing — cannot verify the distribution policy"
+            exit 1
+          fi
+          echo "Channel: $SPIRITCHAT_DISTRIBUTION"
+          grep -F 'SWIFT_ACTIVE_COMPILATION_CONDITIONS' "$CONFIG" || true
+          if grep -qF 'SPIRITCHAT_APP_STORE' "$CONFIG"; then PRESENT=yes; else PRESENT=no; fi
+          if [ "$SPIRITCHAT_DISTRIBUTION" = "app-store" ] && [ "$PRESENT" != "yes" ]; then
+            echo "::error::app-store build without SPIRITCHAT_APP_STORE — this binary would mine on device"
+            exit 1
+          fi
+          if [ "$SPIRITCHAT_DISTRIBUTION" != "app-store" ] && [ "$PRESENT" = "yes" ]; then
+            echo "::error::direct build carries SPIRITCHAT_APP_STORE — mining would be disabled unintentionally"
+            exit 1
+          fi
+          echo "Distribution policy verified: SPIRITCHAT_APP_STORE present=$PRESENT"
+
       # Now that the project itself is stable across runs whenever possible
       # (see above), this can actually do what it was meant to: let Xcode's
       # own incremental build system skip recompiling any pod whose inputs
@@ -183,9 +232,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Developer/Xcode/DerivedData
-          key: deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ hashFiles('apps/mobile/ios/ios/Podfile.lock') }}
+          key: deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ env.SPIRITCHAT_DISTRIBUTION }}-${{ hashFiles('apps/mobile/ios/ios/Podfile.lock') }}
           restore-keys: |
-            deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ env.SPIRITCHAT_DISTRIBUTION }}-
 
       - name: Detect Xcode scheme
         working-directory: apps/mobile/ios/ios
