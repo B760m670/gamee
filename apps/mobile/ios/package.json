@@ -57,7 +57,8 @@
   },
   "overrides": {
     "react": "19.2.3",
-    "expo-modules-jsi": "57.0.1"
+    "expo-modules-jsi": "57.0.1",
+    "expo-modules-core": "57.0.3"
   },
   "expo": {
     "autolinking": {
