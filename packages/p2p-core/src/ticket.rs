@@ -213,6 +213,89 @@ pub fn mine_ticket(
     }
 }
 
+/// What a recipient knows about someone approaching them, as far as it is
+/// knowable without reading anything. Every field is derived from the
+/// recipient's *own* view — their contacts, their consent decisions, receipts
+/// that reached them through their own graph — never from a global verdict.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContactSignals {
+    /// An existing correspondent: already a contact, or a conversation this
+    /// device has consented to. The common case, and the one that must cost
+    /// nothing at all.
+    pub established: bool,
+    /// This device blocked them. Its own decision, and the only one that
+    /// closes the door.
+    pub blocked_by_me: bool,
+    /// How many of *this device's* contacts have blocked them, as learned
+    /// through receipts. Zero when nothing is known, which is also the state
+    /// of a network where nobody publishes receipts at all.
+    pub contacts_who_blocked: u32,
+    /// Shares at least one contact with this device — weak evidence of being
+    /// a real participant rather than a fresh throwaway.
+    pub shares_contacts: bool,
+    /// Holds a `@username`, which costs proof of work to claim. Also weak,
+    /// and for the same reason: it is a cost signal, not an endorsement.
+    pub holds_username: bool,
+}
+
+/// What a sender must pay to be heard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactRequirement {
+    /// No ticket at all — an established conversation.
+    None,
+    /// A ticket meeting this many leading zero bits.
+    Work(u32),
+    /// Nothing will be accepted.
+    Refused,
+}
+
+/// Cheapest a stranger can ever get. Never free: "cheap" and "free" differ by
+/// exactly the property that makes bulk contact expensive.
+pub const TICKET_MIN_LEADING_ZERO_BITS: u32 = 18;
+/// Dearest the ladder climbs. Around a minute of one core — heavy enough to
+/// make mass approach pointless, bounded so it can never become a life
+/// sentence handed down by other people.
+pub const TICKET_MAX_LEADING_ZERO_BITS: u32 = 28;
+
+/// The sanction ladder, as arithmetic.
+///
+/// One property here is deliberate and worth naming, because the obvious
+/// implementation gets it wrong: **other people's blocks raise the price,
+/// they never impose silence.** However many of your contacts have blocked
+/// someone, the result is a harder ticket, never `Refused`. Only
+/// `blocked_by_me` closes the door. Otherwise a graph could be assembled into
+/// a mob veto, and a moderation mechanism that can be aimed is a weapon
+/// rather than a defence — the same reasoning that keeps the whole design
+/// subjective (see `docs/consent-and-moderation.md` §1).
+pub fn required_work(signals: &ContactSignals) -> ContactRequirement {
+    if signals.blocked_by_me {
+        return ContactRequirement::Refused;
+    }
+    if signals.established {
+        return ContactRequirement::None;
+    }
+
+    let mut bits = TICKET_BASE_LEADING_ZERO_BITS as i64;
+
+    // Costly identity and a shared social edge each shave a little. Small on
+    // purpose: they are evidence of effort, not of good intent, and treating
+    // them as more would make a `@username` a licence to spam.
+    if signals.holds_username {
+        bits -= 1;
+    }
+    if signals.shares_contacts {
+        bits -= 1;
+    }
+
+    // Each block from someone this device actually trusts roughly quadruples
+    // the work. Saturating, since the cap does the bounding.
+    bits += 4 * i64::from(signals.contacts_who_blocked.min(8));
+
+    ContactRequirement::Work(
+        bits.clamp(TICKET_MIN_LEADING_ZERO_BITS as i64, TICKET_MAX_LEADING_ZERO_BITS as i64) as u32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +413,84 @@ mod tests {
         let restored = ContactTicket::from_bytes(&ticket.to_bytes()).unwrap();
         assert_eq!(restored, ticket);
         restored.verify_for(&bob, TEST_BITS, 100).unwrap();
+    }
+
+    #[test]
+    fn an_established_correspondent_pays_nothing() {
+        let signals = ContactSignals { established: true, ..Default::default() };
+        assert_eq!(required_work(&signals), ContactRequirement::None);
+    }
+
+    #[test]
+    fn only_my_own_block_closes_the_door() {
+        // The property that keeps this a defence rather than a weapon: no
+        // number of other people's blocks can silence someone for me.
+        let mobbed = ContactSignals { contacts_who_blocked: 1000, ..Default::default() };
+        assert!(matches!(required_work(&mobbed), ContactRequirement::Work(_)));
+
+        let mine = ContactSignals { blocked_by_me: true, ..Default::default() };
+        assert_eq!(required_work(&mine), ContactRequirement::Refused);
+    }
+
+    #[test]
+    fn a_stranger_pays_the_base_rate() {
+        let stranger = ContactSignals::default();
+        assert_eq!(
+            required_work(&stranger),
+            ContactRequirement::Work(TICKET_BASE_LEADING_ZERO_BITS),
+        );
+    }
+
+    #[test]
+    fn blocks_from_my_contacts_raise_the_price_monotonically() {
+        let price = |n| match required_work(&ContactSignals {
+            contacts_who_blocked: n,
+            ..Default::default()
+        }) {
+            ContactRequirement::Work(bits) => bits,
+            other => panic!("expected work, got {other:?}"),
+        };
+        assert!(price(0) < price(1));
+        assert!(price(1) < price(2));
+    }
+
+    #[test]
+    fn the_price_is_bounded_at_both_ends() {
+        // Never free, however trusted the approach looks...
+        let trusted = ContactSignals {
+            shares_contacts: true,
+            holds_username: true,
+            ..Default::default()
+        };
+        match required_work(&trusted) {
+            ContactRequirement::Work(bits) => assert!(bits >= TICKET_MIN_LEADING_ZERO_BITS),
+            other => panic!("expected work, got {other:?}"),
+        }
+        // ...and never unpayable, however many people dislike them.
+        match required_work(&ContactSignals { contacts_who_blocked: u32::MAX, ..Default::default() }) {
+            ContactRequirement::Work(bits) => assert_eq!(bits, TICKET_MAX_LEADING_ZERO_BITS),
+            other => panic!("expected work, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_costly_identity_helps_a_little_but_is_not_a_licence() {
+        // A @username makes an approach cheaper, never free and never enough
+        // to offset real negative signal — otherwise buying a name would buy
+        // the right to spam.
+        let named = ContactSignals { holds_username: true, ..Default::default() };
+        let named_but_blocked = ContactSignals {
+            holds_username: true,
+            contacts_who_blocked: 2,
+            ..Default::default()
+        };
+        let plain = ContactSignals::default();
+        let bits = |s| match required_work(&s) {
+            ContactRequirement::Work(b) => b,
+            other => panic!("expected work, got {other:?}"),
+        };
+        assert!(bits(named) < bits(plain));
+        assert!(bits(named_but_blocked) > bits(plain));
     }
 
     #[test]
