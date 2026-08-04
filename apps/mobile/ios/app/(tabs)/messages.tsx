@@ -12,6 +12,7 @@ import { useUsernameSearch, normalizeUsernameQuery, type FoundUser } from '../..
 import { useChatStore } from '../../store/chat'
 import { useGroupStore } from '../../store/groups'
 import { useProfileStore } from '../../store/profile'
+import { useContactsStore } from '../../store/contacts'
 
 // Deliberately a plain, always-in-flow search field — not a hidden,
 // pull-to-reveal trigger that opens a separate absolutely-positioned
@@ -24,6 +25,7 @@ export default function ChatsScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const conversations = useChatStore(s => s.conversations)
+  const contacts = useContactsStore(s => s.contacts)
   const groups = useGroupStore(s => s.groups)
   const myPeerId = useProfileStore(s => s.peerId)
 
@@ -35,7 +37,23 @@ export default function ChatsScreen() {
   // always resolves (this device published its own claim), but there is
   // no legitimate reason to open a "chat" with yourself.
   const results = useMemo(() => rawResults.filter(u => u.peerId !== myPeerId), [rawResults, myPeerId])
-  const items = useMemo(() => Object.values(conversations).sort((a, b) => b.lastMessageAt - a.lastMessageAt), [conversations])
+  // A conversation a stranger started stays out of the inbox until this
+  // device consents to it — see docs/consent-and-moderation.md. Being in
+  // Contacts counts as consent already given, which is why that check lives
+  // here rather than in the store: the store would have to reach across into
+  // another store to know it.
+  const allConversations = useMemo(
+    () => Object.values(conversations).sort((a, b) => b.lastMessageAt - a.lastMessageAt),
+    [conversations],
+  )
+  const items = useMemo(
+    () => allConversations.filter(c => c.accepted === true || !!contacts[c.peerId]),
+    [allConversations, contacts],
+  )
+  const requests = useMemo(
+    () => allConversations.filter(c => c.accepted !== true && !contacts[c.peerId]),
+    [allConversations, contacts],
+  )
   const groupItems = useMemo(() => Object.values(groups), [groups])
   const term = normalizeUsernameQuery(query)
 
@@ -150,9 +168,24 @@ export default function ChatsScreen() {
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: insets.bottom + 20 }}
           ListHeaderComponent={
-            groupItems.length > 0 ? (
-              <View>
-                <Text style={s.sectionHeader}>Группы</Text>
+            <View>
+              {requests.length > 0 ? (
+                <Pressable
+                  style={({ pressed }) => [s.groupRow, pressed && s.groupRowPressed]}
+                  onPress={() => router.push('/requests')}
+                >
+                  <View style={s.groupIcon}>
+                    <Ionicons name="mail-unread-outline" size={22} color="#71717a" />
+                  </View>
+                  <Text style={s.groupTitle} numberOfLines={1}>Запросы</Text>
+                  <View style={s.requestBadge}>
+                    <Text style={s.requestBadgeText}>{requests.length}</Text>
+                  </View>
+                </Pressable>
+              ) : null}
+              {groupItems.length > 0 ? (
+                <View>
+                  <Text style={s.sectionHeader}>Группы</Text>
                 {groupItems.map(group => (
                   <Pressable
                     key={group.groupId}
@@ -165,8 +198,9 @@ export default function ChatsScreen() {
                     <Text style={s.groupTitle} numberOfLines={1}>{group.name}</Text>
                   </Pressable>
                 ))}
-              </View>
-            ) : null
+                </View>
+              ) : null}
+            </View>
           }
           ListEmptyComponent={
             <View style={s.empty}>
@@ -198,6 +232,11 @@ const s = StyleSheet.create({
     width: 54, height: 54, borderRadius: 27, backgroundColor: '#1c1c1e',
     alignItems: 'center', justifyContent: 'center',
   },
+  requestBadge: {
+    minWidth: 22, height: 22, borderRadius: 11, paddingHorizontal: 6,
+    backgroundColor: '#2f7bff', alignItems: 'center', justifyContent: 'center',
+  },
+  requestBadgeText: { color: '#fff', fontSize: 12, fontWeight: '700' },
   groupTitle: { flex: 1, color: '#fff', fontSize: 16, fontWeight: '600' },
 
   searchRow: {

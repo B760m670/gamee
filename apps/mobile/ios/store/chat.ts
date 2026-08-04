@@ -43,6 +43,18 @@ export interface Conversation extends PeerInfo {
   lastMessageText: string
   /** Epoch milliseconds. */
   lastMessageAt: number
+  /**
+   * Whether this device has consented to the conversation — set the moment
+   * *we* send anything, or when the user accepts explicitly. Until then a
+   * conversation started by a stranger is a request, and the Chats list keeps
+   * it out of the way (see `docs/consent-and-moderation.md`, phase 1).
+   *
+   * Optional because conversations persisted before this existed have no such
+   * field; `undefined` is read as "not accepted", which is the safe direction
+   * — the worst case is an old conversation appearing under Requests once,
+   * where one tap fixes it, rather than a stranger appearing in the inbox.
+   */
+  accepted?: boolean
 }
 
 // Namespaced by *this device's own* active fingerprint, the same pattern
@@ -103,6 +115,12 @@ interface ChatState {
   deleteMessage: (peerId: string, localId: string) => Promise<void>
   /** Removes the whole conversation (history + list entry) from this device only. */
   deleteChat: (peerId: string) => Promise<void>
+  /**
+   * Consents to a conversation a stranger started, moving it out of Requests
+   * and into the Chats list. Purely local: the other side is told nothing,
+   * and has no way to tell an accepted request from one still waiting.
+   */
+  acceptRequest: (peerId: string) => Promise<void>
   handleChatEvent: (event: ChatEvent) => void
 }
 
@@ -154,6 +172,11 @@ async function appendIncomingForInactive(
     peerUsername: known?.peerUsername ?? null,
     lastMessageText: event.plaintext,
     lastMessageAt: at,
+    // Carried over rather than rebuilt: this object replaces the stored one
+    // wholesale, so dropping the flag here would quietly demote an already
+    // accepted conversation back to a request the next time a message
+    // arrived while its account was in the background.
+    accepted: known?.accepted,
   }
   const next = [...conversations.filter(c => c.peerId !== event.peerId), updated]
   await AsyncStorage.setItem(conversationsKey(fingerprint), JSON.stringify(next))
@@ -230,7 +253,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const nextMessages = [...(get().messages[peerId] ?? []), message]
     const nextConversations = {
       ...get().conversations,
-      [peerId]: { ...peer, lastMessageText: trimmed, lastMessageAt: at },
+      [peerId]: { ...peer, lastMessageText: trimmed, lastMessageAt: at, accepted: true },
     }
     set({
       messages: { ...get().messages, [peerId]: nextMessages },
@@ -261,7 +284,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     const myFingerprint = get().myFingerprint
     const nextMessages = [...(get().messages[peerId] ?? []), message]
-    const nextConversations = { ...get().conversations, [peerId]: { ...peer, lastMessageText: label, lastMessageAt: at } }
+    const nextConversations = { ...get().conversations, [peerId]: { ...peer, lastMessageText: label, lastMessageAt: at, accepted: true } }
     set({ messages: { ...get().messages, [peerId]: nextMessages }, conversations: nextConversations })
     await Promise.all([
       persistMessages(myFingerprint, peerId, nextMessages),
@@ -292,6 +315,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ conversations: nextConversations })
       await persistConversations(myFingerprint, nextConversations)
     }
+  },
+
+  acceptRequest: async (peerId) => {
+    const myFingerprint = get().myFingerprint
+    const conversation = get().conversations[peerId]
+    if (!myFingerprint || !conversation || conversation.accepted) return
+    const nextConversations = {
+      ...get().conversations,
+      [peerId]: { ...conversation, accepted: true },
+    }
+    set({ conversations: nextConversations })
+    await persistConversations(myFingerprint, nextConversations)
   },
 
   deleteChat: async (peerId) => {
