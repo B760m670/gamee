@@ -34,12 +34,17 @@ mod node;
 mod public_relay;
 mod recovery_backup;
 mod rendezvous;
+mod ticket;
 mod username;
 
 pub use bootstrap::public_dht_bootstrap_addresses;
 pub use command::Command;
 pub use error::{P2pError, Result};
 pub use event::P2pEvent;
+pub use ticket::{
+    mine_ticket, ticket_base, ContactTicket, MAX_EPOCH_DRIFT, TICKET_BASE_LEADING_ZERO_BITS,
+    TICKET_LEN,
+};
 pub use identity::{
     keypair_from_seed, peer_id_from_public_key, peer_id_from_seed, public_key_bytes_from_seed,
 };
