@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  View, Text, FlatList, Pressable,
+  View, Text, FlatList, Pressable, Alert,
   KeyboardAvoidingView, Platform, StyleSheet,
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
@@ -10,6 +10,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { PeerAvatar } from '../../components/PeerAvatar'
 import { MessageBubble } from '../../components/MessageBubble'
 import { ChatInputBar } from '../../components/ChatInputBar'
+import { useMediaAttach } from '../../hooks/useMediaAttach'
 import { useChatStore, type ChatMessage, type PeerInfo } from '../../store/chat'
 
 const BTN_H = 44
@@ -32,6 +33,9 @@ export default function ChatScreen() {
   const known = useChatStore(s => s.conversations[peerId] ?? s.activePeers[peerId])
   const openConversation = useChatStore(s => s.openConversation)
   const sendMessage = useChatStore(s => s.sendMessage)
+  const sendVoice = useChatStore(s => s.sendVoice)
+  const sendMedia = useChatStore(s => s.sendMedia)
+  const deleteMessage = useChatStore(s => s.deleteMessage)
   const messages = useChatStore(s => s.messages[peerId] ?? [])
 
   const [ready, setReady] = useState(false)
@@ -54,6 +58,21 @@ export default function ChatScreen() {
 
   function handleSend(text: string) {
     sendMessage(peerId, text)
+  }
+
+  function handleSendVoice(fileUri: string, durationMs: number) {
+    sendVoice(peerId, fileUri, durationMs)
+  }
+
+  const handleAttach = useMediaAttach(m =>
+    sendMedia(peerId, m.fileUri, m.mime, m.filename, m.durationMs),
+  )
+
+  function confirmDeleteMessage(msg: ChatMessage) {
+    Alert.alert('Удалить сообщение?', 'Оно удалится только на этом устройстве.', [
+      { text: 'Отмена', style: 'cancel' },
+      { text: 'Удалить', style: 'destructive', onPress: () => deleteMessage(peerId, msg.localId) },
+    ])
   }
 
   return (
@@ -83,7 +102,9 @@ export default function ChatScreen() {
         data={[...messages].reverse()}
         inverted
         keyExtractor={m => m.localId}
-        renderItem={({ item }: { item: ChatMessage }) => <MessageBubble msg={item} />}
+        renderItem={({ item }: { item: ChatMessage }) => (
+          <MessageBubble msg={item} onLongPress={confirmDeleteMessage} />
+        )}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="interactive"
         contentContainerStyle={{ paddingVertical: 10 }}
@@ -97,7 +118,7 @@ export default function ChatScreen() {
       />
 
       <View style={{ paddingBottom: insets.bottom + 6 }}>
-        <ChatInputBar onSend={handleSend} />
+        <ChatInputBar onSend={handleSend} onSendVoice={handleSendVoice} onAttach={handleAttach} />
       </View>
     </KeyboardAvoidingView>
   )

@@ -14,9 +14,11 @@ import {
   addChatEventListener,
   requestLedgerChainSync,
 } from '../modules/spiritchat-crypto-core'
-import { useProfileStore } from '../store/profile'
+import { useProfileStore, handleRecoveryBackupEvent } from '../store/profile'
 import { useChatStore } from '../store/chat'
 import { useGroupStore } from '../store/groups'
+import { useContactsStore } from '../store/contacts'
+import { useConsentStore } from '../store/consent'
 import { handlePeerAvatarEvent } from '../store/peerAvatars'
 
 const queryClient = new QueryClient({
@@ -76,9 +78,11 @@ export default function RootLayout() {
   // Chat events are handled entirely in the stores (see store/chat.ts and
   // store/groups.ts) — this just wires the native event stream to both,
   // once for the app's lifetime; each ignores whatever event type isn't
-  // its own. ChatManager.swift already only ever emits for whichever
-  // account is currently active, so nothing here needs to change on an
-  // account switch.
+  // its own. Every registered account's node runs concurrently now, so
+  // events arrive tagged with their owning account's fingerprint and the
+  // stores route inactive accounts' traffic into that account's own
+  // namespaced storage — nothing here needs to change on an account
+  // switch either way.
   useEffect(() => {
     return addChatEventListener((event) => {
       useChatStore.getState().handleChatEvent(event)
@@ -96,9 +100,17 @@ export default function RootLayout() {
     if (fingerprint) {
       useChatStore.getState().loadForFingerprint(fingerprint)
       useGroupStore.getState().loadForFingerprint(fingerprint, peerId)
+      useContactsStore.getState().loadForFingerprint(fingerprint)
+      // Not namespaced by fingerprint like the others: the native store is
+      // already per account slot, and this is only a mirror of it (see
+      // store/consent.ts). It still has to be re-read on every switch, since
+      // the slot behind it changed.
+      useConsentStore.getState().load()
     } else {
       useChatStore.getState().reset()
       useGroupStore.getState().reset()
+      useContactsStore.getState().reset()
+      useConsentStore.getState().reset()
     }
   }, [fingerprint])
 
@@ -142,6 +154,7 @@ export default function RootLayout() {
       }
 
       handlePeerAvatarEvent(event)
+      handleRecoveryBackupEvent(event)
     })
     return unsubscribe
   }, [])

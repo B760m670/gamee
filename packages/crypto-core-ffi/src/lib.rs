@@ -6,12 +6,15 @@
 //! apps never re-implement (or subtly diverge on) the handshake or ratchet.
 
 mod agreement;
+mod backup;
 mod blob;
 mod contact_card;
 mod error;
 mod handshake;
 mod identity;
 mod ledger;
+mod media;
+mod mls;
 mod p2p_event;
 mod p2p_node;
 mod prekeys;

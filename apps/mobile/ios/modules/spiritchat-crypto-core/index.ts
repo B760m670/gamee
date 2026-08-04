@@ -1,11 +1,22 @@
 import { requireNativeModule } from 'expo-modules-core'
 
 /**
+ * Which account's node an event came from. Every registered account runs
+ * its own live node now (not just the active one), so every event that
+ * crosses the bridge is stamped with its session's slot + fingerprint by
+ * the native pump — `addP2pEventListener` uses `slot` to drop inactive
+ * accounts' node chatter before the active-account UI ever sees it, and
+ * store/chat.ts uses `selfFingerprint` to route an inactive account's
+ * messages into that account's own namespaced storage.
+ */
+export type EventOrigin = { slot?: number; selfFingerprint?: string }
+
+/**
  * Mirrors `spiritchat_crypto_core_ffi::FfiP2pEvent` — see p2p_event.rs.
  * Discriminated by `type` so the native side can stay a plain dictionary
  * instead of needing a second binding layer.
  */
-export type P2pEvent =
+export type P2pEvent = EventOrigin & (
   | { type: 'listeningOn'; address: string }
   | { type: 'peerDiscoveredLocally'; peerId: string }
   | { type: 'peerConnected'; peerId: string }
@@ -52,8 +63,20 @@ export type P2pEvent =
   | { type: 'mixPacketArrived'; payload: Uint8Array }
   | { type: 'mixForwardFailed'; reason: string }
   | { type: 'mixRelayDiscovered'; peerId: string }
+  | { type: 'publicRelayAnnounced' }
+  | { type: 'publicRelayAnnouncementFailed'; reason: string }
+  | { type: 'publicRelayDiscovered'; peerId: string }
   | { type: 'mailboxDepositStored' }
   | { type: 'mailboxEnvelopeRetrieved'; envelope: Uint8Array }
+  | { type: 'recoveryBackupAnnounced' }
+  | { type: 'recoveryBackupAnnouncementFailed'; reason: string }
+  // Raw form — normally never reaches JS: the native pump decrypts it
+  // and delivers `recoveryBackupRestored` instead.
+  | { type: 'recoveryBackupResolved'; ownerIdentityPublicKeyBase64: string; backup: Uint8Array }
+  | { type: 'recoveryBackupResolutionFailed'; ownerIdentityPublicKeyBase64?: string }
+  /** A found backup, already decrypted natively — `json` is the snapshot `recoveryBackupPublish` was given. */
+  | { type: 'recoveryBackupRestored'; json: string }
+)
 
 /**
  * Synthesized by `ChatManager.swift` from decrypted/queued messages — not a
@@ -61,7 +84,7 @@ export type P2pEvent =
  * crypto/session logic behind these lives entirely on the Swift side (JS
  * never sees raw envelope bytes or handshake data, only these results).
  */
-export type ChatEvent =
+export type ChatEvent = EventOrigin & (
   | { type: 'messageReceived'; peerId: string; peerFingerprint: string; peerPublicKeyBase64: string; plaintext: string; at: number }
   | { type: 'messageSent'; peerId: string; localId: string }
   | { type: 'messageFailed'; peerId: string; localId: string; reason: string }
@@ -69,6 +92,21 @@ export type ChatEvent =
   | { type: 'groupMessageReceived'; groupId: string; senderPeerId: string; plaintext: string; at: number }
   | { type: 'groupMemberAdded'; groupId: string; memberPeerId: string }
   | { type: 'groupMemberRemoved'; groupId: string; memberPeerId: string }
+  // A media message (photo/video/voice) that finished downloading and
+  // decrypting — `localPath` is a file:// URL to the decrypted media on
+  // disk. `groupId` is set for group media, null for 1:1.
+  | {
+      type: 'mediaReceived'
+      peerId: string
+      groupId: string | null
+      localPath: string
+      mime: string
+      filename: string | null
+      durationMs: number | null
+      totalSize: number
+      at: number
+    }
+)
 
 type NativeEvents = {
   onP2pEvent(event: P2pEvent): void
@@ -78,6 +116,8 @@ type NativeEvents = {
 const NativeCryptoCore = requireNativeModule<
   {
     hasIdentity(): boolean
+    recoveryBackupPublish(json: string): void
+    recoveryBackupRequest(): void
     generateRecoveryPhrase(): string
     setIdentityFromWords(words: string): string
     recoveryPhraseWords(): string | null
@@ -118,6 +158,16 @@ const NativeCryptoCore = requireNativeModule<
     setMixRelayParticipationEnabled(enabled: boolean): void
     mixDummyTrafficBytesPerHourEstimate(): number
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
+    chatSetConsent(peerId: string, stance: ConsentStance): void
+    chatConsentFor(peerId: string): ConsentStance
+    chatConsentList(): { peerId: string; stance: Exclude<ConsentStance, 'none'> }[]
+    chatSendMedia(peerId: string, peerPublicKeyBase64: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
+    chatSendGroupMedia(groupId: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
+    hasMicrophonePermission(): boolean
+    requestMicrophonePermission(): Promise<boolean>
+    voiceRecordingStart(): string
+    voiceRecordingStop(): { fileUri: string; durationMs: number } | null
+    voiceRecordingCancel(): void
     chatCreateGroup(name: string, memberPeerIds: string[]): string
     chatSendGroupMessage(groupId: string, plaintext: string): string
     chatAddGroupMember(groupId: string, newMemberPeerId: string): void
@@ -310,9 +360,21 @@ export function p2pReserveRelaySlot(relayAddress: string): void {
   NativeCryptoCore.p2pReserveRelaySlot(relayAddress)
 }
 
-/** Subscribes to the node's event stream (connections, envelopes, DHT results). Returns an unsubscribe function. */
+/**
+ * Subscribes to the node's event stream (connections, envelopes, DHT
+ * results). Returns an unsubscribe function. Only the *active* account's
+ * node events are delivered: every subscriber of this stream drives
+ * active-account UI state (profile, avatars, username lookups), and an
+ * inactive account's node answering e.g. a username query would corrupt
+ * it. Inactive accounts' *messages* still arrive — those flow through
+ * `addChatEventListener`, which deliberately does not filter (see
+ * store/chat.ts's fingerprint routing).
+ */
 export function addP2pEventListener(listener: (event: P2pEvent) => void): () => void {
-  const subscription = NativeCryptoCore.addListener('onP2pEvent', listener)
+  const subscription = NativeCryptoCore.addListener('onP2pEvent', (event: P2pEvent) => {
+    if (event.slot !== undefined && event.slot !== NativeCryptoCore.activeAccountSlot()) return
+    listener(event)
+  })
   return () => subscription.remove()
 }
 
@@ -358,6 +420,29 @@ export function p2pFetchBlob(peerId: string, idHex: string): void {
  */
 export function p2pSetLocalBlobRaw(idHex: string, bytes: Uint8Array): void {
   NativeCryptoCore.p2pSetLocalBlobRaw(idHex, bytes)
+}
+
+/**
+ * Encrypts `json` (the active account's profile/contacts snapshot) under
+ * a key only this account's recovery-phrase holder can derive, and
+ * publishes the ciphertext into the public DHT. What makes restoring
+ * from a phrase bring the account's data back — no server ever holds
+ * anything readable. Re-run periodically and on every profile/contacts
+ * change. Answered by `recoveryBackupAnnounced`/
+ * `recoveryBackupAnnouncementFailed` on `onP2pEvent`.
+ */
+export function recoveryBackupPublish(json: string): void {
+  NativeCryptoCore.recoveryBackupPublish(json)
+}
+
+/**
+ * Asks the DHT for this account's own published recovery backup — run
+ * after restoring an identity from its phrase. A found record is
+ * decrypted natively and arrives as `recoveryBackupRestored` (plain
+ * JSON); anything else surfaces as `recoveryBackupResolutionFailed`.
+ */
+export function recoveryBackupRequest(): void {
+  NativeCryptoCore.recoveryBackupRequest()
 }
 
 /**
@@ -662,6 +747,15 @@ export function requestLedgerChainSync(peerId: string, timeoutMs = 30_000): Prom
  * toggle, if one is ever needed — not for product UI to call directly.
  * Successful blocks surface as `newBlockMined` on the event stream,
  * alongside the `chainTipChanged` every new tip fires.
+ *
+ * **Throws on App Store builds**, which mine nothing on the device at all
+ * (see `DistributionPolicy.swift`): App Review allows mining only where the
+ * processing happens off device, so that binary is compiled without the
+ * ability rather than merely configured not to use it — including through
+ * this function, since a JS bundle is the one part of the app that can
+ * change after review. On those builds the `@username` ledger is mined by
+ * standing relays (`packages/relay-node`) instead, and claims confirm when
+ * a relay includes them in a block.
  */
 export function startLedgerMining(publicKeyBase64Value: string = publicKeyBase64()): void {
   NativeCryptoCore.p2pStartMining(publicKeyBase64Value)
@@ -723,8 +817,92 @@ export function mixDummyTrafficBytesPerHourEstimate(): number {
  * time this device sees that peer reconnect (including across an app
  * restart), for as long as this device keeps running.
  */
+/**
+ * How much of a peer this account accepts — phase 1 of
+ * `docs/consent-and-moderation.md`.
+ *
+ * - `blocked` — their envelopes are dropped **before decryption**, natively,
+ *   and anything queued for them is discarded. Nothing reaches JS, so this is
+ *   a real boundary rather than a filter on what was already delivered. The
+ *   peer is never told; in this protocol there is deliberately no "you have
+ *   been blocked" signal, since a blocked person is precisely who should not
+ *   be able to make your device send them something.
+ * - `restricted` — still decrypted and delivered, but kept silent and out of
+ *   the way by the UI. For when cutting someone off entirely would cause more
+ *   trouble than absorbing them.
+ * - `none` — no stance.
+ */
+export type ConsentStance = 'blocked' | 'restricted' | 'none'
+
+/** Sets (or with `'none'`, clears) this account's stance toward a peer. */
+export function setConsent(peerId: string, stance: ConsentStance): void {
+  NativeCryptoCore.chatSetConsent(peerId, stance)
+}
+
+/** This account's current stance toward one peer. */
+export function consentFor(peerId: string): ConsentStance {
+  return NativeCryptoCore.chatConsentFor(peerId)
+}
+
+/** Every peer with a stance — what the privacy screen lists. */
+export function consentList(): { peerId: string; stance: Exclude<ConsentStance, 'none'> }[] {
+  return NativeCryptoCore.chatConsentList()
+}
+
 export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string {
   return NativeCryptoCore.chatSendMessage(peerId, peerPublicKeyBase64, plaintext)
+}
+
+/**
+ * Sends a media file (photo/video/voice) to a 1:1 peer. `fileUri` is a
+ * local file on disk (a recorded note, a picked image); it's encrypted
+ * chunk by chunk under a fresh per-file key, each chunk registered as a
+ * content-addressed blob, and a small manifest sent as the message. The
+ * recipient sees a `mediaReceived` event once fetched and decrypted.
+ * Returns a local id to correlate with `messageSent`/`messageFailed`.
+ */
+export function chatSendMedia(
+  peerId: string, peerPublicKeyBase64: string, fileUri: string,
+  mime: string, filename: string | null = null, durationMs: number | null = null,
+): string {
+  return NativeCryptoCore.chatSendMedia(peerId, peerPublicKeyBase64, fileUri, mime, filename, durationMs)
+}
+
+/** Sends a media file to a group — see `chatSendMedia`. */
+export function chatSendGroupMedia(
+  groupId: string, fileUri: string, mime: string,
+  filename: string | null = null, durationMs: number | null = null,
+): string {
+  return NativeCryptoCore.chatSendGroupMedia(groupId, fileUri, mime, filename, durationMs)
+}
+
+// --- Voice recording (see VoiceRecorder.swift) ---
+
+/** MIME to pass to `chatSendMedia` for a recorded voice note. */
+export const VOICE_MIME = 'audio/mp4'
+
+export function hasMicrophonePermission(): boolean {
+  return NativeCryptoCore.hasMicrophonePermission()
+}
+
+/** Asks for microphone access. Call before the first recording. */
+export function requestMicrophonePermission(): Promise<boolean> {
+  return NativeCryptoCore.requestMicrophonePermission()
+}
+
+/** Starts recording a voice note; returns the temp file's `file://` URL. */
+export function voiceRecordingStart(): string {
+  return NativeCryptoCore.voiceRecordingStart()
+}
+
+/** Finishes recording — `{ fileUri, durationMs }`, or null if none was active. */
+export function voiceRecordingStop(): { fileUri: string; durationMs: number } | null {
+  return NativeCryptoCore.voiceRecordingStop()
+}
+
+/** Discards the current recording (swipe-to-cancel). */
+export function voiceRecordingCancel(): void {
+  NativeCryptoCore.voiceRecordingCancel()
 }
 
 /**

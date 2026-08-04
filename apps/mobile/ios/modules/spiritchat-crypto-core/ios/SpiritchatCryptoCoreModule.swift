@@ -7,11 +7,22 @@ enum BlobStoreError: Error {
 
 enum MiningError: Error {
   case malformedPublicKey(String)
+  /// This binary was built for a channel that forbids mining on the device —
+  /// see `DistributionPolicy`. Surfaced rather than silently ignored so
+  /// tooling that calls `p2pStartMining` gets told why nothing happened.
+  case notPermittedInThisBuild
 }
 
 enum ChatError: Error {
   case malformedPublicKey(String)
   case malformedPlaintext
+}
+
+enum ConsentError: Error {
+  /// The JS side asked for a stance this build doesn't know. Thrown rather
+  /// than defaulting to something: silently treating an unrecognised stance
+  /// as "none" would turn a typo into an unblock.
+  case unknownStance(String)
 }
 
 private func requireIdentity() throws -> IdentitySession {
@@ -33,13 +44,19 @@ private func requireP2pSession() throws -> P2pSession {
 private func removeAccountSlot(_ slot: Int) throws {
   let wasActive = slot == IdentitySession.activeSlot
   if wasActive {
+    // Controllers gate the *active* node — stop them while that node is
+    // still the one `P2pSession.shared` resolves to, so stopMining/dummy
+    // traffic land on the right session.
     MiningController.shared.stop()
     MixRelayController.shared.stop()
-    P2pSession.signOut()
   }
+  P2pSession.stop(slot: slot)
   IdentitySession.removeSlot(slot)
   if wasActive, let fallback = IdentitySession.occupiedSlots().first {
     try IdentitySession.switchTo(slot: fallback)
+    // The fallback account's node is already running (every slot's is);
+    // the supervisor loop re-starts the controllers against it on its
+    // next pass.
   }
 }
 
@@ -123,14 +140,15 @@ public class SpiritchatCryptoCoreModule: Module {
     }
 
     // Switches to an already-registered `slot` — throws if it's empty.
-    // Tears down the current account's P2P node/mining first (each
-    // account has its own PeerId, so the swarm can't just be relabeled in
-    // place) and lets it lazily restart for the new identity, the same way
-    // it does on a normal launch.
+    // Every slot's node keeps running through a switch (that's the whole
+    // point of concurrent multi-account sessions — the outgoing account
+    // keeps receiving/retrying in the background); only the mining/mix
+    // policy controllers move: stopped here while the old node is still
+    // what `P2pSession.shared` resolves to, restarted by the supervisor
+    // loop against the new one.
     Function("switchAccount") { (slot: Int) throws in
       MiningController.shared.stop()
       MixRelayController.shared.stop()
-      P2pSession.signOut()
       try IdentitySession.switchTo(slot: slot)
     }
 
@@ -143,31 +161,33 @@ public class SpiritchatCryptoCoreModule: Module {
 
     Events("onP2pEvent", "onChatEvent")
 
-    // Starts pumping the P2P node's event loop as soon as an identity
-    // exists — immediately on launch if one was already on this device,
-    // or the moment onboarding finishes creating/restoring one — and goes
-    // back to waiting whenever a node stops (sign out), so a subsequent
-    // sign-in/restore within the same running app still gets its events
-    // pumped without needing a relaunch. Polls for readiness rather than
-    // being notified since "an identity now exists" is a simple, low-
-    // frequency state change; a callback/notification mechanism for it
-    // would be more machinery than the problem needs.
+    // The session supervisor: keeps one live node + event pump running
+    // per *occupied account slot* (not just the active one — the device
+    // being online means every account on it is online), starting new
+    // ones as slots appear (launch, onboarding, "add account") and
+    // re-starting any that stopped (sign-out then re-restore in the same
+    // run). Also keeps the policy controllers attached to whichever slot
+    // is currently active, and keeps this device's own nodes dialed into
+    // each other (see P2pSession.interconnect). Polls rather than being
+    // notified since "slots changed" is a simple, low-frequency state
+    // change; a callback mechanism for it would be more machinery than
+    // the problem needs.
     OnCreate {
       Task {
         while true {
-          while P2pSession.shared == nil {
-            try? await Task.sleep(nanoseconds: 200_000_000)
+          for slot in IdentitySession.occupiedSlots() {
+            guard let session = P2pSession.session(forSlot: slot), session.claimPump() else { continue }
+            self.startEventPump(for: session)
           }
-          guard let session = P2pSession.shared else { continue }
-          MiningController.shared.start()
-          MixRelayController.shared.start()
-          session.chatManager.emit = { event in self.sendEvent("onChatEvent", event) }
-          while let event = await session.node.nextEvent() {
-            self.sendEvent("onP2pEvent", P2pSession.encode(event))
-            session.chatManager.handleP2pEvent(event)
+          if P2pSession.shared != nil {
+            // Safe to call every pass — both controllers no-op once
+            // observing; after an account switch they were stopped, so
+            // this is what re-attaches them to the new active node.
+            MiningController.shared.start()
+            MixRelayController.shared.start()
           }
-          // The node shut down (sign out) — loop back and wait for the
-          // next one instead of letting this task end.
+          P2pSession.interconnect()
+          try? await Task.sleep(nanoseconds: 200_000_000)
         }
       }
     }
@@ -312,6 +332,38 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().node.setLocalBlob(id: id, bytes: bytes)
     }
 
+    // Encrypts `json` (the active account's profile/contacts snapshot,
+    // assembled in JS — see store/profile.ts) under a key only this
+    // account's recovery-phrase holder can derive, and publishes the
+    // ciphertext into the public DHT keyed by the identity public key.
+    // What makes "restore from phrase" bring the account's *data* back,
+    // not just its keys — with no server holding anything readable.
+    // Re-run periodically and on every profile/contacts change. Answered
+    // by `recoveryBackupAnnounced`/`recoveryBackupAnnouncementFailed` on
+    // `onP2pEvent`.
+    Function("recoveryBackupPublish") { (json: String) throws in
+      let identity = try requireIdentity()
+      let ciphertext = try recoveryBackupEncrypt(
+        identitySeed: identity.identity.secretBytes(),
+        plaintext: Data(json.utf8)
+      )
+      try requireP2pSession().node.announceRecoveryBackup(
+        ownerIdentityPublicKey: identity.publicKeyBytes,
+        backup: ciphertext
+      )
+    }
+
+    // Asks the DHT for this account's own published recovery backup —
+    // what a fresh install runs right after restoring from a phrase. The
+    // event pump decrypts a found record natively and delivers it to JS
+    // as `recoveryBackupRestored` (already-decrypted JSON); a record that
+    // doesn't authenticate under this account's key surfaces as
+    // `recoveryBackupResolutionFailed`, same as none existing.
+    Function("recoveryBackupRequest") { () throws in
+      let identity = try requireIdentity()
+      try requireP2pSession().node.resolveRecoveryBackup(ownerIdentityPublicKey: identity.publicKeyBytes)
+    }
+
     // Publishes this device's own current avatar content id into the
     // public DHT, keyed by its own peer id — the pointer only, not the
     // avatar bytes (those still need `p2pFetchBlob` over a live
@@ -395,6 +447,14 @@ public class SpiritchatCryptoCoreModule: Module {
     // involvement. Successful blocks surface as `newBlockMined` on
     // `onP2pEvent`.
     Function("p2pStartMining") { (publicKeyBase64: String) throws in
+      // The compile-time policy has to hold here too, not just in
+      // `MiningController`. This function is reachable from JS, and a JS
+      // bundle is the one part of the app that can change after review — so
+      // if this were left open, "an App Store build does not mine" would be a
+      // property of the current bundle rather than of the binary.
+      guard DistributionPolicy.allowsOnDeviceMining else {
+        throw MiningError.notPermittedInThisBuild
+      }
       guard let publicKey = Data(base64Encoded: publicKeyBase64) else {
         throw MiningError.malformedPublicKey(publicKeyBase64)
       }
@@ -451,6 +511,118 @@ public class SpiritchatCryptoCoreModule: Module {
       return try requireP2pSession().chatManager.sendMessage(peerId: peerId, peerPublicKey: publicKey, plaintext: plaintextBytes)
     }
 
+    // Consent — who this account refuses to hear from, and how strongly.
+    // Phase 1 of docs/consent-and-moderation.md. These reach the very same
+    // `ConsentStore` instance the message path consults, deliberately: a
+    // second copy of the list could disagree with the one doing the
+    // dropping, and the disagreement would look exactly like a block that
+    // didn't work.
+    //
+    // "blocked" drops envelopes unopened and discards anything queued for
+    // them; "restricted" still decrypts and delivers, and it is the JS layer
+    // that keeps such conversations silent and out of the way — which is the
+    // right place for it, since it is a presentation decision, not a
+    // security boundary.
+    Function("chatSetConsent") { (peerId: String, stance: String) throws in
+      let consent = try requireP2pSession().chatManager.consent
+      switch stance {
+      case "blocked": consent.set(.blocked, for: peerId)
+      case "restricted": consent.set(.restricted, for: peerId)
+      case "none": consent.clear(peerId)
+      default: throw ConsentError.unknownStance(stance)
+      }
+    }
+
+    // The stance for one peer: "blocked", "restricted", or "none".
+    Function("chatConsentFor") { (peerId: String) throws -> String in
+      let consent = try requireP2pSession().chatManager.consent
+      return consent.stance(for: peerId)?.rawValue ?? "none"
+    }
+
+    // Every peer with a stance, for the privacy screen. Returns objects
+    // rather than two parallel arrays so the list can't get misaligned.
+    Function("chatConsentList") { () throws -> [[String: String]] in
+      let consent = try requireP2pSession().chatManager.consent
+      return consent.all().map { ["peerId": $0.peerId, "stance": $0.stance.rawValue] }
+    }
+
+    // Sends a media file (photo/video/voice) to a 1:1 peer. `fileUri` is a
+    // local file already on disk (a recorded voice note, a picked image) —
+    // read straight off the filesystem here, never round-tripped through
+    // JS as bytes, the same way `blobSaveFromFile` avoids a second copy.
+    // The file is encrypted chunk by chunk under a fresh per-file key,
+    // each chunk registered as a content-addressed blob, and a small
+    // manifest (key + chunk ids + metadata) sent as the message. Returns a
+    // local id; the recipient sees a `mediaReceived` event once they've
+    // fetched and decrypted it (receive half lands next).
+    Function("chatSendMedia") { (
+      peerId: String, peerPublicKeyBase64: String, fileUri: String,
+      mime: String, filename: String?, durationMs: Int?
+    ) throws -> String in
+      guard let publicKey = Data(base64Encoded: peerPublicKeyBase64) else {
+        throw ChatError.malformedPublicKey(peerPublicKeyBase64)
+      }
+      guard let url = URL(string: fileUri), let bytes = try? Data(contentsOf: url) else {
+        throw BlobStoreError.unreadableFile(fileUri)
+      }
+      guard let localId = try requireP2pSession().chatManager.sendMediaMessage(
+        peerId: peerId, peerPublicKey: publicKey, mediaData: bytes,
+        mime: mime, filename: filename, durationMs: durationMs.map { UInt32($0) }, thumbnail: nil
+      ) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return localId
+    }
+
+    // Sends a media file to a group — same as `chatSendMedia`, fanned out
+    // to every member the way `chatSendGroupMessage` already is.
+    Function("chatSendGroupMedia") { (
+      groupId: String, fileUri: String, mime: String, filename: String?, durationMs: Int?
+    ) throws -> String in
+      guard let url = URL(string: fileUri), let bytes = try? Data(contentsOf: url) else {
+        throw BlobStoreError.unreadableFile(fileUri)
+      }
+      guard let localId = try requireP2pSession().chatManager.sendGroupMediaMessage(
+        groupId: groupId, mediaData: bytes, mime: mime, filename: filename,
+        durationMs: durationMs.map { UInt32($0) }, thumbnail: nil
+      ) else {
+        throw IdentitySessionError.notYetInitialized
+      }
+      return localId
+    }
+
+    // --- Voice recording (see VoiceRecorder.swift) ---
+
+    // Whether microphone access is already granted.
+    Function("hasMicrophonePermission") { () -> Bool in
+      VoiceRecorder.shared.hasPermission
+    }
+
+    // Asks for microphone permission, resolving true/false. Call before
+    // `voiceRecordingStart` the first time.
+    AsyncFunction("requestMicrophonePermission") { (promise: Promise) in
+      VoiceRecorder.shared.requestPermission { granted in promise.resolve(granted) }
+    }
+
+    // Starts recording a voice note to a temp .m4a file; returns its
+    // file:// URL. Throws if permission isn't granted or a recording is
+    // already running.
+    Function("voiceRecordingStart") { () throws -> String in
+      try VoiceRecorder.shared.start()
+    }
+
+    // Finishes recording, returning { fileUri, durationMs } — hand the
+    // fileUri to `chatSendMedia`/`chatSendGroupMedia` with mime
+    // "audio/mp4". Returns nil if nothing was recording.
+    Function("voiceRecordingStop") { () -> [String: Any]? in
+      VoiceRecorder.shared.stop()
+    }
+
+    // Aborts and discards the current recording (swipe-to-cancel).
+    Function("voiceRecordingCancel") { () in
+      VoiceRecorder.shared.cancel()
+    }
+
     // Creates a group named `name` with `memberPeerIds` as its initial
     // members — every one of them must already be an existing 1:1 contact
     // (see ChatManager's own "MARK: - Groups" doc comment for this v1's
@@ -493,6 +665,48 @@ public class SpiritchatCryptoCoreModule: Module {
     // afterward. `groupMemberRemoved` on `onChatEvent` confirms it locally.
     Function("chatRemoveGroupMember") { (groupId: String, memberToRemove: String) throws in
       try requireP2pSession().chatManager.removeGroupMember(groupId: groupId, memberToRemove: memberToRemove)
+    }
+  }
+
+  /// One per `P2pSession`: drains that node's events until it shuts down.
+  /// Every event crossing to JS is tagged with the session's slot and
+  /// fingerprint, so the stores can route an inactive account's traffic
+  /// into that account's own namespaced storage (see store/chat.ts) and
+  /// the UI can ignore P2P events that aren't the active account's.
+  private func startEventPump(for session: P2pSession) {
+    session.chatManager.emit = { [weak self] event in
+      var tagged = event
+      tagged["slot"] = session.slot
+      tagged["selfFingerprint"] = session.selfFingerprint
+      self?.sendEvent("onChatEvent", tagged)
+    }
+    Task {
+      while let event = await session.node.nextEvent() {
+        if case .listeningOn(let address) = event {
+          session.recordListenAddress(address)
+        }
+        var encoded = P2pSession.encode(event)
+        if case .recoveryBackupResolved(_, let backup) = event {
+          // Decrypt natively — JS should only ever see the plaintext
+          // snapshot (or a clean failure), never ciphertext + key
+          // material. A record that doesn't authenticate under this
+          // account's key is someone else's or tampered: exactly
+          // equivalent to no backup existing.
+          if let plaintext = try? recoveryBackupDecrypt(identitySeed: session.identitySeed, backupBytes: backup),
+             let json = String(data: plaintext, encoding: .utf8) {
+            encoded = ["type": "recoveryBackupRestored", "json": json]
+          } else {
+            encoded = ["type": "recoveryBackupResolutionFailed"]
+          }
+        }
+        encoded["slot"] = session.slot
+        encoded["selfFingerprint"] = session.selfFingerprint
+        self.sendEvent("onP2pEvent", encoded)
+        session.chatManager.handleP2pEvent(event)
+      }
+      // The node shut down (sign out / account removal) — this pump ends
+      // with it; a re-created slot gets a fresh session object and a
+      // fresh pump from the supervisor loop.
     }
   }
 }

@@ -76,6 +76,14 @@ final class ChatManager {
   private static let controlDistributionTag: UInt8 = 0x02
   private static let controlMemberAddedTag: UInt8 = 0x03
   private static let controlMemberRemovedTag: UInt8 = 0x04
+  // MLS group control (new groups). Distinct tags in the same inner
+  // control-message namespace as the Sender Keys ones above, so both
+  // schemes share one transport (pairwise ratchet sessions) without
+  // colliding. See the "Groups (MLS)" section.
+  private static let controlMlsInviteRequestTag: UInt8 = 0x05
+  private static let controlMlsKeyPackageTag: UInt8 = 0x06
+  private static let controlMlsWelcomeTag: UInt8 = 0x07
+  private static let controlMlsCommitTag: UInt8 = 0x08
 
   /// Group control messages (an invite, or a member handing out their
   /// Sender Key chain — see `GroupStore`) travel through an *existing*
@@ -104,6 +112,12 @@ final class ChatManager {
   private let lock = NSLock()
   private var peerStates: [String: PeerSendState] = [:]
   private var connectedPeers: Set<String> = []
+  /// In-flight media downloads, keyed by an internal download id (see the
+  /// "Media receive" section). Guarded by `lock`.
+  private var mediaDownloads: [String: MediaDownload] = [:]
+  /// chunk content-id (hex) -> the downloads waiting on that chunk, so a
+  /// `blobFetched` event routes to whoever needs it. Guarded by `lock`.
+  private var mediaChunkWaiters: [String: [(String, Int)]] = [:]
   private var retrievalTimer: Timer?
   private var contactCardAnnounceTimer: Timer?
 
@@ -112,6 +126,13 @@ final class ChatManager {
   private let identity: FfiIdentity
   private let agreement: FfiAgreementKey
   private let prekeys: FfiPrekeyStore
+
+  /// This account's own decisions about who it will accept. Consulted on the
+  /// inbound path before decryption and on the outbound path before sending —
+  /// see `ConsentStore` for why it lives here rather than in JS. Exposed so
+  /// the module's block/unblock functions and the settings screen can reach
+  /// the same instance the message path uses; two copies could disagree.
+  let consent: ConsentStore
 
   /// Computed exactly once, in `init` — `FfiPrekeyStore.contactCard`
   /// hands out a fresh one-time prekey on every call ("generate a new
@@ -134,6 +155,7 @@ final class ChatManager {
     self.identity = identity
     self.agreement = agreement
     self.prekeys = prekeys
+    self.consent = ConsentStore(slot: slot)
 
     let card = prekeys.contactCard(identity: identity, agreement: agreement)
     self.contactCard = card
@@ -234,6 +256,16 @@ final class ChatManager {
     try? ChatStore.saveOutbox(outbox, slot: slot)
   }
 
+  /// Drops every queued 1:1 envelope for `peerId` — used when that peer is
+  /// blocked, so nothing already in the durable outbox is delivered later.
+  private func discardOutbox(for peerId: String) {
+    var outbox = ChatStore.loadOutbox(slot: slot)
+    let before = outbox.count
+    outbox.removeAll(where: { $0.peerId == peerId })
+    guard outbox.count != before else { return }
+    try? ChatStore.saveOutbox(outbox, slot: slot)
+  }
+
   /// The oldest still-queued group envelope for `peerId` — same "one at
   /// a time per peer" reasoning as `firstOutboxItem`, and sharing that
   /// same peer's `peerStates` slot (see `PeerSendState.sendingGroupEnvelope`).
@@ -257,6 +289,16 @@ final class ChatManager {
   /// how this method already prioritized itself over everything else
   /// before group messages existed.
   private func attemptSend(peerId: String) {
+    // Blocking cuts both directions. Enforced here rather than only at the
+    // send call, because the outbox is durable and retried: a message queued
+    // before the block, or one already waiting for the peer to come online,
+    // must not slip out afterwards. Anything still queued for a blocked peer
+    // is dropped rather than held, since it will never be sendable while the
+    // block stands and keeping it would silently deliver it on unblock.
+    if consent.isBlocked(peerId) {
+      discardOutbox(for: peerId)
+      return
+    }
     guard let item = firstOutboxItem(peerId) else {
       attemptGroupDelivery(peerId: peerId)
       return
@@ -448,29 +490,10 @@ final class ChatManager {
   /// isn't available yet or the group couldn't be persisted.
   @discardableResult
   func createGroup(name: String, memberPeerIds: [String]) -> String? {
-    guard let myPeerId = try? node.localPeerId() else { return nil }
-    let groupIdBytes = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
-    let groupId = Self.hexString(groupIdBytes)
-
-    let ownState = FfiSenderKeyState.generate()
-    let session = GroupStore.Session(
-      groupId: groupId, name: name, members: memberPeerIds,
-      ownSenderKeyStateBytes: ownState.toBytes(), receiverStates: [:]
-    )
-    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return nil }
-
-    // The invite's own member list includes this device (the creator) —
-    // every recipient needs to know to also send *it* their distribution,
-    // not just each other.
-    let allMembers = memberPeerIds + [myPeerId]
-    let distribution = ownState.toDistributionBytes()
-    for member in memberPeerIds {
-      sendGroupControlMessageBestEffort(
-        peerId: member,
-        payload: Self.frameGroupInvite(groupId: groupIdBytes, name: name, members: allMembers, distribution: distribution)
-      )
-    }
-    return groupId
+    // New groups are always MLS/TreeKEM (see the "Groups (MLS)" section);
+    // existing Sender Keys groups keep working through the legacy paths,
+    // which every method below routes to via `session.isMls`.
+    return createGroupMls(name: name, memberPeerIds: memberPeerIds)
   }
 
   /// Encrypts `plaintext` once under this device's own chain for `groupId`
@@ -482,9 +505,14 @@ final class ChatManager {
   /// this device isn't (or is no longer) a member of `groupId`.
   @discardableResult
   func sendGroupMessage(groupId: String, plaintext: Data) -> String? {
+    guard let session = GroupStore.loadSession(slot: slot, groupId: groupId) else { return nil }
+    if session.isMls {
+      return sendGroupMessageMls(groupId: groupId, plaintext: plaintext)
+    }
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
           let groupIdBytes = Self.data(fromHex: groupId),
-          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes)
+          let ownStateBytes = session.ownSenderKeyStateBytes,
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: ownStateBytes)
     else { return nil }
 
     guard let signedEnvelope = try? ownState.encrypt(plaintext: plaintext, associatedData: groupIdBytes) else {
@@ -577,6 +605,18 @@ final class ChatManager {
     case Self.controlMemberRemovedTag:
       guard let (groupId, removedMemberPeerId) = Self.parseGroupMembershipChange(body) else { return }
       handleGroupMemberRemoved(fromPeerId: fromPeerId, groupIdBytes: groupId, removedMemberPeerId: removedMemberPeerId)
+    case Self.controlMlsInviteRequestTag:
+      guard let (groupId, name, members) = Self.parseMlsInviteRequest(body) else { return }
+      handleMlsInviteRequest(fromPeerId: fromPeerId, groupIdBytes: groupId, name: name, memberPeerIds: members)
+    case Self.controlMlsKeyPackageTag:
+      guard let (groupId, keyPackage) = Self.parseMlsBlob(body) else { return }
+      handleMlsKeyPackage(fromPeerId: fromPeerId, groupIdBytes: groupId, keyPackageBytes: keyPackage)
+    case Self.controlMlsWelcomeTag:
+      guard let (groupId, welcome) = Self.parseMlsBlob(body) else { return }
+      handleMlsWelcome(fromPeerId: fromPeerId, groupIdBytes: groupId, welcomeBytes: welcome)
+    case Self.controlMlsCommitTag:
+      guard let (groupId, commit) = Self.parseMlsBlob(body) else { return }
+      handleMlsCommit(fromPeerId: fromPeerId, groupIdBytes: groupId, commitBytes: commit)
     default:
       NSLog("[ChatManager] unrecognized group control message tag \(tag) from \(fromPeerId) — dropped")
     }
@@ -603,6 +643,7 @@ final class ChatManager {
     let ownState = FfiSenderKeyState.generate()
     let session = GroupStore.Session(
       groupId: groupId, name: name, members: otherMembers,
+      mlsStateBytes: nil,
       ownSenderKeyStateBytes: ownState.toBytes(),
       receiverStates: [fromPeerId: creatorReceiverState.toBytes()]
     )
@@ -631,7 +672,9 @@ final class ChatManager {
       return
     }
     guard let receiverState = try? FfiSenderKeyReceiverState.fromDistributionBytes(bytes: distributionBytes) else { return }
-    session.receiverStates[fromPeerId] = receiverState.toBytes()
+    var receiverStates = session.receiverStates ?? [:]
+    receiverStates[fromPeerId] = receiverState.toBytes()
+    session.receiverStates = receiverStates
     try? GroupStore.saveSession(session, slot: slot)
   }
 
@@ -646,10 +689,15 @@ final class ChatManager {
   /// position onward (see `SenderKeyState`'s own doc comment), so nothing
   /// about the past is exposed by adding someone new.
   func addGroupMember(groupId: String, newMemberPeerId: String) {
+    if let session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls {
+      addGroupMemberMls(groupId: groupId, newMemberPeerId: newMemberPeerId)
+      return
+    }
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
           let groupIdBytes = Self.data(fromHex: groupId),
           let myPeerId = try? node.localPeerId(),
-          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes),
+          let ownStateBytes = session.ownSenderKeyStateBytes,
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: ownStateBytes),
           !session.members.contains(newMemberPeerId)
     else { return }
 
@@ -675,7 +723,8 @@ final class ChatManager {
   private func handleGroupMemberAdded(fromPeerId: String, groupIdBytes: Data, newMemberPeerId: String) {
     let groupId = Self.hexString(groupIdBytes)
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), !session.members.contains(newMemberPeerId),
-          let ownState = try? FfiSenderKeyState.fromBytes(bytes: session.ownSenderKeyStateBytes)
+          let ownStateBytes = session.ownSenderKeyStateBytes,
+          let ownState = try? FfiSenderKeyState.fromBytes(bytes: ownStateBytes)
     else { return }
     session.members.append(newMemberPeerId)
     guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
@@ -697,13 +746,17 @@ final class ChatManager {
   /// forward secrecy against the removed member must not depend on
   /// trusting whoever initiated the removal to have done it right.
   func removeGroupMember(groupId: String, memberToRemove: String) {
+    if let session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls {
+      removeGroupMemberMls(groupId: groupId, memberToRemove: memberToRemove)
+      return
+    }
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
           let groupIdBytes = Self.data(fromHex: groupId),
           session.members.contains(memberToRemove)
     else { return }
 
     session.members.removeAll { $0 == memberToRemove }
-    session.receiverStates.removeValue(forKey: memberToRemove)
+    session.receiverStates?.removeValue(forKey: memberToRemove)
     let freshState = FfiSenderKeyState.generate()
     session.ownSenderKeyStateBytes = freshState.toBytes()
     guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
@@ -727,7 +780,7 @@ final class ChatManager {
     guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.members.contains(removedMemberPeerId) else { return }
 
     session.members.removeAll { $0 == removedMemberPeerId }
-    session.receiverStates.removeValue(forKey: removedMemberPeerId)
+    session.receiverStates?.removeValue(forKey: removedMemberPeerId)
     let freshState = FfiSenderKeyState.generate()
     session.ownSenderKeyStateBytes = freshState.toBytes()
     guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
@@ -758,21 +811,528 @@ final class ChatManager {
       return
     }
 
-    for (memberPeerId, receiverStateBytes) in session.receiverStates {
+    if session.isMls {
+      handleIncomingGroupMessageMls(groupId: groupId, session: session, wire: signedEnvelope)
+      return
+    }
+
+    for (memberPeerId, receiverStateBytes) in (session.receiverStates ?? [:]) {
       guard let receiverState = try? FfiSenderKeyReceiverState.fromBytes(bytes: receiverStateBytes) else { continue }
       guard let plaintext = try? receiverState.decrypt(message: signedEnvelope, associatedData: groupIdBytes) else { continue }
       var updated = session
-      updated.receiverStates[memberPeerId] = receiverState.toBytes()
+      updated.receiverStates?[memberPeerId] = receiverState.toBytes()
       try? GroupStore.saveSession(updated, slot: slot)
-      emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: memberPeerId, plaintext: plaintext))
+      deliverIncomingGroup(groupId: groupId, senderPeerId: memberPeerId, plaintext: plaintext)
       return
     }
     NSLog("[ChatManager] a group message for \(groupId) matched no known member's chain — dropped")
   }
 
+  // MARK: - Groups (MLS/TreeKEM)
+  //
+  // New groups use MLS/TreeKEM (`spiritchat_mls_core` via `FfiMlsGroup`)
+  // instead of Sender Keys: O(log N) membership changes (a removal is one
+  // logarithmic commit, not everyone re-keying with everyone), post-
+  // compromise security (a self-update re-randomizes the epoch), and
+  // cryptographic agreement on the roster (the transcript-bound
+  // confirmation tag). Existing Sender Keys groups keep working through
+  // the legacy methods above; `session.isMls` is what every entry point
+  // routes on.
+  //
+  // MLS needs a joiner's *key package* (a signed leaf public key) before
+  // they can be added — a step Sender Keys didn't have. This is carried
+  // over the same pairwise ratchet sessions the Sender Keys control
+  // messages already used, so no new transport: a committer sends an
+  // invite request, the invitee replies with a key package, the committer
+  // commits the Add and returns a Welcome (to the joiner) plus a Commit
+  // (broadcast to existing members). Every member still has to be a 1:1
+  // contact first, exactly as before.
+
+  private var identitySeed: Data { identity.secretBytes() }
+
+  /// A roster leaf's identity public key resolved to a peer id, or nil for
+  /// a blank leaf (empty identity bytes).
+  private func mlsPeerId(forIdentity identityBytes: Data) -> String? {
+    guard !identityBytes.isEmpty else { return nil }
+    return try? p2pPeerIdFromPublicKey(publicKey: identityBytes)
+  }
+
+  /// Every *other* current member's peer id, from an MLS group's roster —
+  /// what content and commit fan-out address.
+  private func mlsMemberPeerIds(_ group: FfiMlsGroup, myPeerId: String) -> [String] {
+    group.roster().compactMap { mlsPeerId(forIdentity: $0) }.filter { $0 != myPeerId }
+  }
+
+  /// The leaf a given peer id occupies in a roster, or nil if absent.
+  private func mlsLeaf(forPeerId peerId: String, roster: [Data]) -> Int? {
+    for (leaf, identityBytes) in roster.enumerated() {
+      if let candidate = mlsPeerId(forIdentity: identityBytes), candidate == peerId { return leaf }
+    }
+    return nil
+  }
+
+  @discardableResult
+  private func createGroupMls(name: String, memberPeerIds: [String]) -> String? {
+    guard let myPeerId = try? node.localPeerId() else { return nil }
+    let groupIdBytes = Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+    let groupId = Self.hexString(groupIdBytes)
+
+    guard let group = try? FfiMlsGroup.create(groupId: groupIdBytes, identitySeed: identitySeed) else { return nil }
+    let session = GroupStore.Session(
+      groupId: groupId, name: name, members: memberPeerIds,
+      mlsStateBytes: group.toBytes(), ownSenderKeyStateBytes: nil, receiverStates: nil
+    )
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return nil }
+
+    // Ask each initial member for a key package; their reply drives an
+    // Add commit (see handleMlsKeyPackage). The roster list includes this
+    // device so a joiner knows to reach it too.
+    let roster = memberPeerIds + [myPeerId]
+    for member in memberPeerIds {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMlsInviteRequest(groupId: groupIdBytes, name: name, members: roster))
+    }
+    return groupId
+  }
+
+  @discardableResult
+  private func sendGroupMessageMls(groupId: String, plaintext: Data) -> String? {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes)
+    else { return nil }
+
+    let wire = group.encryptMessage(plaintext: plaintext)
+    session.mlsStateBytes = group.toBytes()
+    try? GroupStore.saveSession(session, slot: slot)
+
+    let localId = UUID().uuidString
+    let wireEnvelope = Self.frameGroupMessage(groupId: groupIdBytes, signedEnvelope: wire)
+    let createdAt = Date().timeIntervalSince1970
+    var outbox = GroupStore.loadOutbox(slot: slot)
+    for member in session.members {
+      outbox.append(GroupStore.OutboxItem(localId: localId, groupId: groupId, memberPeerId: member, wireEnvelope: wireEnvelope, createdAt: createdAt))
+    }
+    try? GroupStore.saveOutbox(outbox, slot: slot)
+    for member in session.members { attemptSend(peerId: member) }
+    return localId
+  }
+
+  private func handleIncomingGroupMessageMls(groupId: String, session: GroupStore.Session, wire: Data) {
+    guard let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes)
+    else { return }
+    guard let message = try? group.decryptMessage(wire: wire) else {
+      NSLog("[ChatManager] an MLS group message for \(groupId) failed to decrypt — dropped")
+      return
+    }
+    // decrypt_message doesn't advance persisted state, so nothing to save.
+    let roster = group.roster()
+    let senderLeaf = Int(message.senderLeaf)
+    guard senderLeaf < roster.count, let senderPeerId = mlsPeerId(forIdentity: roster[senderLeaf]) else { return }
+    deliverIncomingGroup(groupId: groupId, senderPeerId: senderPeerId, plaintext: message.plaintext)
+  }
+
+  private func addGroupMemberMls(groupId: String, newMemberPeerId: String) {
+    guard let session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let myPeerId = try? node.localPeerId(),
+          !session.members.contains(newMemberPeerId)
+    else { return }
+    // Same shape as creation: ask for a key package; the reply drives the
+    // Add commit + Welcome in handleMlsKeyPackage.
+    let roster = session.members + [newMemberPeerId, myPeerId]
+    sendGroupControlMessageBestEffort(peerId: newMemberPeerId, payload: Self.frameMlsInviteRequest(groupId: groupIdBytes, name: session.name, members: roster))
+  }
+
+  private func removeGroupMemberMls(groupId: String, memberToRemove: String) {
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId),
+          let groupIdBytes = Self.data(fromHex: groupId),
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes),
+          let myPeerId = try? node.localPeerId()
+    else { return }
+    guard let leaf = mlsLeaf(forPeerId: memberToRemove, roster: group.roster()) else { return }
+    guard let output = try? group.commit(addKeyPackages: [], removeLeaves: [UInt32(leaf)]) else { return }
+
+    session.mlsStateBytes = group.toBytes()
+    session.members = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    try? GroupStore.saveSession(session, slot: slot)
+
+    // One logarithmic commit to everyone still in the group — the O(log N)
+    // removal that motivated MLS. The removed member simply can't process
+    // it (they hold no key the new epoch's path was sealed to).
+    for member in session.members {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMlsBlob(tag: Self.controlMlsCommitTag, groupId: groupIdBytes, blob: output.commitBytes))
+    }
+    emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: memberToRemove))
+  }
+
+  /// A member asked this device for a key package to add it to a group.
+  /// Generates a leaf key, remembers its secret (needed to open the
+  /// forthcoming Welcome), and replies. Ignored if this device is already
+  /// in the group (a duplicate request).
+  private func handleMlsInviteRequest(fromPeerId: String, groupIdBytes: Data, name: String, memberPeerIds: [String]) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard GroupStore.loadSession(slot: slot, groupId: groupId) == nil else { return }
+
+    let leaf = mlsGenerateLeafKey()
+    guard let keyPackage = try? mlsKeyPackage(identitySeed: identitySeed, leafPublic: leaf.publicKey) else { return }
+    let pending = GroupStore.PendingJoin(groupId: groupId, name: name, leafSecret: leaf.secret)
+    try? GroupStore.savePendingJoin(pending, slot: slot)
+    sendGroupControlMessageBestEffort(peerId: fromPeerId, payload: Self.frameMlsBlob(tag: Self.controlMlsKeyPackageTag, groupId: groupIdBytes, blob: keyPackage))
+  }
+
+  /// A member sent this device (the committer) their key package. Commits
+  /// the Add, sends them the Welcome, and broadcasts the Commit to every
+  /// existing member.
+  private func handleMlsKeyPackage(fromPeerId: String, groupIdBytes: Data, keyPackageBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls,
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes),
+          let myPeerId = try? node.localPeerId()
+    else { return }
+
+    guard let output = try? group.commit(addKeyPackages: [keyPackageBytes], removeLeaves: []) else {
+      NSLog("[ChatManager] failed to commit an MLS add for \(groupId) — dropped")
+      return
+    }
+    session.mlsStateBytes = group.toBytes()
+    session.members = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    try? GroupStore.saveSession(session, slot: slot)
+
+    for welcome in output.welcomes {
+      sendGroupControlMessageBestEffort(peerId: fromPeerId, payload: Self.frameMlsBlob(tag: Self.controlMlsWelcomeTag, groupId: groupIdBytes, blob: welcome.welcomeBytes))
+    }
+    // Every already-joined member (not the new one) processes the commit.
+    for member in session.members where member != fromPeerId {
+      sendGroupControlMessageBestEffort(peerId: member, payload: Self.frameMlsBlob(tag: Self.controlMlsCommitTag, groupId: groupIdBytes, blob: output.commitBytes))
+    }
+    emit(groupMemberAddedEvent(groupId: groupId, memberPeerId: fromPeerId))
+  }
+
+  /// This device was welcomed into an MLS group it earlier sent a key
+  /// package for. Joins using the leaf secret stashed at invite time.
+  private func handleMlsWelcome(fromPeerId: String, groupIdBytes: Data, welcomeBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard GroupStore.loadSession(slot: slot, groupId: groupId) == nil else { return }
+    guard let pending = GroupStore.loadPendingJoin(slot: slot, groupId: groupId),
+          let myPeerId = try? node.localPeerId(),
+          let group = try? FfiMlsGroup.join(welcomeBytes: welcomeBytes, identitySeed: identitySeed, leafSecret: pending.leafSecret)
+    else { return }
+
+    let members = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    let session = GroupStore.Session(
+      groupId: groupId, name: pending.name, members: members,
+      mlsStateBytes: group.toBytes(), ownSenderKeyStateBytes: nil, receiverStates: nil
+    )
+    guard (try? GroupStore.saveSession(session, slot: slot)) != nil else { return }
+    GroupStore.deletePendingJoin(slot: slot, groupId: groupId)
+    emit(groupInvitedEvent(groupId: groupId, name: pending.name, members: members))
+  }
+
+  /// An existing member applies a commit (an add or removal someone else
+  /// committed). Emits roster diffs so the UI membership stays live.
+  private func handleMlsCommit(fromPeerId: String, groupIdBytes: Data, commitBytes: Data) {
+    let groupId = Self.hexString(groupIdBytes)
+    guard var session = GroupStore.loadSession(slot: slot, groupId: groupId), session.isMls,
+          let stateBytes = session.mlsStateBytes,
+          let group = try? FfiMlsGroup.fromBytes(bytes: stateBytes),
+          let myPeerId = try? node.localPeerId()
+    else { return }
+
+    let before = Set(session.members)
+    guard (try? group.processCommit(commitBytes: commitBytes)) != nil else {
+      NSLog("[ChatManager] failed to process an MLS commit for \(groupId) — dropped")
+      return
+    }
+    session.mlsStateBytes = group.toBytes()
+    let after = mlsMemberPeerIds(group, myPeerId: myPeerId)
+    session.members = after
+    try? GroupStore.saveSession(session, slot: slot)
+
+    let afterSet = Set(after)
+    for added in afterSet.subtracting(before) { emit(groupMemberAddedEvent(groupId: groupId, memberPeerId: added)) }
+    for removed in before.subtracting(afterSet) { emit(groupMemberRemovedEvent(groupId: groupId, memberPeerId: removed)) }
+  }
+
+  // MARK: - Media messages (photo / video / voice)
+  //
+  // A media message is an ordinary end-to-end chat message whose plaintext
+  // is not text but a `mediaFrameMagic`-tagged manifest (see
+  // `spiritchat_crypto_core::media` + `FfiMediaManifest`): the small
+  // manifest travels encrypted over the same ratchet/MLS channel as any
+  // message, while the media bytes travel separately as content-addressed
+  // blobs — one blob per encrypted chunk, so a large video reuses the
+  // existing blob protocol unchanged and never loads whole into memory.
+  // The magic prefix begins with a NUL byte, which valid UTF-8 chat text
+  // never starts with, so text messages stay byte-for-byte unchanged and
+  // the receive side (next) tells the two apart unambiguously.
+  //
+  // This section is the send half: encrypt the file chunk by chunk,
+  // register each encrypted chunk as a local blob, and send the manifest.
+  // The receive half (fetching the chunks and reassembling) and the native
+  // recorder / UI land alongside it.
+
+  /// Prefix marking a decrypted plaintext as a media manifest rather than
+  /// text. Leading NUL guarantees it can never collide with real text.
+  private static let mediaFrameMagic = Data([0x00]) + Data("SCMEDIA1".utf8)
+
+  private static func frameMediaPlaintext(_ manifestBytes: Data) -> Data {
+    mediaFrameMagic + manifestBytes
+  }
+
+  /// Encrypts `mediaData` under a fresh per-file key, registers each
+  /// encrypted chunk as a content-addressed local blob so peers can fetch
+  /// them, and returns the framed manifest plaintext to send as a message.
+  /// `nil` only if blob registration fails outright.
+  private func registerMediaAndFrame(
+    mediaData: Data, mime: String, filename: String?, durationMs: UInt32?, thumbnail: Data?
+  ) -> Data? {
+    let keyBytes = mediaGenerateKey()
+    let chunkSize = Int(mediaChunkSize())
+    // At least one (possibly empty) chunk, so an empty file still has a
+    // final chunk and can't be forged as "no chunks".
+    let chunkCount = max(1, (mediaData.count + chunkSize - 1) / chunkSize)
+    var chunkIds: [Data] = []
+    chunkIds.reserveCapacity(chunkCount)
+
+    for i in 0..<chunkCount {
+      let start = i * chunkSize
+      let end = min(start + chunkSize, mediaData.count)
+      let plainChunk = start < end ? mediaData.subdata(in: start..<end) : Data()
+      let isLast = i == chunkCount - 1
+      guard let ciphertext = try? mediaEncryptChunk(key: keyBytes, chunkIndex: UInt32(i), isLast: isLast, plaintext: plainChunk) else {
+        return nil
+      }
+      let id = blobContentId(bytes: ciphertext)
+      do {
+        try node.setLocalBlob(id: id, bytes: ciphertext)
+      } catch {
+        NSLog("[ChatManager] failed to register a media chunk blob: \(error)")
+        return nil
+      }
+      chunkIds.append(id)
+    }
+
+    let manifest = FfiMediaManifest(
+      key: keyBytes,
+      mime: mime,
+      totalSize: UInt64(mediaData.count),
+      chunkIds: chunkIds,
+      filename: filename,
+      durationMs: durationMs,
+      thumbnail: thumbnail
+    )
+    return Self.frameMediaPlaintext(mediaManifestEncode(manifest: manifest))
+  }
+
+  /// Sends a media file to a 1:1 peer — mirrors `sendMessage`, only the
+  /// plaintext is a framed media manifest instead of text.
+  @discardableResult
+  func sendMediaMessage(
+    peerId: String, peerPublicKey: Data, mediaData: Data,
+    mime: String, filename: String?, durationMs: UInt32?, thumbnail: Data?
+  ) -> String? {
+    guard let framed = registerMediaAndFrame(mediaData: mediaData, mime: mime, filename: filename, durationMs: durationMs, thumbnail: thumbnail) else {
+      return nil
+    }
+    return sendMessage(peerId: peerId, peerPublicKey: peerPublicKey, plaintext: framed)
+  }
+
+  /// Sends a media file to a group — registers the same content-addressed
+  /// chunk blobs, then rides the existing group send path.
+  @discardableResult
+  func sendGroupMediaMessage(
+    groupId: String, mediaData: Data, mime: String, filename: String?, durationMs: UInt32?, thumbnail: Data?
+  ) -> String? {
+    guard let framed = registerMediaAndFrame(mediaData: mediaData, mime: mime, filename: filename, durationMs: durationMs, thumbnail: thumbnail) else {
+      return nil
+    }
+    return sendGroupMessage(groupId: groupId, plaintext: framed)
+  }
+
+  // --- Media receive ----------------------------------------------------
+
+  /// An in-flight media download: the manifest plus the chunk plaintexts
+  /// as they arrive, and where to attribute the finished media.
+  private struct MediaDownload {
+    let senderPeerId: String
+    let groupId: String?
+    let manifest: FfiMediaManifest
+    var chunks: [Data?]
+  }
+
+  /// Whether a decrypted plaintext is a media manifest rather than text.
+  private static func isMediaFrame(_ plaintext: Data) -> Bool {
+    plaintext.starts(with: mediaFrameMagic)
+  }
+
+  /// The single point every decrypted 1:1 plaintext flows through — text
+  /// emits as before, a media frame kicks off a chunk download instead.
+  private func deliverIncoming(peerId: String, peerFingerprint: String, peerPublicKey: Data, plaintext: Data) {
+    if Self.isMediaFrame(plaintext) {
+      handleIncomingMedia(fetchFromPeerId: peerId, senderPeerId: peerId, groupId: nil, plaintext: plaintext)
+    } else {
+      emit(receivedEvent(peerId: peerId, peerFingerprint: peerFingerprint, peerPublicKey: peerPublicKey, plaintext: plaintext))
+    }
+  }
+
+  /// The same, for group messages.
+  private func deliverIncomingGroup(groupId: String, senderPeerId: String, plaintext: Data) {
+    if Self.isMediaFrame(plaintext) {
+      handleIncomingMedia(fetchFromPeerId: senderPeerId, senderPeerId: senderPeerId, groupId: groupId, plaintext: plaintext)
+    } else {
+      emit(groupMessageReceivedEvent(groupId: groupId, senderPeerId: senderPeerId, plaintext: plaintext))
+    }
+  }
+
+  /// Parses a media manifest and starts fetching its chunk blobs from the
+  /// sender. Each chunk arrives as a `blobFetched` event routed through
+  /// `handleMediaBlobFetched`; once all are in, the file is reassembled
+  /// and a `mediaReceived` event fires.
+  private func handleIncomingMedia(fetchFromPeerId: String, senderPeerId: String, groupId: String?, plaintext: Data) {
+    let manifestBytes = Data(plaintext.dropFirst(Self.mediaFrameMagic.count))
+    guard let manifest = try? mediaManifestDecode(bytes: manifestBytes), !manifest.chunkIds.isEmpty else {
+      NSLog("[ChatManager] a media message with an unreadable manifest — dropped")
+      return
+    }
+
+    let downloadId = UUID().uuidString
+    let download = MediaDownload(
+      senderPeerId: senderPeerId, groupId: groupId, manifest: manifest,
+      chunks: Array(repeating: nil, count: manifest.chunkIds.count)
+    )
+    lock.lock()
+    mediaDownloads[downloadId] = download
+    for (index, id) in manifest.chunkIds.enumerated() {
+      let idHex = Self.hexString(id)
+      mediaChunkWaiters[idHex, default: []].append((downloadId, index))
+    }
+    lock.unlock()
+
+    // Fetch every chunk. A blob already cached locally (e.g. media this
+    // device also holds) still resolves via the same blobFetched path.
+    for id in manifest.chunkIds {
+      do {
+        try node.fetchBlob(peerId: fetchFromPeerId, id: id)
+      } catch {
+        NSLog("[ChatManager] failed to request a media chunk from \(fetchFromPeerId): \(error)")
+      }
+    }
+  }
+
+  /// Routes a fetched blob into any waiting media download. Returns true
+  /// if the blob was a media chunk (so the generic blob handler skips it).
+  private func handleMediaBlobFetched(id: Data, bytes: Data) -> Bool {
+    let idHex = Self.hexString(id)
+    lock.lock()
+    guard let waiters = mediaChunkWaiters[idHex] else { lock.unlock(); return false }
+    mediaChunkWaiters.removeValue(forKey: idHex)
+    var completed: [MediaDownload] = []
+    for (downloadId, index) in waiters {
+      guard var download = mediaDownloads[downloadId] else { continue }
+      let isLast = index == download.manifest.chunkIds.count - 1
+      guard let plain = try? mediaDecryptChunk(key: download.manifest.key, chunkIndex: UInt32(index), isLast: isLast, ciphertext: bytes) else {
+        // A chunk that won't decrypt means a corrupt or wrong blob — drop
+        // the whole download rather than deliver a half-broken file.
+        mediaDownloads.removeValue(forKey: downloadId)
+        continue
+      }
+      download.chunks[index] = plain
+      if download.chunks.allSatisfy({ $0 != nil }) {
+        mediaDownloads.removeValue(forKey: downloadId)
+        completed.append(download)
+      } else {
+        mediaDownloads[downloadId] = download
+      }
+    }
+    lock.unlock()
+
+    for download in completed { finishMediaDownload(download) }
+    return true
+  }
+
+  /// A media chunk fetch failed outright — abandon its download (the
+  /// message simply doesn't render its media until re-sent/re-tried).
+  private func handleMediaBlobFailed(id: Data) -> Bool {
+    let idHex = Self.hexString(id)
+    lock.lock()
+    guard let waiters = mediaChunkWaiters[idHex] else { lock.unlock(); return false }
+    mediaChunkWaiters.removeValue(forKey: idHex)
+    for (downloadId, _) in waiters { mediaDownloads.removeValue(forKey: downloadId) }
+    lock.unlock()
+    NSLog("[ChatManager] a media chunk fetch failed — media download abandoned")
+    return true
+  }
+
+  /// Reassembles a completed download to a local file and emits it.
+  private func finishMediaDownload(_ download: MediaDownload) {
+    var data = Data()
+    for chunk in download.chunks { data.append(chunk ?? Data()) }
+
+    let ext = Self.fileExtension(forMime: download.manifest.mime)
+    let dir = Self.mediaDirectory(slot: slot)
+    let localName = "\(UUID().uuidString).\(ext)"
+    let url = dir.appendingPathComponent(localName)
+    do {
+      try data.write(to: url, options: .atomic)
+    } catch {
+      NSLog("[ChatManager] failed to write received media: \(error)")
+      return
+    }
+    emit(mediaReceivedEvent(download: download, localPath: url.absoluteString))
+  }
+
+  private static func mediaDirectory(slot: Int) -> URL {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    let dir = base
+      .appendingPathComponent("Chats", isDirectory: true)
+      .appendingPathComponent("\(slot)", isDirectory: true)
+      .appendingPathComponent("Media", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+  }
+
+  private static func fileExtension(forMime mime: String) -> String {
+    switch mime {
+    case "audio/opus", "audio/ogg": return "opus"
+    case "audio/mp4", "audio/aac", "audio/m4a": return "m4a"
+    case "image/jpeg": return "jpg"
+    case "image/png": return "png"
+    case "image/gif": return "gif"
+    case "video/mp4": return "mp4"
+    case "video/quicktime": return "mov"
+    default: return "bin"
+    }
+  }
+
+  private func mediaReceivedEvent(download: MediaDownload, localPath: String) -> [String: Any?] {
+    [
+      "type": "mediaReceived",
+      "peerId": download.senderPeerId,
+      "groupId": download.groupId,
+      "localPath": localPath,
+      "mime": download.manifest.mime,
+      "filename": download.manifest.filename,
+      "durationMs": download.manifest.durationMs.map { Int($0) },
+      "totalSize": Int(download.manifest.totalSize),
+      "at": Int(Date().timeIntervalSince1970 * 1000),
+    ]
+  }
+
   // MARK: - Receiving
 
   private func onEnvelopeReceived(fromPeerId: String, bytes: Data) {
+    // Before the type tag, before any parsing, before any decryption: this
+    // is the whole point of keeping consent native-side. A blocked peer's
+    // envelope is never opened, so nothing it contains — not a message, not
+    // a media manifest, not a group invite — can reach the UI or the
+    // notification layer. Ratchet state is left untouched too, which matters:
+    // decrypting would advance it, so dropping here also means a blocked
+    // peer cannot make this device do cryptographic work on demand.
+    if consent.isBlocked(fromPeerId) { return }
     guard let tag = bytes.first else { return }
     let body = bytes.dropFirst()
     switch tag {
@@ -814,7 +1374,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: response.initiatorIdentityBytes)) ?? ""
-      emit(receivedEvent(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext))
+      deliverIncoming(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext)
     } catch {
       NSLog("[ChatManager] failed to accept a handshake from \(fromPeerId): \(error)")
     }
@@ -833,7 +1393,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
-      emit(receivedEvent(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
+      deliverIncoming(peerId: fromPeerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext)
     } catch {
       // Might actually be a group control message sent through this same
       // session instead — see `groupControlAssociatedData`'s own doc
@@ -906,7 +1466,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: response.initiatorIdentityBytes)) ?? ""
-      emit(receivedEvent(peerId: peerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext))
+      deliverIncoming(peerId: peerId, peerFingerprint: fingerprint, peerPublicKey: response.initiatorIdentityBytes, plaintext: plaintext)
     } catch {
       NSLog("[ChatManager] failed to accept a mailbox-retrieved handshake: \(error)")
     }
@@ -927,7 +1487,7 @@ final class ChatManager {
         slot: slot
       )
       let fingerprint = (try? identityFingerprintOfPublicKey(publicKey: session.peerPublicKey)) ?? ""
-      emit(receivedEvent(peerId: session.peerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext))
+      deliverIncoming(peerId: session.peerId, peerFingerprint: fingerprint, peerPublicKey: session.peerPublicKey, plaintext: plaintext)
       return
     }
     for session in ChatStore.loadAllSessions(slot: slot) {
@@ -1045,10 +1605,14 @@ final class ChatManager {
       }
 
     case .blobFetched(let peerId, let id, let bytes):
+      // A media chunk takes priority — it's addressed by its own content
+      // id, never the fixed contact-card id, so the two never overlap.
+      if handleMediaBlobFetched(id: id, bytes: bytes) { return }
       guard id == Self.contactCardBlobId, state(for: peerId) == .fetchingCard else { return }
       handleCardFetched(peerId: peerId, cardBytes: bytes, delivery: .sendDirectly)
 
     case .blobFetchFailed(let peerId, let id, let reason):
+      if handleMediaBlobFailed(id: id) { return }
       guard id == Self.contactCardBlobId, state(for: peerId) == .fetchingCard else { return }
       guard let item = firstOutboxItem(peerId) else { endState(for: peerId); return }
       // `attemptSend` only ever calls `fetchBlob` when no session exists
@@ -1252,6 +1816,73 @@ final class ChatManager {
     let peerIdBytes = rest.dropFirst()
     guard peerIdBytes.count == Int(length), let memberPeerId = String(data: Data(peerIdBytes), encoding: .utf8) else { return nil }
     return (groupId, memberPeerId)
+  }
+
+  // --- MLS control framing ---
+  //
+  // `[controlMlsInviteRequestTag][groupId: 16][1-byte name len][name]
+  //  [1-byte member count][for each: 1-byte peer id len, peer id]` — the
+  // creator's ask for a key package. Carries the roster peer ids so the
+  // invitee learns who else is (or will be) in the group, same as a
+  // Sender Keys invite did.
+  private static func frameMlsInviteRequest(groupId: Data, name: String, members: [String]) -> Data {
+    var out = Data([controlMlsInviteRequestTag])
+    out.append(groupId)
+    let nameBytes = Data(name.utf8.prefix(255))
+    out.append(UInt8(nameBytes.count))
+    out.append(nameBytes)
+    let clamped = members.prefix(255)
+    out.append(UInt8(clamped.count))
+    for member in clamped {
+      let b = Data(member.utf8.prefix(255))
+      out.append(UInt8(b.count))
+      out.append(b)
+    }
+    return out
+  }
+
+  private static func parseMlsInviteRequest(_ body: Data) -> (groupId: Data, name: String, members: [String])? {
+    var offset = body.startIndex
+    guard body.distance(from: offset, to: body.endIndex) >= 16 else { return nil }
+    let groupId = Data(body[offset..<body.index(offset, offsetBy: 16)])
+    offset = body.index(offset, offsetBy: 16)
+
+    guard offset < body.endIndex else { return nil }
+    let nameLength = Int(body[offset]); offset = body.index(after: offset)
+    guard body.distance(from: offset, to: body.endIndex) >= nameLength else { return nil }
+    let nameEnd = body.index(offset, offsetBy: nameLength)
+    let name = String(data: Data(body[offset..<nameEnd]), encoding: .utf8) ?? ""
+    offset = nameEnd
+
+    guard offset < body.endIndex else { return nil }
+    let memberCount = Int(body[offset]); offset = body.index(after: offset)
+    var members: [String] = []
+    for _ in 0..<memberCount {
+      guard offset < body.endIndex else { return nil }
+      let length = Int(body[offset]); offset = body.index(after: offset)
+      guard body.distance(from: offset, to: body.endIndex) >= length else { return nil }
+      let end = body.index(offset, offsetBy: length)
+      guard let member = String(data: Data(body[offset..<end]), encoding: .utf8) else { return nil }
+      members.append(member)
+      offset = end
+    }
+    return (groupId, name, members)
+  }
+
+  /// `[tag][groupId: 16][opaque blob]` — shared framing for the three MLS
+  /// control payloads that carry one length-implicit byte blob (a key
+  /// package, a Welcome, or a Commit); the blob runs to the end, so no
+  /// length prefix is needed.
+  private static func frameMlsBlob(tag: UInt8, groupId: Data, blob: Data) -> Data {
+    var out = Data([tag])
+    out.append(groupId)
+    out.append(blob)
+    return out
+  }
+
+  private static func parseMlsBlob(_ body: Data) -> (groupId: Data, blob: Data)? {
+    guard body.count >= 16 else { return nil }
+    return (Data(body.prefix(16)), Data(body.dropFirst(16)))
   }
 
   private static func hexString(_ data: Data) -> String {

@@ -218,6 +218,24 @@ impl FfiP2pNode {
         self.send(Command::ResolveContactCard { owner_identity_public_key })
     }
 
+    /// Publishes this account's encrypted recovery backup into the public
+    /// DHT, keyed by its identity public key. `backup` must be ciphertext
+    /// from `recovery_backup_encrypt` — never plaintext; every DHT node
+    /// that stores it sees only bytes it cannot read. Re-run periodically
+    /// and whenever the backed-up data changes. Answered by a
+    /// `RecoveryBackupAnnounced`/`RecoveryBackupAnnouncementFailed` event.
+    pub fn announce_recovery_backup(&self, owner_identity_public_key: Vec<u8>, backup: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::AnnounceRecoveryBackup { owner_identity_public_key, backup })
+    }
+
+    /// Looks up the recovery backup published for `owner_identity_public_key`
+    /// — what a fresh install runs right after restoring from a phrase.
+    /// Answered by a `RecoveryBackupResolved`/`RecoveryBackupResolutionFailed`
+    /// event; decrypt the result with `recovery_backup_decrypt`.
+    pub fn resolve_recovery_backup(&self, owner_identity_public_key: Vec<u8>) -> FfiResult<()> {
+        self.send(Command::ResolveRecoveryBackup { owner_identity_public_key })
+    }
+
     /// Publishes this node's own current avatar content id into the
     /// public DHT, keyed by its own peer id — the pointer, not the avatar
     /// bytes themselves (those still need a live connection via

@@ -6,6 +6,7 @@ import { useRouter, useLocalSearchParams } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { MessageBubble } from '../../components/MessageBubble'
 import { ChatInputBar } from '../../components/ChatInputBar'
+import { useMediaAttach } from '../../hooks/useMediaAttach'
 import { useGroupStore, type GroupMessage } from '../../store/groups'
 
 const BTN_H = 44
@@ -18,6 +19,8 @@ export default function GroupChatScreen() {
   const group = useGroupStore(s => s.groups[groupId])
   const openGroup = useGroupStore(s => s.openGroup)
   const sendMessage = useGroupStore(s => s.sendMessage)
+  const sendVoice = useGroupStore(s => s.sendVoice)
+  const sendMedia = useGroupStore(s => s.sendMedia)
   const messages = useGroupStore(s => s.messages[groupId] ?? [])
 
   const [ready, setReady] = useState(false)
@@ -29,6 +32,14 @@ export default function GroupChatScreen() {
   function handleSend(text: string) {
     sendMessage(groupId, text)
   }
+
+  function handleSendVoice(fileUri: string, durationMs: number) {
+    sendVoice(groupId, fileUri, durationMs)
+  }
+
+  const handleAttach = useMediaAttach(m =>
+    sendMedia(groupId, m.fileUri, m.mime, m.filename, m.durationMs),
+  )
 
   return (
     <KeyboardAvoidingView style={s.root} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={0}>
@@ -67,7 +78,7 @@ export default function GroupChatScreen() {
       />
 
       <View style={{ paddingBottom: insets.bottom + 6 }}>
-        <ChatInputBar onSend={handleSend} />
+        <ChatInputBar onSend={handleSend} onSendVoice={handleSendVoice} onAttach={handleAttach} />
       </View>
     </KeyboardAvoidingView>
   )

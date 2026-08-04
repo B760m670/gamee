@@ -29,6 +29,11 @@ pub enum P2pError {
     #[error("mailbox error: {0}")]
     Mailbox(String),
 
+    /// A contact ticket was malformed, unsigned, stale, addressed elsewhere,
+    /// or did not carry enough work — see `crate::ticket`.
+    #[error("contact ticket rejected: {0}")]
+    Ticket(String),
+
     #[error("mix routing error: {0}")]
     Mix(String),
 }

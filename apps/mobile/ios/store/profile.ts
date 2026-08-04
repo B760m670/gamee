@@ -17,9 +17,13 @@ import {
   activeAccountSlot,
   switchAccount as nativeSwitchAccount,
   removeAccount as nativeRemoveAccount,
+  recoveryBackupPublish,
+  recoveryBackupRequest,
   type AccountSlot,
+  type P2pEvent,
 } from '../modules/spiritchat-crypto-core'
 import { publishOwnAvatarPointer } from './peerAvatars'
+import { useContactsStore, type Contact } from './contacts'
 
 // Namespaced by fingerprint rather than fixed keys: this device's Keychain
 // identity is recoverable via its phrase, so signing out and restoring the
@@ -117,8 +121,117 @@ function ensureAvatarPointerReannounceStarted(get: () => ProfileState) {
   if (avatarPointerReannounceStarted) return
   avatarPointerReannounceStarted = true
   setInterval(() => {
-    if (get().isReady) publishOwnAvatarPointer(get().avatarId)
+    if (get().isReady) {
+      publishOwnAvatarPointer(get().avatarId)
+      // The recovery backup is a DHT record too, with the same expiry —
+      // ride the same re-announce cadence.
+      scheduleRecoveryBackupPublish()
+    }
   }, AVATAR_POINTER_REANNOUNCE_INTERVAL_MS)
+}
+
+// --- Recovery backup ------------------------------------------------------
+//
+// Everything an account would otherwise lose on a fresh install (except
+// what forward secrecy forbids backing up — see crypto-core's backup.rs):
+// display name, bio, @username, saved contacts. Serialized, encrypted
+// natively under a key derived from the recovery phrase's own seed, and
+// published into the public DHT. A fresh install that restores the phrase
+// pulls it back — from the network, not from any server.
+
+/** Collapses bursts of changes into one publish. */
+let backupPublishTimer: ReturnType<typeof setTimeout> | null = null
+export function scheduleRecoveryBackupPublish() {
+  if (backupPublishTimer) clearTimeout(backupPublishTimer)
+  backupPublishTimer = setTimeout(() => {
+    backupPublishTimer = null
+    const profile = useProfileStore.getState()
+    if (!profile.isReady) return
+    const contacts = Object.values(useContactsStore.getState().contacts)
+    // Nothing worth publishing yet — an empty snapshot would only
+    // overwrite a real one this identity published from a previous
+    // install (exactly the record a restore is about to need).
+    if (!profile.displayName && !profile.bio && !profile.username && contacts.length === 0) return
+    const snapshot = {
+      v: 1,
+      displayName: profile.displayName,
+      bio: profile.bio,
+      username: profile.username,
+      contacts,
+    }
+    try {
+      recoveryBackupPublish(JSON.stringify(snapshot))
+    } catch {
+      // P2P not up right now — the periodic re-announce retries.
+    }
+  }, 3000)
+}
+
+/** How many times, and how often, a fresh install re-asks the DHT for its
+ * backup — a single ask right after the first connection can miss simply
+ * because the DHT walk hasn't warmed up yet. Stops early the moment any
+ * profile data exists (restored or user-entered). */
+const RESTORE_ATTEMPTS = 5
+const RESTORE_RETRY_MS = 15_000
+function requestRestoreFromNetwork(get: () => ProfileState, attempt = 0) {
+  const profile = get()
+  const hasAnythingAlready =
+    !!profile.displayName || !!profile.username || Object.keys(useContactsStore.getState().contacts).length > 0
+  if (hasAnythingAlready || attempt >= RESTORE_ATTEMPTS) return
+  try {
+    recoveryBackupRequest()
+  } catch {
+    // P2P not up yet — the retry below covers it.
+  }
+  setTimeout(() => requestRestoreFromNetwork(get, attempt + 1), RESTORE_RETRY_MS)
+}
+
+/**
+ * Applies a decrypted backup snapshot — called from app/_layout.tsx's
+ * P2P event listener on `recoveryBackupRestored`. Only ever fills what's
+ * locally empty: anything the user already set on this install wins over
+ * the network copy.
+ */
+export function handleRecoveryBackupEvent(event: P2pEvent) {
+  if (event.type !== 'recoveryBackupRestored') return
+  let snapshot: { displayName?: string; bio?: string; username?: string | null; contacts?: Contact[] }
+  try {
+    snapshot = JSON.parse(event.json)
+  } catch {
+    return
+  }
+  const profile = useProfileStore.getState()
+  if (!profile.isReady) return
+  const fingerprint = profile.fingerprint
+  const updates: Partial<ProfileState> = {}
+
+  if (!profile.displayName && typeof snapshot.displayName === 'string' && snapshot.displayName) {
+    updates.displayName = snapshot.displayName
+    AsyncStorage.setItem(displayNameKey(fingerprint), snapshot.displayName).catch(() => {})
+  }
+  if (!profile.bio && typeof snapshot.bio === 'string' && snapshot.bio) {
+    updates.bio = snapshot.bio
+    AsyncStorage.setItem(bioKey(fingerprint), snapshot.bio).catch(() => {})
+  }
+  if (!profile.username && typeof snapshot.username === 'string' && snapshot.username) {
+    // The claim itself is permanent chain state under this same identity —
+    // the launch-time reconciliation in `bootstrap` re-verifies it against
+    // the ledger once the chain syncs, so a stale local label can't stick.
+    updates.username = snapshot.username
+    AsyncStorage.setItem(usernameKey(fingerprint), snapshot.username).catch(() => {})
+  }
+  if (Object.keys(updates).length > 0) {
+    useProfileStore.setState(updates)
+  }
+
+  if (Array.isArray(snapshot.contacts)) {
+    const contactsStore = useContactsStore.getState()
+    for (const contact of snapshot.contacts) {
+      if (contact && typeof contact.peerId === 'string' && !contactsStore.contacts[contact.peerId]) {
+        contactsStore.addContact(contact)
+      }
+    }
+  }
 }
 
 export const useProfileStore = create<ProfileState>((set, get) => ({
@@ -178,6 +291,18 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     // itself remembers nothing between runs, same reasoning as `blobReserve`.
     if (p2pReady) publishOwnAvatarPointer(avatarId)
     ensureAvatarPointerReannounceStarted(get)
+
+    // A namespace with no profile data at all is the "fresh install
+    // restored from a phrase" signature — try pulling this account's own
+    // encrypted backup from the network. Deliberately also fine to run
+    // when it's genuinely a brand new account: no record exists, the
+    // lookups come back empty, nothing changes.
+    if (!storedName && !storedUsername) {
+      requestRestoreFromNetwork(get)
+    } else {
+      // Existing data — make sure the network copy is fresh.
+      scheduleRecoveryBackupPublish()
+    }
 
     set({
       isReady:         true,
@@ -264,12 +389,14 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
     const trimmed = name.trim()
     await AsyncStorage.setItem(displayNameKey(get().fingerprint), trimmed)
     set({ displayName: trimmed })
+    scheduleRecoveryBackupPublish()
   },
 
   setBio: async (bio) => {
     const trimmed = bio.trim()
     await AsyncStorage.setItem(bioKey(get().fingerprint), trimmed)
     set({ bio: trimmed })
+    scheduleRecoveryBackupPublish()
   },
 
   setAvatarFromFile: async (fileUri) => {
@@ -301,6 +428,7 @@ export const useProfileStore = create<ProfileState>((set, get) => ({
       await AsyncStorage.removeItem(key)
     }
     set({ username: username || null })
+    scheduleRecoveryBackupPublish()
   },
 
   // There is no server session to invalidate — this permanently forgets

@@ -124,6 +124,28 @@ pub enum P2pEvent {
     /// for the ledger and the mailbox cache, would want to count).
     MixRelayDiscovered { peer: PeerId },
 
+    RecoveryBackupAnnounced,
+    RecoveryBackupAnnouncementFailed { reason: String },
+
+    /// A published recovery backup exists for this identity — `backup` is
+    /// still ciphertext at this layer; the caller decrypts it (or discards
+    /// it as not-ours if decryption fails).
+    RecoveryBackupResolved { owner_identity_public_key: Vec<u8>, backup: Vec<u8> },
+    RecoveryBackupResolutionFailed { owner_identity_public_key: Vec<u8> },
+
+    /// This node's `Command::AnnouncePublicRelay` provider record reached
+    /// the DHT — other nodes' `DiscoverPublicRelays` can now find it.
+    PublicRelayAnnounced,
+    PublicRelayAnnouncementFailed { reason: String },
+
+    /// A `DiscoverPublicRelays` lookup (explicit, or the event loop's own
+    /// empty-directory retry) found `peer` announced as a standing relay.
+    /// The event loop has already begun dialing it — this event is
+    /// transparency, not a to-do; the useful signal to wait on is the
+    /// `MixRelayDiscovered` that follows once connected gossip delivers
+    /// its routing key.
+    PublicRelayDiscovered { peer: PeerId },
+
     /// This node was a Sphinx packet's final hop, and the payload parsed
     /// and validated (PoW, size, clock — see `mailbox::validate`) as a
     /// genuine mailbox deposit, which is now held in this node's own

@@ -48,6 +48,10 @@ final class MiningController {
   /// exists — there's nothing to start/stop before that. Safe to call more
   /// than once; only the first call attaches observers.
   func start() {
+    // An App Store build never mines on device (see `DistributionPolicy`);
+    // bail before touching battery monitoring or notifications, so such a
+    // build doesn't even observe the state it would have mined on.
+    guard DistributionPolicy.allowsOnDeviceMining else { return }
     onMainThread { self.startOnMainThread() }
   }
 
@@ -88,6 +92,12 @@ final class MiningController {
   }
 
   @objc private func reevaluate() {
+    // Defence in depth: `start()` already refuses to attach the observers
+    // that call this, so on an App Store build nothing should reach here —
+    // but this is the single place that actually issues `startMining`, and
+    // it is worth the policy being re-checked at the point of the act rather
+    // than only at the point of subscription.
+    guard DistributionPolicy.allowsOnDeviceMining else { return }
     guard let session = P2pSession.shared, let identity = IdentitySession.shared else { return }
 
     let isForeground = UIApplication.shared.applicationState == .active

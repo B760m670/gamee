@@ -31,14 +31,24 @@ mod mailbox;
 mod mailbox_dht;
 mod mix;
 mod node;
+mod public_relay;
+mod recovery_backup;
 mod rendezvous;
+mod ticket;
 mod username;
 
 pub use bootstrap::public_dht_bootstrap_addresses;
 pub use command::Command;
 pub use error::{P2pError, Result};
 pub use event::P2pEvent;
-pub use identity::{keypair_from_seed, peer_id_from_public_key, peer_id_from_seed};
+pub use ticket::{
+    mine_ticket, required_work, ticket_base, ContactRequirement, ContactSignals, ContactTicket,
+    MAX_EPOCH_DRIFT, TICKET_BASE_LEADING_ZERO_BITS, TICKET_LEN, TICKET_MAX_LEADING_ZERO_BITS,
+    TICKET_MIN_LEADING_ZERO_BITS,
+};
+pub use identity::{
+    keypair_from_seed, peer_id_from_public_key, peer_id_from_seed, public_key_bytes_from_seed,
+};
 pub use mailbox::shared_material_from_identity_keys;
 pub use mix::{build_packet, estimated_dummy_traffic_bytes_per_hour, node_address_for, routing_keypair_from_seed, MixHop};
 pub use node::{mix_dummy_traffic_interval_secs, P2pNode};

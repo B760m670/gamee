@@ -289,6 +289,15 @@ final class IdentitySession {
     return session
   }
 
+  /// Loads `slot`'s full key material *without* activating it — what
+  /// `P2pSession` uses to run every registered account's node
+  /// concurrently, not just the active one's. Unlike `switchTo` this
+  /// never touches `activeSlot`/`cached`, so which account the UI shows
+  /// is entirely unaffected. `nil` if the slot is empty or incomplete.
+  static func loadFor(slot: Int) -> IdentitySession? {
+    try? loadExisting(slot: slot)
+  }
+
   private static func loadExisting(slot: Int) throws -> IdentitySession {
     guard
       let identityBytes = try KeychainStore.load(account: identityAccount(slot)),
@@ -297,12 +306,36 @@ final class IdentitySession {
     else {
       throw IdentitySessionError.slotEmpty(slot)
     }
+    let identity = try FfiIdentity.fromSecretBytes(bytes: identityBytes)
     return IdentitySession(
       slot: slot,
-      identity: try FfiIdentity.fromSecretBytes(bytes: identityBytes),
+      identity: identity,
       agreement: try FfiAgreementKey.fromSecretBytes(bytes: agreementBytes),
-      prekeys: try FfiPrekeyStore.fromBytes(bytes: prekeyBytes)
+      prekeys: try loadOrMigratePrekeys(slot: slot, identity: identity, bytes: prekeyBytes)
     )
+  }
+
+  /// Decodes a persisted prekey store, transparently upgrading a legacy
+  /// (pre-PQ) store to the post-quantum PQXDH format. A v1 store carries no
+  /// ML-KEM material and can't be upgraded in place — the Rust decoder
+  /// rejects it — so we regenerate a fresh PQ-capable store for this identity
+  /// and persist it. That rotates the signed/one-time prekeys, which is a
+  /// normal, safe operation: only in-flight handshakes that referenced an old
+  /// one-time prekey would need to be re-initiated, and those retry anyway.
+  private static func loadOrMigratePrekeys(
+    slot: Int,
+    identity: FfiIdentity,
+    bytes: Data
+  ) throws -> FfiPrekeyStore {
+    if let store = try? FfiPrekeyStore.fromBytes(bytes: bytes) {
+      return store
+    }
+    let fresh = FfiPrekeyStore.generate(
+      identity: identity,
+      oneTimeCount: initialOneTimePrekeyCount
+    )
+    try KeychainStore.save(fresh.toBytes(), account: prekeysAccount(slot))
+    return fresh
   }
 
   var fingerprint: String {
@@ -325,6 +358,10 @@ final class IdentitySession {
     KeychainStore.delete(account: agreementAccount(slot))
     KeychainStore.delete(account: prekeysAccount(slot))
     KeychainStore.delete(account: recoveryPhraseAccount(slot))
+    // Consent lives on the filesystem, not in the Keychain, so it needs
+    // wiping explicitly — otherwise the next account created in this slot
+    // would silently inherit a stranger's block list.
+    ConsentStore.removeAll(slot: slot)
     if slot == activeSlot {
       cached = nil
     }

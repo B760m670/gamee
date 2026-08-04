@@ -6,6 +6,8 @@ import type { Conversation } from '../store/chat'
 interface Props {
   item: Conversation
   onPress: (peerId: string) => void
+  /** Long-press on the row — e.g. the Chats list's delete menu. */
+  onLongPress?: (item: Conversation) => void
 }
 
 function formatWhen(epochMs: number): string {
@@ -21,13 +23,15 @@ function formatWhen(epochMs: number): string {
   return `${d.getDate().toString().padStart(2, '0')}.${(d.getMonth() + 1).toString().padStart(2, '0')}`
 }
 
-function ConversationRowBase({ item, onPress }: Props) {
+function ConversationRowBase({ item, onPress, onLongPress }: Props) {
   const title = item.peerUsername ? `@${item.peerUsername}` : item.peerFingerprint
 
   return (
     <Pressable
       style={({ pressed }) => [s.row, pressed && s.rowPressed]}
       onPress={() => onPress(item.peerId)}
+      onLongPress={onLongPress ? () => onLongPress(item) : undefined}
+      delayLongPress={350}
     >
       <PeerAvatar peerId={item.peerId} size={54} username={item.peerUsername ?? undefined} />
       <View style={s.center}>

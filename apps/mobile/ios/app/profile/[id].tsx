@@ -7,6 +7,8 @@ import { useRouter, useLocalSearchParams } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { PeerAvatar } from '../../components/PeerAvatar'
 import { useChatStore } from '../../store/chat'
+import { useContactsStore } from '../../store/contacts'
+import { useConsentStore } from '../../store/consent'
 
 const AVATAR_SIZE = 100
 const BTN_H = 44
@@ -32,7 +34,16 @@ export default function ProfileScreen() {
   const insets = useSafeAreaInsets()
   const router = useRouter()
   const { id } = useLocalSearchParams<{ id: string }>()
-  const peer = useChatStore(s => s.conversations[id] ?? s.activePeers[id])
+  const knownPeer = useChatStore(s => s.conversations[id] ?? s.activePeers[id])
+  const savedContact = useContactsStore(s => s.contacts[id])
+  const addContact = useContactsStore(s => s.addContact)
+  const removeContact = useContactsStore(s => s.removeContact)
+  const stance = useConsentStore(s => s.stances[id] ?? 'none')
+  const applyConsent = useConsentStore(s => s.apply)
+  // A profile can be reached from a conversation (chat store knows the
+  // peer) or straight from the Contacts tab (only the contacts store
+  // does) — either source has the full PeerInfo.
+  const peer = knownPeer ?? savedContact
 
   const title = peer?.peerUsername ? `@${peer.peerUsername}` : (peer?.peerFingerprint || 'Профиль')
 
@@ -42,6 +53,38 @@ export default function ProfileScreen() {
       return
     }
     Alert.alert('Скоро', 'Эта функция появится позже.')
+  }
+
+  function failed() {
+    Alert.alert('Не удалось', 'Сессия ещё не готова. Попробуйте через мгновение.')
+  }
+
+  function toggleRestrict() {
+    if (!applyConsent(id, stance === 'restricted' ? 'none' : 'restricted')) failed()
+  }
+
+  function confirmBlockToggle() {
+    if (stance === 'blocked') {
+      if (!applyConsent(id, 'none')) failed()
+      return
+    }
+    // Destructive and not fully reversible in its effects — anything queued
+    // for this peer is discarded, not held — so it asks first, and says what
+    // actually happens rather than a generic "are you sure?".
+    Alert.alert(
+      'Заблокировать?',
+      'Его сообщения будут отклоняться, не расшифровываясь, а неотправленные вами — удалены. Он не узнает о блокировке.',
+      [
+        { text: 'Отмена', style: 'cancel' },
+        {
+          text: 'Заблокировать',
+          style: 'destructive',
+          onPress: () => {
+            if (!applyConsent(id, 'blocked')) failed()
+          },
+        },
+      ],
+    )
   }
 
   return (
@@ -83,6 +126,64 @@ export default function ProfileScreen() {
             </View>
           </View>
         ) : null}
+
+        {peer ? (
+          <View style={[s.group, { marginTop: 16 }]}>
+            <Pressable
+              style={({ pressed }) => [s.contactBtn, pressed && { opacity: 0.7 }]}
+              onPress={() => (savedContact ? removeContact(id) : addContact(peer))}
+            >
+              <Ionicons
+                name={savedContact ? 'person-remove-outline' : 'person-add-outline'}
+                size={20}
+                color={savedContact ? '#f87171' : '#2f7bff'}
+              />
+              <Text style={[s.contactBtnText, savedContact && { color: '#f87171' }]}>
+                {savedContact ? 'Убрать из контактов' : 'В контакты'}
+              </Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        <View style={[s.group, { marginTop: 16 }]}>
+          {stance !== 'blocked' ? (
+            <Pressable
+              style={({ pressed }) => [s.contactBtn, pressed && { opacity: 0.7 }]}
+              onPress={toggleRestrict}
+            >
+              <Ionicons
+                name={stance === 'restricted' ? 'volume-medium-outline' : 'volume-mute-outline'}
+                size={20}
+                color={stance === 'restricted' ? '#2f7bff' : '#a1a1aa'}
+              />
+              <Text style={[s.contactBtnText, { color: stance === 'restricted' ? '#2f7bff' : '#a1a1aa' }]}>
+                {stance === 'restricted' ? 'Снять ограничение' : 'Ограничить'}
+              </Text>
+            </Pressable>
+          ) : null}
+
+          <Pressable
+            style={({ pressed }) => [s.contactBtn, pressed && { opacity: 0.7 }]}
+            onPress={confirmBlockToggle}
+          >
+            <Ionicons
+              name={stance === 'blocked' ? 'lock-open-outline' : 'ban-outline'}
+              size={20}
+              color={stance === 'blocked' ? '#2f7bff' : '#f87171'}
+            />
+            <Text style={[s.contactBtnText, { color: stance === 'blocked' ? '#2f7bff' : '#f87171' }]}>
+              {stance === 'blocked' ? 'Разблокировать' : 'Заблокировать'}
+            </Text>
+          </Pressable>
+        </View>
+
+        {stance !== 'none' ? (
+          <Text style={s.stanceNote}>
+            {stance === 'blocked'
+              ? 'Сообщения от этого человека отклоняются, не расшифровываясь. Он об этом не узнает.'
+              : 'Сообщения приходят, но без уведомлений, и чат не поднимается в списке.'}
+          </Text>
+        ) : null}
       </ScrollView>
     </View>
   )
@@ -119,4 +220,14 @@ const s = StyleSheet.create({
   infoValue: { color: '#fff', fontSize: 16, lineHeight: 22 },
 
   errorText: { color: '#f87171', fontSize: 15 },
+
+  contactBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+    paddingVertical: 14,
+  },
+  contactBtnText: { color: '#2f7bff', fontSize: 16, fontWeight: '600' },
+  stanceNote: {
+    color: '#71717a', fontSize: 13, lineHeight: 18,
+    paddingHorizontal: 32, paddingTop: 10,
+  },
 })

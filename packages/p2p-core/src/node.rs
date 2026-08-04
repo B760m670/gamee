@@ -38,6 +38,8 @@ use crate::event::P2pEvent;
 use crate::identity;
 use crate::ledger::{self, ChainSyncRequest, ChainSyncResponse};
 use crate::mailbox;
+use crate::public_relay;
+use crate::recovery_backup;
 use crate::mailbox_dht;
 use crate::mix;
 use crate::rendezvous;
@@ -81,6 +83,14 @@ const MIX_DUMMY_TRAFFIC_HOP_DELAY: Duration = Duration::from_millis(100);
 /// honestly true of everything else built on the mix relay directory.
 const MIX_PATH_HOPS: usize = 3;
 
+/// How often a node with an *empty* usable-mix-relay set retries standing-
+/// relay discovery (`public_relay.rs`) on its own. Only ever fires work in
+/// that empty state — a node already able to originate mix traffic skips
+/// the tick entirely — so this stays cheap in the steady state while
+/// keeping a fresh install's time-to-first-relay bounded by roughly one
+/// interval rather than "whenever the app happens to ask".
+const PUBLIC_RELAY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(120);
+
 pub struct P2pNode {
     local_peer_id: PeerId,
     command_tx: mpsc::UnboundedSender<Command>,
@@ -114,6 +124,19 @@ impl P2pNode {
         bootstrap_addresses: Vec<Multiaddr>,
         ledger_data_dir: PathBuf,
     ) -> Result<Self> {
+        Self::spawn_with_config(identity_seed, bootstrap_addresses, None, ledger_data_dir)
+    }
+
+    /// `spawn_with_bootstrap`, plus an optional fixed listen port —
+    /// meaningless for a phone (whose address changes with every network
+    /// anyway), but what lets a standing relay (`packages/relay-node`)
+    /// keep one stable, firewall-openable, restart-surviving address.
+    pub fn spawn_with_config(
+        identity_seed: [u8; 32],
+        bootstrap_addresses: Vec<Multiaddr>,
+        listen_port: Option<u16>,
+        ledger_data_dir: PathBuf,
+    ) -> Result<Self> {
         let keypair = identity::keypair_from_seed(&identity_seed)?;
         let local_peer_id = keypair.public().to_peer_id();
         let mut swarm = build_swarm(keypair)?;
@@ -128,17 +151,21 @@ impl P2pNode {
         let mailbox_data_dir = ledger_data_dir.with_file_name("mailbox.redb");
         let mailbox_store = mailbox::MailboxStore::open(&mailbox_data_dir)?;
 
-        // Always listen, on an OS-assigned port over both transports, so
-        // this node is directly dialable whenever it isn't behind a NAT
-        // that blocks it outright (in which case ReserveRelaySlot is what
-        // makes it reachable instead). The resulting address(es) surface
-        // as P2pEvent::ListeningOn.
+        // Always listen, on an OS-assigned port (or the caller's fixed
+        // one) over both transports, so this node is directly dialable
+        // whenever it isn't behind a NAT that blocks it outright (in
+        // which case ReserveRelaySlot is what makes it reachable
+        // instead). The resulting address(es) surface as
+        // P2pEvent::ListeningOn.
+        let port = listen_port.unwrap_or(0);
+        let tcp_addr = format!("/ip4/0.0.0.0/tcp/{port}");
+        let quic_addr = format!("/ip4/0.0.0.0/udp/{port}/quic-v1");
         swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("valid multiaddr"))
-            .map_err(|source| P2pError::Listen { addr: "tcp/0".into(), source })?;
+            .listen_on(tcp_addr.parse().expect("valid multiaddr"))
+            .map_err(|source| P2pError::Listen { addr: tcp_addr, source })?;
         swarm
-            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("valid multiaddr"))
-            .map_err(|source| P2pError::Listen { addr: "udp/0/quic-v1".into(), source })?;
+            .listen_on(quic_addr.parse().expect("valid multiaddr"))
+            .map_err(|source| P2pError::Listen { addr: quic_addr, source })?;
 
         let have_bootstrap_peers = !bootstrap_addresses.is_empty();
         for addr in bootstrap_addresses {
@@ -259,6 +286,17 @@ struct Pending {
     /// echo it back to the caller.
     resolve_contact_card: HashMap<QueryId, Vec<u8>>,
     announce_avatar_pointer: std::collections::HashSet<QueryId>,
+    announce_recovery_backup: std::collections::HashSet<QueryId>,
+    /// Keyed by the same `owner_identity_public_key` the original
+    /// `Command::ResolveRecoveryBackup` was given, echoed back in the
+    /// answering event — same shape as `resolve_contact_card`.
+    resolve_recovery_backup: HashMap<QueryId, Vec<u8>>,
+    announce_public_relay: std::collections::HashSet<QueryId>,
+    /// In-flight `DiscoverPublicRelays` provider lookups. Providers found
+    /// get auto-dialed as they stream in (see `handle_kad_event`), so
+    /// there's nothing to echo back on completion — a marker set, same as
+    /// `announce`.
+    discover_public_relays: std::collections::HashSet<QueryId>,
     /// Keyed by the same `owner` `Command::ResolveAvatarPointer` was given.
     resolve_avatar_pointer: HashMap<QueryId, PeerId>,
     /// One entry per in-flight `mailbox_dht::record_key_for` slot lookup a
@@ -456,6 +494,7 @@ async fn run_event_loop(
     // and reports back over this channel once it's actually time to send.
     let (mix_forward_tx, mut mix_forward_rx) = mpsc::unbounded_channel::<(PeerId, MixMessage)>();
     let mut dummy_traffic_interval = tokio::time::interval(MIX_DUMMY_TRAFFIC_INTERVAL);
+    let mut public_relay_discovery_interval = tokio::time::interval(PUBLIC_RELAY_DISCOVERY_INTERVAL);
     // Gated by `Command::SetMixDummyTrafficActive` — off until the app
     // layer says otherwise (see that command's own doc comment for why).
     let mut mix_dummy_traffic_active = false;
@@ -511,6 +550,14 @@ async fn run_event_loop(
                     for command in deferred_commands.drain(..) {
                         handle_command(&mut swarm, &mut chain_store, &mut pending, &mut local_blobs, &mut mempool, &mut mining, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public, &deposit_tx, &mut mix_dummy_traffic_active, &events, command);
                     }
+                    // First DHT contact = first moment standing-relay
+                    // discovery (public_relay.rs) can work at all — run it
+                    // now rather than waiting out the first
+                    // PUBLIC_RELAY_DISCOVERY_INTERVAL tick, so a fresh
+                    // install's time-to-usable-relay is bounded by this
+                    // lookup, not by a timer.
+                    let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+                    pending.discover_public_relays.insert(query_id);
                 }
                 handle_swarm_event(
                     &mut swarm, &mut chain_store, &mut pending, &local_blobs, &mut mempool, &mut mining,
@@ -528,6 +575,18 @@ async fn run_event_loop(
             _ = dummy_traffic_interval.tick() => {
                 if mix_dummy_traffic_active {
                     emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
+                }
+            }
+            _ = public_relay_discovery_interval.tick() => {
+                // Self-healing for the bootstrap gap public_relay.rs
+                // describes: only while this node can't originate mix
+                // traffic at all (no connected peer whose routing key is
+                // known) — once it can, standing relays add nothing the
+                // gossip directory isn't already providing.
+                let can_originate = known_mix_relays.values().any(|peer| known_mix_routing_keys.contains_key(peer));
+                if dht_ready && !can_originate {
+                    let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+                    pending.discover_public_relays.insert(query_id);
                 }
             }
             Some(deposit) = deposit_rx.recv() => {
@@ -580,6 +639,10 @@ fn needs_dht_peer(command: &Command) -> bool {
             | Command::ResolveContactCard { .. }
             | Command::AnnounceAvatarPointer { .. }
             | Command::ResolveAvatarPointer { .. }
+            | Command::AnnounceRecoveryBackup { .. }
+            | Command::ResolveRecoveryBackup { .. }
+            | Command::AnnouncePublicRelay
+            | Command::DiscoverPublicRelays
     )
 }
 
@@ -681,6 +744,20 @@ fn handle_command(
             }
         }
 
+        Command::AnnounceRecoveryBackup { owner_identity_public_key, backup } => {
+            let key = recovery_backup::record_key_for(&owner_identity_public_key);
+            let record = Record::new(key, backup);
+            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+                pending.announce_recovery_backup.insert(query_id);
+            }
+        }
+
+        Command::ResolveRecoveryBackup { owner_identity_public_key } => {
+            let key = recovery_backup::record_key_for(&owner_identity_public_key);
+            let query_id = swarm.behaviour_mut().kad.get_record(key);
+            pending.resolve_recovery_backup.insert(query_id, owner_identity_public_key);
+        }
+
         Command::ResolveContactCard { owner_identity_public_key } => {
             let key = contact_card::record_key_for(&owner_identity_public_key);
             let query_id = swarm.behaviour_mut().kad.get_record(key);
@@ -711,6 +788,26 @@ fn handle_command(
             if let Ok(bytes) = bincode::serialize(&announcement) {
                 let _ = swarm.behaviour_mut().ledger_gossip.publish(behaviour::mix_relay_directory_topic(), bytes);
             }
+        }
+
+        Command::AnnouncePublicRelay => {
+            match swarm.behaviour_mut().kad.start_providing(public_relay::provider_key()) {
+                Ok(query_id) => {
+                    pending.announce_public_relay.insert(query_id);
+                }
+                Err(err) => {
+                    // start_providing only fails synchronously when the
+                    // local record store is full — worth reporting, since
+                    // a standing relay that silently isn't announced
+                    // defeats its whole reason to exist.
+                    let _ = events.send(P2pEvent::PublicRelayAnnouncementFailed { reason: err.to_string() });
+                }
+            }
+        }
+
+        Command::DiscoverPublicRelays => {
+            let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+            pending.discover_public_relays.insert(query_id);
         }
 
         Command::DepositToMailbox { shared_material, envelope } => {
@@ -886,7 +983,7 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Kad(kad_event)) => {
-            handle_kad_event(pending, events, kad_event);
+            handle_kad_event(swarm, pending, events, kad_event);
         }
 
         // Kademlia's routing table is *not* populated automatically from
@@ -950,6 +1047,7 @@ fn handle_mdns_event(
 }
 
 fn handle_kad_event(
+    swarm: &mut Swarm<Behaviour>,
     pending: &mut Pending,
     events: &mpsc::UnboundedSender<P2pEvent>,
     event: kad::Event,
@@ -959,6 +1057,48 @@ fn handle_kad_event(
     };
 
     match result {
+        QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) => {
+            // A streaming result — more batches (and a final
+            // FinishedWithNoAdditionalRecord) may follow under the same
+            // query id, so `pending` is only cleared on completion below.
+            if !pending.discover_public_relays.contains(&id) {
+                return;
+            }
+            let local_peer = *swarm.local_peer_id();
+            for peer in providers {
+                if peer == local_peer {
+                    continue; // a standing relay discovering itself
+                }
+                let _ = events.send(P2pEvent::PublicRelayDiscovered { peer });
+                if !swarm.is_connected(&peer) {
+                    // Dialing by bare PeerId lets the swarm gather
+                    // addresses from every behaviour — the provider walk
+                    // itself just fed this peer's addresses into
+                    // Kademlia's table. Failures surface as the ordinary
+                    // OutgoingConnectionError -> DialFailed path.
+                    let _ = swarm.dial(libp2p::swarm::dial_opts::DialOpts::peer_id(peer).build());
+                }
+            }
+        }
+        QueryResult::GetProviders(Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. })) => {
+            pending.discover_public_relays.remove(&id);
+        }
+        QueryResult::GetProviders(Err(_)) => {
+            // "Nobody announced yet" is this network's expected early
+            // state, not an error worth surfacing — same reasoning as an
+            // empty mailbox-DHT slot.
+            pending.discover_public_relays.remove(&id);
+        }
+        QueryResult::StartProviding(Ok(kad::AddProviderOk { .. })) => {
+            if pending.announce_public_relay.remove(&id) {
+                let _ = events.send(P2pEvent::PublicRelayAnnounced);
+            }
+        }
+        QueryResult::StartProviding(Err(err)) => {
+            if pending.announce_public_relay.remove(&id) {
+                let _ = events.send(P2pEvent::PublicRelayAnnouncementFailed { reason: err.to_string() });
+            }
+        }
         QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(found))) => {
             if let Some(peer) = pending.resolve_peer.remove(&id) {
                 let addresses = rendezvous::decode_addresses(&found.record.value);
@@ -975,6 +1115,11 @@ fn handle_kad_event(
                 });
             } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerResolved { owner, avatar_content_id: found.record.value });
+            } else if let Some(owner_identity_public_key) = pending.resolve_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupResolved {
+                    owner_identity_public_key,
+                    backup: found.record.value,
+                });
             } else if pending.mailbox_dht_retrieval.remove(&id) {
                 // One of a `RetrieveFromMailbox`'s per-slot DHT lookups
                 // (see `send_mailbox_retrieval_query`) found a replica —
@@ -994,6 +1139,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardResolutionFailed { owner_identity_public_key });
             } else if let Some(owner) = pending.resolve_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerResolutionFailed { owner });
+            } else if let Some(owner_identity_public_key) = pending.resolve_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupResolutionFailed { owner_identity_public_key });
             } else {
                 // An empty slot is the expected steady state, not a real
                 // failure — silence, same reasoning as a mailbox query
@@ -1010,6 +1157,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardAnnounced);
             } else if pending.announce_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerAnnounced);
+            } else if pending.announce_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupAnnounced);
             }
         }
         QueryResult::PutRecord(Err(err)) => {
@@ -1024,6 +1173,8 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::ContactCardAnnouncementFailed { reason: err.to_string() });
             } else if pending.announce_avatar_pointer.remove(&id) {
                 let _ = events.send(P2pEvent::AvatarPointerAnnouncementFailed { reason: err.to_string() });
+            } else if pending.announce_recovery_backup.remove(&id) {
+                let _ = events.send(P2pEvent::RecoveryBackupAnnouncementFailed { reason: err.to_string() });
             }
         }
         _ => {}

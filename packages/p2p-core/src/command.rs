@@ -75,6 +75,27 @@ pub enum Command {
     /// `P2pEvent::ContactCardResolved`/`ContactCardResolutionFailed`.
     ResolveContactCard { owner_identity_public_key: Vec<u8> },
 
+    /// Publishes this account's encrypted recovery backup into the public
+    /// DHT, keyed by `owner_identity_public_key` (see
+    /// `recovery_backup::record_key_for`). `backup` is opaque ciphertext
+    /// to this crate — encrypted by `spiritchat_crypto_core::backup` under
+    /// a key only the recovery-phrase holder can derive, so every DHT node
+    /// that stores or replicates it learns nothing. Re-run periodically
+    /// (DHT records expire) and whenever the backed-up data changes.
+    /// Answered by `P2pEvent::RecoveryBackupAnnounced`/
+    /// `RecoveryBackupAnnouncementFailed`.
+    AnnounceRecoveryBackup { owner_identity_public_key: Vec<u8>, backup: Vec<u8> },
+
+    /// Looks up whatever recovery backup is currently published for
+    /// `owner_identity_public_key` — what a fresh install runs right after
+    /// restoring an identity from its phrase, so profile/contacts come
+    /// back from the network instead of starting empty. Answered by
+    /// `P2pEvent::RecoveryBackupResolved`/`RecoveryBackupResolutionFailed`;
+    /// a record that fails to decrypt on the caller's side is treated the
+    /// same as no record (the DHT is a public, writable store — only the
+    /// AEAD tag decides what's really ours).
+    ResolveRecoveryBackup { owner_identity_public_key: Vec<u8> },
+
     /// Publishes this node's own current avatar *content id* (not the
     /// image bytes — those still need `SetLocalBlob`/`FetchBlob`, since
     /// they're genuinely content-addressed) into the public DHT, keyed by
@@ -105,6 +126,32 @@ pub enum Command {
     /// ends up being a path's final hop. Requires an existing connection
     /// to `first_hop`, same as `SendEnvelope`.
     SendMixPacket { first_hop: PeerId, packet_bytes: Vec<u8> },
+
+    /// Announces this node as a *standing* relay in the public DHT, under
+    /// the single well-known provider key every node discovers by (see
+    /// `public_relay.rs` for why gossip alone can't bootstrap a brand new
+    /// install into the mix). Kademlia keeps re-publishing the provider
+    /// record on its own schedule for as long as this node runs — this is
+    /// a one-shot opt-in, not something to re-issue on a timer the way
+    /// `AnnounceAddresses` is. Meant for nodes on always-on machines (see
+    /// `packages/relay-node`); a phone that's foreground-and-charging
+    /// gains nothing by announcing here that `AnnounceMixRelay` doesn't
+    /// already give it, and would only pollute the provider set with
+    /// entries that go dark minutes later. Answered by
+    /// `P2pEvent::PublicRelayAnnounced`/`PublicRelayAnnouncementFailed`.
+    AnnouncePublicRelay,
+
+    /// Enumerates currently-announced standing relays from the public DHT
+    /// and dials any that aren't already connected — the event loop also
+    /// runs this by itself whenever its mix-relay directory is empty (see
+    /// `run_event_loop`), so a fresh install converges on the mix without
+    /// the app layer doing anything; this command exists for the moments
+    /// the app *knows* a retry is warranted right now (a user pressing
+    /// "retry" on a stuck message) rather than on the next sweep. Each
+    /// relay found surfaces as `P2pEvent::PublicRelayDiscovered`; a
+    /// successful dial then flows through the ordinary
+    /// `PeerConnected`/gossip path that populates the mix-relay directory.
+    DiscoverPublicRelays,
 
     /// Broadcasts this node's own Sphinx routing public key to
     /// `behaviour::mix_relay_directory_topic()`, so other nodes can

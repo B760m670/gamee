@@ -54,6 +54,16 @@ export default function PrivacyScreen() {
 
         <View style={s.rowGap} />
 
+        <SettingsRow onPress={() => router.push('/settings/blocked')}>
+          <View style={[s.iconWrap, { backgroundColor: '#ef4444' }]}>
+            <Ionicons name="ban" size={15} color="#fff" />
+          </View>
+          <Text style={s.rowLabel}>Заблокированные</Text>
+          <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.3)" />
+        </SettingsRow>
+
+        <View style={s.rowGap} />
+
         <Pressable onPress={() => toggleMixRelay(!mixRelayEnabled)} style={s.toggleRow}>
           <View style={[s.iconWrap, { backgroundColor: '#06b6d4' }]}>
             <Ionicons name="git-network" size={15} color="#fff" />
