@@ -18,6 +18,7 @@ import { useProfileStore, handleRecoveryBackupEvent } from '../store/profile'
 import { useChatStore } from '../store/chat'
 import { useGroupStore } from '../store/groups'
 import { useContactsStore } from '../store/contacts'
+import { useConsentStore } from '../store/consent'
 import { handlePeerAvatarEvent } from '../store/peerAvatars'
 
 const queryClient = new QueryClient({
@@ -100,10 +101,16 @@ export default function RootLayout() {
       useChatStore.getState().loadForFingerprint(fingerprint)
       useGroupStore.getState().loadForFingerprint(fingerprint, peerId)
       useContactsStore.getState().loadForFingerprint(fingerprint)
+      // Not namespaced by fingerprint like the others: the native store is
+      // already per account slot, and this is only a mirror of it (see
+      // store/consent.ts). It still has to be re-read on every switch, since
+      // the slot behind it changed.
+      useConsentStore.getState().load()
     } else {
       useChatStore.getState().reset()
       useGroupStore.getState().reset()
       useContactsStore.getState().reset()
+      useConsentStore.getState().reset()
     }
   }, [fingerprint])
 
