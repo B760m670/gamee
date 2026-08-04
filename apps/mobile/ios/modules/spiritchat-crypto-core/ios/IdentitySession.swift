@@ -358,6 +358,10 @@ final class IdentitySession {
     KeychainStore.delete(account: agreementAccount(slot))
     KeychainStore.delete(account: prekeysAccount(slot))
     KeychainStore.delete(account: recoveryPhraseAccount(slot))
+    // Consent lives on the filesystem, not in the Keychain, so it needs
+    // wiping explicitly — otherwise the next account created in this slot
+    // would silently inherit a stranger's block list.
+    ConsentStore.removeAll(slot: slot)
     if slot == activeSlot {
       cached = nil
     }

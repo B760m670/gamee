@@ -158,6 +158,9 @@ const NativeCryptoCore = requireNativeModule<
     setMixRelayParticipationEnabled(enabled: boolean): void
     mixDummyTrafficBytesPerHourEstimate(): number
     chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string
+    chatSetConsent(peerId: string, stance: ConsentStance): void
+    chatConsentFor(peerId: string): ConsentStance
+    chatConsentList(): { peerId: string; stance: Exclude<ConsentStance, 'none'> }[]
     chatSendMedia(peerId: string, peerPublicKeyBase64: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
     chatSendGroupMedia(groupId: string, fileUri: string, mime: string, filename: string | null, durationMs: number | null): string
     hasMicrophonePermission(): boolean
@@ -814,6 +817,38 @@ export function mixDummyTrafficBytesPerHourEstimate(): number {
  * time this device sees that peer reconnect (including across an app
  * restart), for as long as this device keeps running.
  */
+/**
+ * How much of a peer this account accepts — phase 1 of
+ * `docs/consent-and-moderation.md`.
+ *
+ * - `blocked` — their envelopes are dropped **before decryption**, natively,
+ *   and anything queued for them is discarded. Nothing reaches JS, so this is
+ *   a real boundary rather than a filter on what was already delivered. The
+ *   peer is never told; in this protocol there is deliberately no "you have
+ *   been blocked" signal, since a blocked person is precisely who should not
+ *   be able to make your device send them something.
+ * - `restricted` — still decrypted and delivered, but kept silent and out of
+ *   the way by the UI. For when cutting someone off entirely would cause more
+ *   trouble than absorbing them.
+ * - `none` — no stance.
+ */
+export type ConsentStance = 'blocked' | 'restricted' | 'none'
+
+/** Sets (or with `'none'`, clears) this account's stance toward a peer. */
+export function setConsent(peerId: string, stance: ConsentStance): void {
+  NativeCryptoCore.chatSetConsent(peerId, stance)
+}
+
+/** This account's current stance toward one peer. */
+export function consentFor(peerId: string): ConsentStance {
+  return NativeCryptoCore.chatConsentFor(peerId)
+}
+
+/** Every peer with a stance — what the privacy screen lists. */
+export function consentList(): { peerId: string; stance: Exclude<ConsentStance, 'none'> }[] {
+  return NativeCryptoCore.chatConsentList()
+}
+
 export function chatSendMessage(peerId: string, peerPublicKeyBase64: string, plaintext: string): string {
   return NativeCryptoCore.chatSendMessage(peerId, peerPublicKeyBase64, plaintext)
 }

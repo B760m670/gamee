@@ -127,6 +127,13 @@ final class ChatManager {
   private let agreement: FfiAgreementKey
   private let prekeys: FfiPrekeyStore
 
+  /// This account's own decisions about who it will accept. Consulted on the
+  /// inbound path before decryption and on the outbound path before sending —
+  /// see `ConsentStore` for why it lives here rather than in JS. Exposed so
+  /// the module's block/unblock functions and the settings screen can reach
+  /// the same instance the message path uses; two copies could disagree.
+  let consent: ConsentStore
+
   /// Computed exactly once, in `init` — `FfiPrekeyStore.contactCard`
   /// hands out a fresh one-time prekey on every call ("generate a new
   /// card per contact"), so `reannounceContactCard` must re-publish this
@@ -148,6 +155,7 @@ final class ChatManager {
     self.identity = identity
     self.agreement = agreement
     self.prekeys = prekeys
+    self.consent = ConsentStore(slot: slot)
 
     let card = prekeys.contactCard(identity: identity, agreement: agreement)
     self.contactCard = card
@@ -248,6 +256,16 @@ final class ChatManager {
     try? ChatStore.saveOutbox(outbox, slot: slot)
   }
 
+  /// Drops every queued 1:1 envelope for `peerId` — used when that peer is
+  /// blocked, so nothing already in the durable outbox is delivered later.
+  private func discardOutbox(for peerId: String) {
+    var outbox = ChatStore.loadOutbox(slot: slot)
+    let before = outbox.count
+    outbox.removeAll(where: { $0.peerId == peerId })
+    guard outbox.count != before else { return }
+    try? ChatStore.saveOutbox(outbox, slot: slot)
+  }
+
   /// The oldest still-queued group envelope for `peerId` — same "one at
   /// a time per peer" reasoning as `firstOutboxItem`, and sharing that
   /// same peer's `peerStates` slot (see `PeerSendState.sendingGroupEnvelope`).
@@ -271,6 +289,16 @@ final class ChatManager {
   /// how this method already prioritized itself over everything else
   /// before group messages existed.
   private func attemptSend(peerId: String) {
+    // Blocking cuts both directions. Enforced here rather than only at the
+    // send call, because the outbox is durable and retried: a message queued
+    // before the block, or one already waiting for the peer to come online,
+    // must not slip out afterwards. Anything still queued for a blocked peer
+    // is dropped rather than held, since it will never be sendable while the
+    // block stands and keeping it would silently deliver it on unblock.
+    if consent.isBlocked(peerId) {
+      discardOutbox(for: peerId)
+      return
+    }
     guard let item = firstOutboxItem(peerId) else {
       attemptGroupDelivery(peerId: peerId)
       return
@@ -1297,6 +1325,14 @@ final class ChatManager {
   // MARK: - Receiving
 
   private func onEnvelopeReceived(fromPeerId: String, bytes: Data) {
+    // Before the type tag, before any parsing, before any decryption: this
+    // is the whole point of keeping consent native-side. A blocked peer's
+    // envelope is never opened, so nothing it contains — not a message, not
+    // a media manifest, not a group invite — can reach the UI or the
+    // notification layer. Ratchet state is left untouched too, which matters:
+    // decrypting would advance it, so dropping here also means a blocked
+    // peer cannot make this device do cryptographic work on demand.
+    if consent.isBlocked(fromPeerId) { return }
     guard let tag = bytes.first else { return }
     let body = bytes.dropFirst()
     switch tag {

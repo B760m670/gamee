@@ -18,6 +18,13 @@ enum ChatError: Error {
   case malformedPlaintext
 }
 
+enum ConsentError: Error {
+  /// The JS side asked for a stance this build doesn't know. Thrown rather
+  /// than defaulting to something: silently treating an unrecognised stance
+  /// as "none" would turn a typo into an unblock.
+  case unknownStance(String)
+}
+
 private func requireIdentity() throws -> IdentitySession {
   guard let session = IdentitySession.shared else { throw IdentitySessionError.notYetInitialized }
   return session
@@ -502,6 +509,41 @@ public class SpiritchatCryptoCoreModule: Module {
         throw ChatError.malformedPlaintext
       }
       return try requireP2pSession().chatManager.sendMessage(peerId: peerId, peerPublicKey: publicKey, plaintext: plaintextBytes)
+    }
+
+    // Consent — who this account refuses to hear from, and how strongly.
+    // Phase 1 of docs/consent-and-moderation.md. These reach the very same
+    // `ConsentStore` instance the message path consults, deliberately: a
+    // second copy of the list could disagree with the one doing the
+    // dropping, and the disagreement would look exactly like a block that
+    // didn't work.
+    //
+    // "blocked" drops envelopes unopened and discards anything queued for
+    // them; "restricted" still decrypts and delivers, and it is the JS layer
+    // that keeps such conversations silent and out of the way — which is the
+    // right place for it, since it is a presentation decision, not a
+    // security boundary.
+    Function("chatSetConsent") { (peerId: String, stance: String) throws in
+      let consent = try requireP2pSession().chatManager.consent
+      switch stance {
+      case "blocked": consent.set(.blocked, for: peerId)
+      case "restricted": consent.set(.restricted, for: peerId)
+      case "none": consent.clear(peerId)
+      default: throw ConsentError.unknownStance(stance)
+      }
+    }
+
+    // The stance for one peer: "blocked", "restricted", or "none".
+    Function("chatConsentFor") { (peerId: String) throws -> String in
+      let consent = try requireP2pSession().chatManager.consent
+      return consent.stance(for: peerId)?.rawValue ?? "none"
+    }
+
+    // Every peer with a stance, for the privacy screen. Returns objects
+    // rather than two parallel arrays so the list can't get misaligned.
+    Function("chatConsentList") { () throws -> [[String: String]] in
+      let consent = try requireP2pSession().chatManager.consent
+      return consent.all().map { ["peerId": $0.peerId, "stance": $0.stance.rawValue] }
     }
 
     // Sends a media file (photo/video/voice) to a 1:1 peer. `fileUri` is a
