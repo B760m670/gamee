@@ -1035,14 +1035,36 @@ fn handle_swarm_event(
             let _ = events.send(P2pEvent::ListeningOn(address));
         }
 
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        // The mirror of `ConnectionClosed` below: `num_established` counts
+        // this connection, so 1 means it is the first one to this peer.
+        // Announcing every additional link as a fresh `PeerConnected`
+        // would have the app layer re-run its own on-connect work (a
+        // ledger sync request per event, in `_layout.tsx`) for a peer it
+        // was already connected to.
+        SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
             known_mix_relays.insert(mix::node_address_for(&peer_id.to_bytes()), peer_id);
-            let _ = events.send(P2pEvent::PeerConnected(peer_id));
+            if num_established.get() == 1 {
+                let _ = events.send(P2pEvent::PeerConnected(peer_id));
+            }
         }
 
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            known_mix_relays.remove(&mix::node_address_for(&peer_id.to_bytes()));
-            let _ = events.send(P2pEvent::PeerDisconnected(peer_id));
+        // `num_established` is how many connections to this peer remain
+        // *after* this one closed — so anything above zero means the peer
+        // is still connected and this is only one redundant link going
+        // away. Acting on it as a disconnect drops the peer out of
+        // `known_mix_relays` (making it unroutable for mix traffic) and
+        // tells the app layer the contact went offline, both while the
+        // peer is in fact still there.
+        //
+        // Redundant links are routine, not exotic: two peers that discover
+        // each other at the same moment dial each other simultaneously,
+        // libp2p establishes both, and one is then dropped. A phone
+        // switching networks produces the same shape.
+        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+            if num_established == 0 {
+                known_mix_relays.remove(&mix::node_address_for(&peer_id.to_bytes()));
+                let _ = events.send(P2pEvent::PeerDisconnected(peer_id));
+            }
         }
 
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1109,33 +1131,8 @@ fn handle_mdns_event(
     match event {
         libp2p::mdns::Event::Discovered(discovered) => {
             for (peer, addr) in discovered {
-                swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                swarm.behaviour_mut().kad.add_address(&peer, addr);
                 let _ = events.send(P2pEvent::PeerDiscoveredLocally(peer));
-
-                // Actually connect, rather than only remembering the
-                // address. Nothing else in the system does this: the app
-                // layer treats `PeerDiscoveredLocally` as a notification
-                // and never dials on it, and Kademlia holding an address
-                // establishes no connection by itself — so without this,
-                // two devices on one network would see each other and
-                // then sit there, with no `PeerConnected`, no ledger
-                // sync, and no envelope path between them. Dialing here
-                // is safe and cheap: mDNS only ever names peers on this
-                // link, `is_connected` keeps a re-announcement (mDNS
-                // re-broadcasts periodically) from redialing an
-                // established peer, and any genuine failure surfaces
-                // through the ordinary `OutgoingConnectionError` path.
-                if !swarm.is_connected(&peer) {
-                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
-                        .addresses(vec![addr])
-                        .build();
-                    if let Err(err) = swarm.dial(opts) {
-                        let _ = events.send(P2pEvent::DialFailed {
-                            peer: Some(peer),
-                            reason: err.to_string(),
-                        });
-                    }
-                }
             }
         }
         libp2p::mdns::Event::Expired(_) => {}
