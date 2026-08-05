@@ -411,6 +411,33 @@ final class ChatManager {
   private func attemptGroupDelivery(peerId: String) {
     guard firstGroupOutboxItem(peerId) != nil else { return }
 
+    // Under the same `DeliveryPolicy` as 1:1 messages, and for the same
+    // reason: a group message is delivered by sending one copy to each
+    // member, so dialing them directly discloses the whole membership —
+    // every pair at once, rather than a single correspondent. If anything
+    // this path deserves the mix more than 1:1 does.
+    switch DeliveryPolicy.route(mixPathAvailable: hasMixPath()) {
+    case .mix:
+      guard let item = firstGroupOutboxItem(peerId), beginState(.sendingGroupEnvelope, for: peerId) else { return }
+      defer { endState(for: peerId) }
+      // Only drop the entry once the deposit actually went out; otherwise
+      // it stays queued for the next attempt rather than being lost.
+      if depositGroupItemToMailbox(item) {
+        removeGroupOutboxItem(localId: item.localId)
+      }
+      return
+
+    case nil:
+      // Held until a mix relay appears, same as the 1:1 case. Silent
+      // rather than emitting a failure: a group item has no single
+      // user-visible message row of its own to mark (the sender's copy is
+      // already shown), so there is nothing to report here.
+      return
+
+    case .direct:
+      break
+    }
+
     guard isConnected(peerId) else {
       guard beginState(.dialing, for: peerId) else { return }
       try? node.dial(peerId: peerId, knownAddresses: [])
@@ -639,12 +666,23 @@ final class ChatManager {
   /// giving up. The item stays queued either way (mirrors
   /// `depositContinuing`'s own reasoning exactly): a future reconnect to
   /// this member still retries a direct send too.
-  private func depositGroupItemToMailbox(_ item: GroupStore.OutboxItem) {
+  /// Returns whether the deposit was actually dispatched. The caller uses
+  /// that to decide whether the outbox entry may be dropped — swallowing
+  /// the failure and dropping it anyway would silently lose the message
+  /// for that member.
+  @discardableResult
+  private func depositGroupItemToMailbox(_ item: GroupStore.OutboxItem) -> Bool {
     guard let pairwiseSession = ChatStore.loadSession(slot: slot, peerId: item.memberPeerId) else {
       NSLog("[ChatManager] no pairwise session with group member \(item.memberPeerId) — cannot deliver a group message to them right now")
-      return
+      return false
     }
-    try? node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: pairwiseSession.peerPublicKey), envelope: item.wireEnvelope)
+    do {
+      try node.depositToMailbox(sharedMaterial: mailboxSharedMaterial(peerPublicKey: pairwiseSession.peerPublicKey), envelope: item.wireEnvelope)
+      return true
+    } catch {
+      NSLog("[ChatManager] mailbox deposit for group member \(item.memberPeerId) failed: \(error)")
+      return false
+    }
   }
 
   /// Encrypts `payload` (an invite or a member distribution) under the
