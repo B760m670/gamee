@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - claude/game-app-architecture-discussion-8gn7ep
+      - claude/decentralized-messenger-review-baagfa
+      - claude/messenger-project-review-i4p3vs
     paths:
       - 'apps/android/**'
       - 'packages/crypto-core/**'
