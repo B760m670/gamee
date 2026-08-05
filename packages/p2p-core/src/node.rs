@@ -101,6 +101,18 @@ const PUBLIC_RELAY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(120);
 /// refreshed it yet.
 const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(600);
 
+/// How soon after the listen-address set changes it gets published.
+///
+/// Deliberately not "immediately, on every `NewListenAddr`": binding
+/// `/ip6/::` and `/ip4/0.0.0.0` reports one address *per interface*, so a
+/// node coming up emits a burst of these within milliseconds of each other.
+/// Publishing per event turns that burst into a burst of Kademlia
+/// `put_record` queries, each superseded by the next and each holding a
+/// query slot until it finishes or times out. Coalescing them into one
+/// publish costs a few seconds of delay on startup and saves every one of
+/// those redundant queries.
+const ADDRESS_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(5);
+
 /// Publishes this node's current listen addresses into the DHT, so a peer
 /// holding only its `PeerId` (which is all a contact card carries) can
 /// look up somewhere to dial.
@@ -111,13 +123,15 @@ const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(600);
 /// could only ever come back empty. Making it automatic is what turns the
 /// rendezvous mechanism from present-but-inert into actually load-bearing.
 ///
-/// Loopback is filtered out (it names this device to itself and is
-/// actively misleading to a peer), but private LAN addresses are kept on
-/// purpose: they are exactly what a peer on the same network needs, and
-/// they are the fallback when mDNS is unavailable — client isolation on a
-/// router blocks mDNS while leaving the two devices routable to each other.
+/// Addresses that name only this host or only this link are filtered out —
+/// they are useless to a peer looking this record up, and publishing them
+/// just gives it dead addresses to spend dial attempts on. Private LAN
+/// addresses are kept on purpose: they are exactly what a peer on the same
+/// network needs, and they are the fallback when mDNS is unavailable —
+/// client isolation on a router blocks mDNS while leaving the two devices
+/// routable to each other.
 fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, addresses: &[Multiaddr]) {
-    let publishable: Vec<Multiaddr> = addresses.iter().filter(|addr| !is_loopback(addr)).cloned().collect();
+    let publishable: Vec<Multiaddr> = addresses.iter().filter(|addr| is_publishable(addr)).cloned().collect();
     if publishable.is_empty() {
         return;
     }
@@ -129,10 +143,17 @@ fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, a
     }
 }
 
-fn is_loopback(addr: &Multiaddr) -> bool {
-    addr.iter().any(|protocol| match protocol {
-        Protocol::Ip4(ip) => ip.is_loopback(),
-        Protocol::Ip6(ip) => ip.is_loopback(),
+/// Whether an address is worth putting in front of another peer.
+///
+/// Loopback names this device to itself. Link-local (IPv6 `fe80::/10`,
+/// IPv4 `169.254.0.0/16`) is only meaningful on the interface it came from
+/// and cannot be routed to from anywhere else — and binding `/ip6/::`
+/// produces one of these per interface, so without this filter a record
+/// would be mostly undialable entries.
+fn is_publishable(addr: &Multiaddr) -> bool {
+    !addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_loopback() || ip.is_link_local(),
+        Protocol::Ip6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xffc0) == 0xfe80,
         _ => false,
     })
 }
@@ -572,6 +593,10 @@ async fn run_event_loop(
     // — see `announce_own_addresses`.
     let mut own_listen_addresses: Vec<Multiaddr> = Vec::new();
     let mut address_announce_interval = tokio::time::interval(ADDRESS_ANNOUNCE_INTERVAL);
+    let mut address_publish_debounce = tokio::time::interval(ADDRESS_PUBLISH_DEBOUNCE);
+    // Set when `own_listen_addresses` gains an entry, cleared once the
+    // coalesced publish actually goes out.
+    let mut addresses_dirty = false;
     // Gated by `Command::SetMixDummyTrafficActive` — off until the app
     // layer says otherwise (see that command's own doc comment for why).
     let mut mix_dummy_traffic_active = false;
@@ -630,7 +655,7 @@ async fn run_event_loop(
                 if let SwarmEvent::NewListenAddr { address, .. } = &swarm_event {
                     if !own_listen_addresses.contains(address) {
                         own_listen_addresses.push(address.clone());
-                        announce_own_addresses(&mut swarm, &mut pending, &own_listen_addresses);
+                        addresses_dirty = true;
                     }
                 }
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
@@ -663,6 +688,16 @@ async fn run_event_loop(
             _ = dummy_traffic_interval.tick() => {
                 if mix_dummy_traffic_active {
                     emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
+                }
+            }
+            _ = address_publish_debounce.tick() => {
+                // The coalesced publish for a burst of `NewListenAddr`.
+                // Gated on `dht_ready` because a put with no connected peer
+                // resolves to nothing; the flag stays set, so it goes out on
+                // a later tick once there is somewhere to put it.
+                if addresses_dirty && dht_ready {
+                    announce_own_addresses(&mut swarm, &mut pending, &own_listen_addresses);
+                    addresses_dirty = false;
                 }
             }
             _ = address_announce_interval.tick() => {
