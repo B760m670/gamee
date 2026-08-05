@@ -3233,6 +3233,7 @@ name = "spiritchat-p2p-core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "ed25519-dalek",
  "futures",
  "hkdf",
  "libp2p",
