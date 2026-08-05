@@ -216,6 +216,16 @@ public class SpiritchatCryptoCoreModule: Module {
       P2pSession.lastStartupError.map { "\($0)" }
     }
 
+    // Every address this node is currently listening on, as accumulated
+    // from `P2pEvent.ListeningOn`. Read-only diagnostics: whether a build
+    // ended up with an IPv6 listener, and whether any address is a
+    // `/p2p-circuit` one (i.e. reachable through a relay), is otherwise
+    // invisible from the app — and those two facts decide whether a peer
+    // far away can reach this device at all.
+    Function("p2pListenAddresses") { () throws -> [String] in
+      try requireP2pSession().currentListenAddresses()
+    }
+
     Function("p2pDial") { (peerId: String, knownAddresses: [String]) throws in
       try requireP2pSession().node.dial(peerId: peerId, knownAddresses: knownAddresses)
     }

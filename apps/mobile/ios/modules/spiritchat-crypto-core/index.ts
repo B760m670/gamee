@@ -131,6 +131,7 @@ const NativeCryptoCore = requireNativeModule<
     p2pLocalPeerId(): string
     p2pIsReady(): boolean
     p2pLastStartupErrorDescription(): string | null
+    p2pListenAddresses(): string[]
     p2pDial(peerId: string, knownAddresses: string[]): void
     p2pResolvePeerAddresses(peerId: string): void
     p2pAnnounceAddresses(addresses: string[]): void
@@ -333,6 +334,20 @@ export function p2pIsReady(): boolean {
  */
 export function p2pLastStartupErrorDescription(): string | null {
   return NativeCryptoCore.p2pLastStartupErrorDescription()
+}
+
+/**
+ * Every address this node is currently listening on.
+ *
+ * Diagnostics, and pointed ones: an address starting `/ip6/` means this
+ * device has a routable IPv6 address, which is the one path on which two
+ * phones on mobile networks connect directly with no relay involved; an
+ * address containing `/p2p-circuit` means this device is reachable through
+ * a relay. With neither, a peer that isn't on this network cannot reach
+ * this device at all, and no amount of retrying changes that.
+ */
+export function p2pListenAddresses(): string[] {
+  return NativeCryptoCore.p2pListenAddresses()
 }
 
 /** Dials a peer directly at `knownAddresses`, or via the DHT if empty. */
