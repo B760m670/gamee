@@ -337,13 +337,41 @@ fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<Swarm<Behaviour>> {
         // acceptable trade here since this transport only ever resolves
         // the handful of `/dnsaddr/...` bootstrap addresses in
         // `bootstrap.rs`, not arbitrary user-facing lookups.
-        .with_dns_config(libp2p::dns::ResolverConfig::cloudflare(), libp2p::dns::ResolverOpts::default())
+        .with_dns_config(libp2p::dns::ResolverConfig::cloudflare(), dns_resolver_opts())
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .with_behaviour(behaviour::build)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .build();
     Ok(swarm)
+}
+
+/// DNS options for the transport, differing from the defaults in exactly
+/// one respect: a lookup returns **both** A and AAAA records rather than
+/// stopping at whichever family answers first.
+///
+/// `ResolverOpts::default()` uses `Ipv4thenIpv6` — query A, and only fall
+/// back to AAAA if that *fails*. On an IPv6-only mobile network (carriers
+/// increasingly run these, with 464XLAT synthesising legacy IPv4) that is
+/// exactly wrong: the A lookup succeeds, so AAAA is never asked for, and
+/// the node is handed an IPv4 address it has no real IPv4 path to. The
+/// dial then sits there until it times out, reported only as
+/// "Failed to negotiate transport protocol(s) … Timeout has been reached".
+///
+/// Observed on a real device: every bootstrap dial timed out this way, so
+/// the node never reached the public DHT — and with no DHT there is no
+/// peer discovery, no address publishing, no ledger sync, and therefore
+/// no `@username` resolution either. Every one of those looked like its
+/// own separate bug.
+///
+/// The bootstrap hosts publish both families (`sv15.bootstrap.libp2p.io`
+/// resolves to `147.135.44.132` and `2604:2dc0:200:484::1`), so asking for
+/// both costs one extra parallel query and lets a node dial whichever
+/// family it can actually route.
+fn dns_resolver_opts() -> libp2p::dns::ResolverOpts {
+    let mut opts = libp2p::dns::ResolverOpts::default();
+    opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
+    opts
 }
 
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {

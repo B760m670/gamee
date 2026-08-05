@@ -2979,6 +2979,7 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "futures",
+ "hickory-resolver",
  "hkdf",
  "libp2p",
  "rand 0.8.6",
