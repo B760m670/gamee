@@ -112,6 +112,13 @@ final class ChatManager {
   private let lock = NSLock()
   private var peerStates: [String: PeerSendState] = [:]
   private var connectedPeers: Set<String> = []
+  /// Mix relays this node currently knows of, from `mixRelayDiscovered`.
+  /// Guarded by `lock`.
+  ///
+  /// Consulted before every send: with none of these, a deposit into the
+  /// mix has nowhere to go, and `DeliveryPolicy` decides whether that
+  /// means "wait" or "go direct and accept the disclosure".
+  private var knownMixRelays: Set<String> = []
   /// In-flight media downloads, keyed by an internal download id (see the
   /// "Media receive" section). Guarded by `lock`.
   private var mediaDownloads: [String: MediaDownload] = [:]
@@ -304,23 +311,94 @@ final class ChatManager {
       return
     }
 
+    // Route before reachability, deliberately. Dialing the recipient is
+    // what discloses the pair to the network, so whether that is allowed
+    // has to be settled before a connection is opened — not after a mix
+    // attempt has already failed, by which point the dial has happened.
+    let route = DeliveryPolicy.route(mixPathAvailable: hasMixPath())
+
+    if let session = ChatStore.loadSession(slot: slot, peerId: peerId) {
+      switch route {
+      case .mix:
+        guard beginState(.sendingEnvelope, for: peerId) else { return }
+        depositContinuing(item: item, session: session)
+        return
+      case .direct:
+        guard isConnected(peerId) else {
+          guard beginState(.dialing, for: peerId) else { return }
+          try? node.dial(peerId: peerId, knownAddresses: [])
+          return
+        }
+        guard beginState(.sendingEnvelope, for: peerId) else { return }
+        sendContinuing(item: item, session: session)
+        return
+      case nil:
+        // No unlinkable route and no permission to use a linkable one.
+        // The item stays in the durable outbox and is retried when a mix
+        // relay turns up (see `mixRelayDiscovered`) — this is a wait, not
+        // a failure, and it is reported as such.
+        emit(failedEvent(item: item, reason: "queued — no private route available yet"))
+        return
+      }
+    }
+
+    // No ratchet session yet: the contact card has to come first, and the
+    // only way to get one without dialing the contact is the DHT — the
+    // `fetchBlob` path below serves the same card but needs a direct
+    // connection to them, which is the disclosure being avoided.
+    switch route {
+    case nil:
+      // Nothing to start: the card would arrive with no private way to
+      // use it. Waits for a mix relay, same as the session case above.
+      emit(failedEvent(item: item, reason: "queued — no private route available yet"))
+      return
+
+    case .mix:
+      guard beginState(.resolvingCardViaDht, for: peerId) else { return }
+      do {
+        try node.resolveContactCard(ownerIdentityPublicKey: item.peerPublicKey)
+      } catch {
+        endState(for: peerId)
+        emit(failedEvent(item: item, reason: "\(error)"))
+      }
+      return
+
+    case .direct:
+      // Falls through to the dial-and-fetch path below.
+      break
+    }
+
     guard isConnected(peerId) else {
       guard beginState(.dialing, for: peerId) else { return }
       try? node.dial(peerId: peerId, knownAddresses: [])
       return
     }
 
-    if let session = ChatStore.loadSession(slot: slot, peerId: peerId) {
-      guard beginState(.sendingEnvelope, for: peerId) else { return }
-      sendContinuing(item: item, session: session)
-    } else {
-      guard beginState(.fetchingCard, for: peerId) else { return }
-      do {
-        try node.fetchBlob(peerId: peerId, id: Self.contactCardBlobId)
-      } catch {
-        endState(for: peerId)
-        emit(failedEvent(item: item, reason: "\(error)"))
-      }
+    guard beginState(.fetchingCard, for: peerId) else { return }
+    do {
+      try node.fetchBlob(peerId: peerId, id: Self.contactCardBlobId)
+    } catch {
+      endState(for: peerId)
+      emit(failedEvent(item: item, reason: "\(error)"))
+    }
+  }
+
+  /// Whether a deposit into the mix has anywhere to go right now.
+  private func hasMixPath() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return !knownMixRelays.isEmpty
+  }
+
+  /// Re-runs delivery for every peer with something queued. Used when a
+  /// mix relay appears, since items held back for want of a private route
+  /// have no other trigger — no dial fails, no connection changes, nothing
+  /// else would ever wake them.
+  private func retryQueuedForAllPeers() {
+    let pendingPeers = Set(ChatStore.loadOutbox(slot: slot).map(\.peerId))
+      .union(GroupStore.loadOutbox(slot: slot).map(\.memberPeerId))
+    for peerId in pendingPeers {
+      attemptSend(peerId: peerId)
     }
   }
 
@@ -395,7 +473,24 @@ final class ChatManager {
       )
       let sharedMaterial = mailboxSharedMaterial(peerPublicKey: session.peerPublicKey)
       try node.depositToMailbox(sharedMaterial: sharedMaterial, envelope: envelope)
-      emit(failedEvent(item: item, reason: "queued for offline delivery"))
+      // Handed to the mix, and the outbox entry goes with it.
+      //
+      // This used to report a failure and keep the item queued, which was
+      // right while a deposit was the fallback after a direct send had
+      // already failed: the item stayed so a later reconnect could retry
+      // directly. Under `DeliveryPolicy` the mix is the *primary* route, so
+      // both halves of that would now be wrong — every message would sit
+      // permanently marked "queued" even though it was dispatched, and the
+      // retained entry would be re-deposited on every reconnect, delivering
+      // the same message repeatedly.
+      //
+      // "Sent" here means handed to the mix, not confirmed read: the mix
+      // deliberately returns no per-item receipt (one would identify the
+      // pair, which is the entire thing being hidden). The deposit remains
+      // retrievable until the recipient's sweep collects it or the mailbox
+      // retention window expires — ordinary store-and-forward semantics.
+      removeOutboxItem(localId: item.localId)
+      emit(sentEvent(item: item))
     } catch {
       emit(failedEvent(item: item, reason: "\(error)"))
     }
@@ -1571,6 +1666,16 @@ final class ChatManager {
       lock.lock()
       connectedPeers.remove(peerId)
       lock.unlock()
+
+    case .mixRelayDiscovered(let peerId):
+      lock.lock()
+      let wasEmpty = knownMixRelays.isEmpty
+      knownMixRelays.insert(peerId)
+      lock.unlock()
+      // Going from no usable mix to some is exactly the moment anything
+      // held back for want of a route becomes sendable, and nothing else
+      // would retry it until the next reconnect or app launch.
+      if wasEmpty { retryQueuedForAllPeers() }
 
     case .dialFailed(let maybePeerId, let reason):
       guard let peerId = maybePeerId, state(for: peerId) == .dialing else { return }
