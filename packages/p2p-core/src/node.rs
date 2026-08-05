@@ -203,15 +203,41 @@ impl P2pNode {
         // which case ReserveRelaySlot is what makes it reachable
         // instead). The resulting address(es) surface as
         // P2pEvent::ListeningOn.
+        //
+        // **IPv6 matters more than it looks here.** Two phones on mobile
+        // networks are normally both behind carrier-grade NAT, where
+        // neither is dialable and a direct connection is impossible
+        // without a third party to coordinate through. But carriers
+        // increasingly hand out real, globally routable IPv6 addresses
+        // (often IPv6-only, with NAT64 covering legacy IPv4) — and two
+        // peers that both have one connect *directly*, with no NAT, no
+        // relay and no hole punching involved at all. Listening only on
+        // IPv4, as this did, silently discarded the single best path
+        // between distant peers.
+        //
+        // Failures are per-family and non-fatal: a host with no IPv6
+        // (or no IPv4) must still come up on whatever it does have,
+        // rather than failing to start a node over an address family it
+        // was never going to use. Only being left with *no* listener at
+        // all is a real error.
         let port = listen_port.unwrap_or(0);
-        let tcp_addr = format!("/ip4/0.0.0.0/tcp/{port}");
-        let quic_addr = format!("/ip4/0.0.0.0/udp/{port}/quic-v1");
-        swarm
-            .listen_on(tcp_addr.parse().expect("valid multiaddr"))
-            .map_err(|source| P2pError::Listen { addr: tcp_addr, source })?;
-        swarm
-            .listen_on(quic_addr.parse().expect("valid multiaddr"))
-            .map_err(|source| P2pError::Listen { addr: quic_addr, source })?;
+        let candidates = [
+            format!("/ip4/0.0.0.0/tcp/{port}"),
+            format!("/ip4/0.0.0.0/udp/{port}/quic-v1"),
+            format!("/ip6/::/tcp/{port}"),
+            format!("/ip6/::/udp/{port}/quic-v1"),
+        ];
+        let mut listen_errors: Vec<String> = Vec::new();
+        let mut listening = false;
+        for addr in candidates {
+            match swarm.listen_on(addr.parse().expect("valid multiaddr")) {
+                Ok(_) => listening = true,
+                Err(source) => listen_errors.push(format!("{addr}: {source}")),
+            }
+        }
+        if !listening {
+            return Err(P2pError::Listen { details: listen_errors.join("; ") });
+        }
 
         let have_bootstrap_peers = !bootstrap_addresses.is_empty();
         for addr in bootstrap_addresses {
