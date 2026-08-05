@@ -226,6 +226,17 @@ public class SpiritchatCryptoCoreModule: Module {
       try requireP2pSession().currentListenAddresses()
     }
 
+    // See DeliveryPolicy.swift. Deliberately not gated on a live session:
+    // it is a stored preference about how this device is willing to
+    // deliver, readable and settable whether or not P2P is currently up.
+    Function("allowsDirectDelivery") { () -> Bool in
+      DeliveryPolicy.allowsDirectDelivery
+    }
+
+    Function("setAllowsDirectDelivery") { (allowed: Bool) in
+      DeliveryPolicy.allowsDirectDelivery = allowed
+    }
+
     Function("p2pDial") { (peerId: String, knownAddresses: [String]) throws in
       try requireP2pSession().node.dial(peerId: peerId, knownAddresses: knownAddresses)
     }

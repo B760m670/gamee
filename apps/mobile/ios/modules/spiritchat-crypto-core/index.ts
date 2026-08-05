@@ -132,6 +132,8 @@ const NativeCryptoCore = requireNativeModule<
     p2pIsReady(): boolean
     p2pLastStartupErrorDescription(): string | null
     p2pListenAddresses(): string[]
+    allowsDirectDelivery(): boolean
+    setAllowsDirectDelivery(allowed: boolean): void
     p2pDial(peerId: string, knownAddresses: string[]): void
     p2pResolvePeerAddresses(peerId: string): void
     p2pAnnounceAddresses(addresses: string[]): void
@@ -348,6 +350,30 @@ export function p2pLastStartupErrorDescription(): string | null {
  */
 export function p2pListenAddresses(): string[] {
   return NativeCryptoCore.p2pListenAddresses()
+}
+
+/**
+ * Whether this device may deliver a message over a direct connection to
+ * the recipient when no mix path is available.
+ *
+ * Off by default. Messages normally travel through the Sphinx mix, where
+ * an observer sees this device talking to a mix node rather than to a
+ * person — end-to-end encryption hides *what* was said, and only the mix
+ * hides *who it was said to*. A direct connection discloses the pair to
+ * every network the traffic crosses.
+ *
+ * With this off, a message that cannot be sent unlinkably waits instead of
+ * going out the fast way — a privacy property that silently degrades when
+ * the network is weak is not a privacy property. Turning it on is a real
+ * choice (delivery speed over graph privacy) and has to be made
+ * knowingly, which is why it is a setting and not a heuristic.
+ */
+export function allowsDirectDelivery(): boolean {
+  return NativeCryptoCore.allowsDirectDelivery()
+}
+
+export function setAllowsDirectDelivery(allowed: boolean): void {
+  NativeCryptoCore.setAllowsDirectDelivery(allowed)
 }
 
 /** Dials a peer directly at `knownAddresses`, or via the DHT if empty. */
