@@ -91,6 +91,52 @@ const MIX_PATH_HOPS: usize = 3;
 /// interval rather than "whenever the app happens to ask".
 const PUBLIC_RELAY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(120);
 
+/// How often this node re-publishes its own addresses into the DHT under
+/// `rendezvous::record_key_for(local_peer_id)`.
+///
+/// Republishing at all is not optional: a Kademlia record expires, and the
+/// peers holding it churn, so a record put once goes stale on its own. The
+/// interval is well inside libp2p's own default record TTL so a lookup
+/// never lands in a window where the record has aged out but nothing has
+/// refreshed it yet.
+const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Publishes this node's current listen addresses into the DHT, so a peer
+/// holding only its `PeerId` (which is all a contact card carries) can
+/// look up somewhere to dial.
+///
+/// Previously this happened only when the app layer explicitly issued
+/// `Command::AnnounceAddresses` — and nothing in the app ever did, so no
+/// device's addresses were ever published and `Command::ResolvePeerAddresses`
+/// could only ever come back empty. Making it automatic is what turns the
+/// rendezvous mechanism from present-but-inert into actually load-bearing.
+///
+/// Loopback is filtered out (it names this device to itself and is
+/// actively misleading to a peer), but private LAN addresses are kept on
+/// purpose: they are exactly what a peer on the same network needs, and
+/// they are the fallback when mDNS is unavailable — client isolation on a
+/// router blocks mDNS while leaving the two devices routable to each other.
+fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, addresses: &[Multiaddr]) {
+    let publishable: Vec<Multiaddr> = addresses.iter().filter(|addr| !is_loopback(addr)).cloned().collect();
+    if publishable.is_empty() {
+        return;
+    }
+    let local_peer = *swarm.local_peer_id();
+    let key = rendezvous::record_key_for(&local_peer);
+    let record = Record::new(key, rendezvous::encode_addresses(&publishable));
+    if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+        pending.announce.insert(query_id);
+    }
+}
+
+fn is_loopback(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_loopback(),
+        Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
+
 pub struct P2pNode {
     local_peer_id: PeerId,
     command_tx: mpsc::UnboundedSender<Command>,
@@ -495,6 +541,11 @@ async fn run_event_loop(
     let (mix_forward_tx, mut mix_forward_rx) = mpsc::unbounded_channel::<(PeerId, MixMessage)>();
     let mut dummy_traffic_interval = tokio::time::interval(MIX_DUMMY_TRAFFIC_INTERVAL);
     let mut public_relay_discovery_interval = tokio::time::interval(PUBLIC_RELAY_DISCOVERY_INTERVAL);
+    // Every address this node is currently listening on, accumulated from
+    // `NewListenAddr`, and re-published into the DHT on the interval above
+    // — see `announce_own_addresses`.
+    let mut own_listen_addresses: Vec<Multiaddr> = Vec::new();
+    let mut address_announce_interval = tokio::time::interval(ADDRESS_ANNOUNCE_INTERVAL);
     // Gated by `Command::SetMixDummyTrafficActive` — off until the app
     // layer says otherwise (see that command's own doc comment for why).
     let mut mix_dummy_traffic_active = false;
@@ -545,6 +596,17 @@ async fn run_event_loop(
                 }
             }
             swarm_event = swarm.select_next_some() => {
+                // Every new listen address is immediately published, so a
+                // peer holding only this node's PeerId has somewhere to
+                // dial. Intercepted here rather than inside
+                // `handle_swarm_event` purely so the address list can live
+                // in the loop alongside the interval that refreshes it.
+                if let SwarmEvent::NewListenAddr { address, .. } = &swarm_event {
+                    if !own_listen_addresses.contains(address) {
+                        own_listen_addresses.push(address.clone());
+                        announce_own_addresses(&mut swarm, &mut pending, &own_listen_addresses);
+                    }
+                }
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
@@ -575,6 +637,15 @@ async fn run_event_loop(
             _ = dummy_traffic_interval.tick() => {
                 if mix_dummy_traffic_active {
                     emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
+                }
+            }
+            _ = address_announce_interval.tick() => {
+                // A DHT record expires and the peers holding it churn, so
+                // the put on `NewListenAddr` alone would go stale. Skipped
+                // entirely until the DHT is actually reachable, since a
+                // put with no connected peer resolves to nothing.
+                if dht_ready {
+                    announce_own_addresses(&mut swarm, &mut pending, &own_listen_addresses);
                 }
             }
             _ = public_relay_discovery_interval.tick() => {
@@ -1038,8 +1109,33 @@ fn handle_mdns_event(
     match event {
         libp2p::mdns::Event::Discovered(discovered) => {
             for (peer, addr) in discovered {
-                swarm.behaviour_mut().kad.add_address(&peer, addr);
+                swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
                 let _ = events.send(P2pEvent::PeerDiscoveredLocally(peer));
+
+                // Actually connect, rather than only remembering the
+                // address. Nothing else in the system does this: the app
+                // layer treats `PeerDiscoveredLocally` as a notification
+                // and never dials on it, and Kademlia holding an address
+                // establishes no connection by itself — so without this,
+                // two devices on one network would see each other and
+                // then sit there, with no `PeerConnected`, no ledger
+                // sync, and no envelope path between them. Dialing here
+                // is safe and cheap: mDNS only ever names peers on this
+                // link, `is_connected` keeps a re-announcement (mDNS
+                // re-broadcasts periodically) from redialing an
+                // established peer, and any genuine failure surfaces
+                // through the ordinary `OutgoingConnectionError` path.
+                if !swarm.is_connected(&peer) {
+                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+                        .addresses(vec![addr])
+                        .build();
+                    if let Err(err) = swarm.dial(opts) {
+                        let _ = events.send(P2pEvent::DialFailed {
+                            peer: Some(peer),
+                            reason: err.to_string(),
+                        });
+                    }
+                }
             }
         }
         libp2p::mdns::Event::Expired(_) => {}
