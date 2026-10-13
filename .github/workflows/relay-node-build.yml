@@ -70,13 +70,23 @@ jobs:
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/spiritchat-relay
           file "$BIN"
-          # A dynamically linked binary here would defeat the whole point
-          # of the musl target, so fail rather than publish one.
-          if ldd "$BIN" 2>&1 | grep -qv "not a dynamic executable"; then
-            echo "::error::binary is dynamically linked — it will not run on older hosts"
-            ldd "$BIN" || true
+          # The real test is whether the ELF asks for any shared library:
+          # a `NEEDED` entry is exactly that, and its absence is what lets
+          # this run on a host with an older glibc.
+          #
+          # Deliberately not parsing `ldd`'s wording, which was the first
+          # attempt and was wrong: for this binary (static-pie) it prints
+          # "statically linked", while the check expected the other phrase
+          # glibc's ldd uses, "not a dynamic executable" — so a correctly
+          # static binary was rejected. `readelf -d` has no such ambiguity;
+          # static-pie still carries a .dynamic section for its own
+          # relocations, but no NEEDED entries.
+          if readelf -d "$BIN" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::binary links shared libraries — it will not run on older hosts"
+            readelf -d "$BIN" | grep 'NEEDED'
             exit 1
           fi
+          echo "No NEEDED entries — statically linked."
           "$BIN" --help
           ls -lh "$BIN"
 
