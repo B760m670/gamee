@@ -1,0 +1,109 @@
+name: Relay node binary
+
+# Builds `spiritchat-relay` for x86_64 Linux and publishes it to the
+# "relay" release tag, so anyone running a standing relay downloads a
+# binary instead of compiling on the machine they are running it on.
+#
+# That matters more than convenience: a release build of this crate pulls
+# in the whole libp2p tree and peaks well above what a small VPS has
+# spare. On a 2 GB box already running something else, compiling here is
+# a good way to push the real workload into swap or get the compiler
+# OOM-killed.
+#
+# Statically linked against musl rather than the runner's glibc, so one
+# binary runs on any x86_64 Linux regardless of how old the host's glibc
+# is — no "GLIBC_2.39 not found" on a stable-release server.
+
+on:
+  push:
+    branches:
+      - claude/messenger-project-review-i4p3vs
+    paths:
+      - 'packages/relay-node/**'
+      - 'packages/p2p-core/**'
+      - 'packages/ledger-core/**'
+      - 'packages/crypto-core/**'
+      - '.github/workflows/relay-node-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: relay-node-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build static relay binary
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/relay-node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/relay-node/target
+          key: rust-relay-node-musl-${{ runner.os }}-${{ hashFiles('packages/relay-node/**/*.rs', 'packages/relay-node/Cargo.toml', 'packages/p2p-core/**/*.rs', 'packages/p2p-core/Cargo.toml', 'packages/ledger-core/**/*.rs', 'packages/crypto-core/**/*.rs') }}
+          restore-keys: |
+            rust-relay-node-musl-${{ runner.os }}-
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Check it is actually static and runnable
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/spiritchat-relay
+          file "$BIN"
+          # A dynamically linked binary here would defeat the whole point
+          # of the musl target, so fail rather than publish one.
+          if ldd "$BIN" 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "::error::binary is dynamically linked — it will not run on older hosts"
+            ldd "$BIN" || true
+            exit 1
+          fi
+          "$BIN" --help
+          ls -lh "$BIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spiritchat-relay-x86_64-linux
+          path: packages/relay-node/target/x86_64-unknown-linux-musl/release/spiritchat-relay
+          if-no-files-found: error
+
+      - name: Publish to the relay channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: relay
+          name: Relay node binary
+          prerelease: true
+          make_latest: false
+          body: |
+            Static x86_64 Linux build of `spiritchat-relay` (musl, no glibc requirement).
+
+            ```bash
+            curl -L -o spiritchat-relay \
+              https://github.com/${{ github.repository }}/releases/download/relay/spiritchat-relay
+            chmod +x spiritchat-relay
+            sudo mv spiritchat-relay /usr/local/bin/
+            ```
+
+            See `packages/relay-node/README.md` for the flags and a systemd unit.
+
+            Built from ${{ github.sha }}.
+          files: packages/relay-node/target/x86_64-unknown-linux-musl/release/spiritchat-relay
