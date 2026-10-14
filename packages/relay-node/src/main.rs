@@ -280,6 +280,26 @@ async fn main() {
                     P2pEvent::ListeningOn(address) => log(&format!("listening on {address}")),
                     P2pEvent::PublicRelayAnnounced => log("announced as a standing relay in the DHT"),
                     P2pEvent::PublicRelayAnnouncementFailed { reason } => log(&format!("standing-relay announcement FAILED: {reason}")),
+
+                    // Why a relay fails to reach the network, rather than
+                    // silence. A relay that never connects to anything logs
+                    // its listen addresses and then nothing at all, which is
+                    // indistinguishable from one that is working — the
+                    // bootstrap dials fail, and `_ => {}` below used to
+                    // swallow every one of them. Observed on a real
+                    // deployment: zero peers, zero diagnostics, no way to
+                    // tell a DNS problem from a firewall one from a bug.
+                    P2pEvent::DialFailed { peer, reason } => match peer {
+                        Some(peer) => log(&format!("dial FAILED to {peer}: {reason}")),
+                        None => log(&format!("dial FAILED: {reason}")),
+                    },
+                    P2pEvent::PeerIdentified(peer) => log(&format!("peer identified: {peer}")),
+                    P2pEvent::PeerDiscoveredLocally(peer) => log(&format!("peer discovered on the local network: {peer}")),
+                    P2pEvent::AddressesAnnounced => log("own addresses published to the DHT"),
+                    P2pEvent::RelayReservationFailed { reason } => log(&format!("relay reservation FAILED: {reason}")),
+                    P2pEvent::MixRelayDiscovered { peer } => log(&format!("mix relay discovered: {peer}")),
+                    P2pEvent::PublicRelayDiscovered { peer } => log(&format!("standing relay discovered: {peer}")),
+
                     P2pEvent::MailboxDepositStored => log("mailbox deposit accepted into the cache"),
                     P2pEvent::MixForwardFailed { reason } => log(&format!("mix forward failed: {reason}")),
                     P2pEvent::AddressAnnouncementFailed { reason } => log(&format!("address announcement failed: {reason}")),
