@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use libp2p::identify;
@@ -447,12 +447,16 @@ struct MiningState {
 struct Mining {
     active: Option<MiningState>,
     next_generation: u64,
+    /// Share of one core the nonce search may use — see
+    /// `Command::SetMiningIntensity`. 100 until told otherwise, which is
+    /// how this behaved before the setting existed.
+    intensity_percent: u8,
     result_tx: mpsc::UnboundedSender<(u64, Block)>,
 }
 
 impl Mining {
     fn new(result_tx: mpsc::UnboundedSender<(u64, Block)>) -> Self {
-        Mining { active: None, next_generation: 0, result_tx }
+        Mining { active: None, next_generation: 0, intensity_percent: 100, result_tx }
     }
 
     fn stop(&mut self) {
@@ -466,7 +470,7 @@ impl Mining {
         self.next_generation += 1;
         let stop = Arc::new(AtomicBool::new(false));
         self.active = Some(MiningState { public_key, stop: stop.clone(), generation: self.next_generation });
-        spawn_mining_attempt(chain_store, mempool, public_key, stop, self.next_generation, self.result_tx.clone());
+        spawn_mining_attempt(chain_store, mempool, public_key, stop, self.next_generation, self.intensity_percent, self.result_tx.clone());
     }
 
     /// A no-op unless mining is currently enabled — kills whatever attempt
@@ -493,6 +497,7 @@ fn spawn_mining_attempt(
     public_key: [u8; 32],
     stop: Arc<AtomicBool>,
     generation: u64,
+    intensity_percent: u8,
     result_tx: mpsc::UnboundedSender<(u64, Block)>,
 ) {
     let (Ok(difficulty_target), Ok(median_time_past)) =
@@ -539,7 +544,7 @@ fn spawn_mining_attempt(
         miner_public_key: public_key,
     };
 
-    tokio::task::spawn_blocking(move || mine(header, selected, stop, generation, result_tx));
+    tokio::task::spawn_blocking(move || mine(header, selected, stop, generation, intensity_percent, result_tx));
 }
 
 /// The actual nonce search — pure CPU work, deliberately kept free of any
@@ -553,11 +558,18 @@ fn mine(
     transactions: Vec<Transaction>,
     stop: Arc<AtomicBool>,
     generation: u64,
+    intensity_percent: u8,
     result_tx: mpsc::UnboundedSender<(u64, Block)>,
 ) {
     const CHECK_INTERVAL: u64 = 50_000;
     let target = expand_target(header.difficulty_target);
     let mut attempts: u64 = 0;
+    // How long each batch of `CHECK_INTERVAL` hashes took, so the pause
+    // after it can be derived from real elapsed time rather than a guessed
+    // hash rate — the same percentage then means the same thing on a phone
+    // and on a server.
+    let intensity = intensity_percent.clamp(1, 100) as u64;
+    let mut batch_started = Instant::now();
     loop {
         if header.hash().meets_target(&target) {
             let _ = result_tx.send((generation, Block { header, transactions }));
@@ -569,7 +581,19 @@ fn mine(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
+            // Work for `intensity` parts, idle for the other `100 -
+            // intensity`, so the loop averages that share of one core.
+            // Skipped entirely at 100, where the arithmetic is zero anyway
+            // and a syscall per batch would be pure waste.
+            if intensity < 100 {
+                let worked = batch_started.elapsed();
+                let idle = worked.mul_f64((100 - intensity) as f64 / intensity as f64);
+                // `stop` is only read once per batch, so an unbounded sleep
+                // here would delay a stale attempt's exit by that long.
+                std::thread::sleep(idle.min(Duration::from_millis(250)));
+            }
             header.timestamp = header.timestamp.max(now_unix());
+            batch_started = Instant::now();
         }
     }
 }
@@ -1045,6 +1069,14 @@ fn handle_command(
 
         Command::StartMining { public_key } => {
             mining.start(public_key, chain_store, mempool);
+        }
+
+        Command::SetMiningIntensity { percent } => {
+            mining.intensity_percent = percent.clamp(1, 100);
+            // Takes effect on the next attempt rather than the one in
+            // flight — restarting here would throw away whatever work the
+            // current search has already done, for a setting that is not
+            // urgent.
         }
 
         Command::StopMining => {

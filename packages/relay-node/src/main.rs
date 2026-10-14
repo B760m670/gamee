@@ -68,6 +68,8 @@ struct Config {
     port: Option<u16>,
     bootstrap: Vec<Multiaddr>,
     cover_traffic: bool,
+    /// Share of one core mining may use, 1-100. See `--mine-intensity`.
+    mine_intensity: u8,
     mine: bool,
 }
 
@@ -92,6 +94,17 @@ OPTIONS:
                           useful for a private/test network.
   --no-cover-traffic      Disable Loopix cover/loop traffic (on by default here,
                           since a standing relay pays no battery cost).
+  --mine-intensity <1-100>
+                          What share of ONE core mining may use (default: 25).
+                          The nonce search paces itself to this, so it is a good
+                          neighbour on a machine that does something else — no
+                          cgroup or init-system configuration needed. Lowering it
+                          costs this network nothing while miners are few:
+                          difficulty retargets toward a fixed block time, so a
+                          slower miner confirms claims just as promptly against a
+                          proportionally lower difficulty. Raise it if you want
+                          this relay to carry real weight against a competing
+                          miner.
   --no-mine               Don't mine the @username ledger. Mining is ON by default:
                           it is how claims get confirmed, and relays are the only
                           miners left now that the app no longer mines on phones.
@@ -110,6 +123,12 @@ fn parse_args() -> Result<Config, String> {
         bootstrap: Vec::new(),
         cover_traffic: true,
         mine: true,
+        // A quarter of one core by default rather than all of it. The
+        // natural place to run a standing relay is a machine that already
+        // does something else, and while miners are few this costs the
+        // network nothing — difficulty retargets to whatever rate the
+        // miners supply, so claims confirm just as promptly.
+        mine_intensity: 25,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -128,6 +147,14 @@ fn parse_args() -> Result<Config, String> {
             }
             "--no-cover-traffic" => config.cover_traffic = false,
             "--no-mine" => config.mine = false,
+            "--mine-intensity" => {
+                let value = args.next().ok_or("--mine-intensity needs a percentage")?;
+                let percent: u8 = value.parse().map_err(|_| format!("not a percentage: {value}"))?;
+                if !(1..=100).contains(&percent) {
+                    return Err(format!("--mine-intensity must be between 1 and 100, got {percent}"));
+                }
+                config.mine_intensity = percent;
+            }
             "--help" | "-h" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -229,8 +256,12 @@ async fn main() {
         // published to the network in every block header we mined.
         match public_key_bytes_from_seed(&seed) {
             Ok(public_key) => {
+                let _ = node.command(Command::SetMiningIntensity { percent: config.mine_intensity });
                 let _ = node.command(Command::StartMining { public_key });
-                log("mining the @username ledger (one core; --no-mine to disable)");
+                log(&format!(
+                    "mining the @username ledger at {}% of one core (--mine-intensity to change, --no-mine to disable)",
+                    config.mine_intensity
+                ));
             }
             Err(err) => {
                 // Not fatal: a relay that can't mine is still a useful relay,
