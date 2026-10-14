@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns, relay,
+    connection_limits, dcutr, gossipsub, identify, kad, mdns, relay,
     request_response::{self, ProtocolSupport},
     swarm::NetworkBehaviour,
     PeerId, StreamProtocol,
@@ -95,6 +95,25 @@ pub enum BlobResponse {
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
+    /// A ceiling on how many connections this node will hold, enforced
+    /// before anything else gets to see them.
+    ///
+    /// Nothing bounded them before. That is survivable for a phone, which
+    /// nothing is trying to reach, but a standing relay announces itself
+    /// publicly in the DHT and invites the whole network to dial it — and
+    /// it typically shares a machine with something its operator cares
+    /// about. Unbounded, inbound connections grow until the process runs
+    /// out of file descriptors or memory, and the first thing to notice is
+    /// whatever else is on the box.
+    ///
+    /// The numbers are deliberately unexciting: enough headroom that a
+    /// healthy node never meets them (Kademlia keeps far fewer peers
+    /// connected than it knows about), low enough that a hostile or broken
+    /// peer cannot grow this process without limit. `max_established_per_peer`
+    /// is above one on purpose — two peers that discover each other
+    /// simultaneously legitimately open a connection each before one is
+    /// dropped (see node.rs's `ConnectionClosed` handling).
+    pub connection_limits: connection_limits::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub mdns: mdns::tokio::Behaviour,
     pub identify: identify::Behaviour,
@@ -160,6 +179,14 @@ pub fn build(
     ledger_gossip.subscribe(&mix_relay_directory_topic())?;
 
     Ok(Behaviour {
+        connection_limits: connection_limits::Behaviour::new(
+            connection_limits::ConnectionLimits::default()
+                .with_max_established(Some(256))
+                .with_max_established_incoming(Some(128))
+                .with_max_pending_incoming(Some(32))
+                .with_max_pending_outgoing(Some(64))
+                .with_max_established_per_peer(Some(4)),
+        ),
         kad,
         mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
         identify: identify::Behaviour::new(identify::Config::new(
