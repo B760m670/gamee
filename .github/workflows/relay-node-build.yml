@@ -35,7 +35,7 @@ permissions:
 
 jobs:
   build:
-    name: Build static relay binary
+    name: Build static relay binary (x86_64)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -117,3 +117,73 @@ jobs:
 
             Built from ${{ github.sha }}.
           files: packages/relay-node/target/x86_64-unknown-linux-musl/release/spiritchat-relay
+
+  build-arm64:
+    name: Build static relay binary (aarch64)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/relay-node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      # `cross` rather than an apt cross-compiler: this crate pulls in
+      # `ring` (via rustls, and via the rsa support the bootstrap peers
+      # need), which compiles C and is particular about having a matching
+      # sysroot for the target. cross runs the build in a container that
+      # already has one, which is markedly less brittle than gluing a gnu
+      # cross-gcc to a musl target and hoping the headers agree.
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-relay-node-arm64-${{ runner.os }}-${{ hashFiles('packages/relay-node/Cargo.lock') }}
+          restore-keys: |
+            rust-relay-node-arm64-${{ runner.os }}-
+
+      - name: Build
+        run: cross build --release --target aarch64-unknown-linux-musl
+
+      - name: Check it is actually static
+        run: |
+          BIN=target/aarch64-unknown-linux-musl/release/spiritchat-relay
+          file "$BIN"
+          # Same test as the x86_64 job, and for the same reason — see its
+          # own comment. readelf reads a foreign-architecture ELF fine, so
+          # this needs no emulator; running the binary would, which is why
+          # this job checks linkage only and leaves `--help` to the native
+          # job.
+          if readelf -d "$BIN" 2>/dev/null | grep -q 'NEEDED'; then
+            echo "::error::binary links shared libraries — it will not run on a bare Android/Termux setup"
+            readelf -d "$BIN" | grep 'NEEDED'
+            exit 1
+          fi
+          echo "No NEEDED entries — statically linked."
+          cp "$BIN" spiritchat-relay-aarch64
+          ls -lh spiritchat-relay-aarch64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spiritchat-relay-aarch64-linux
+          path: packages/relay-node/spiritchat-relay-aarch64
+          if-no-files-found: error
+
+      - name: Publish to the relay channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: relay
+          name: Relay node binary
+          prerelease: true
+          make_latest: false
+          files: packages/relay-node/spiritchat-relay-aarch64
