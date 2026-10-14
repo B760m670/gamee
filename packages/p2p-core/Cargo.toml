@@ -5,7 +5,23 @@ edition = "2021"
 description = "Serverless peer-to-peer transport for SpiritChat: no relay, no VPS, no infrastructure this project operates. Peers find each other via local mDNS and the public IPFS Kademlia DHT (the same shared, already-running network millions of libp2p/IPFS nodes use), connect directly or through peer-run circuit relays with hole-punching, and exchange already end-to-end-encrypted envelopes and content-addressed blobs (e.g. avatars) produced by spiritchat-crypto-core, served directly from each device rather than hosted anywhere."
 
 [dependencies]
-libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "kad", "mdns", "identify", "relay", "dcutr", "request-response", "gossipsub", "cbor", "macros", "tokio"] }
+# `rsa` is not an optional extra here, it is what makes the public IPFS
+# bootstrap set reachable at all.
+#
+# Every one of the four bootstrap peers has a `Qm…` peer id, which is a
+# multihash of an **RSA** public key (the modern `12D3Koo…` form is
+# Ed25519). Without this feature, libp2p-identity cannot decode their
+# keys, so the handshake fails on every single one with "Invalid public
+# key: Key decoding error: cargo feature `rsa` is not enabled" — a node
+# that resolves them, reaches them, and still never joins the DHT.
+#
+# Their advertised addresses also include `/wss/` entries, which this
+# build rejects as "Unsupported resolved address". Deliberately left that
+# way: the builder's `with_websocket` is async, so adding it would make
+# swarm construction async and ripple through the FFI and Swift callers,
+# and those peers advertise plain `/tcp/4001` and `/quic-v1` addresses
+# too — the wss ones are redundant dial candidates, not the only route.
+libp2p = { version = "0.56", features = ["tcp", "quic", "dns", "noise", "yamux", "kad", "mdns", "identify", "relay", "dcutr", "request-response", "gossipsub", "cbor", "macros", "tokio", "rsa"] }
 spiritchat-ledger-core = { path = "../ledger-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"
