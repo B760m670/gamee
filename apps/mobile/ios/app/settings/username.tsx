@@ -112,9 +112,20 @@ export default function UsernameScreen() {
         const owner = await queryLedgerUsernameOwner(normalized)
         if (cancelled || owner.status !== 'found') return
         if (owner.ownerPublicKeyBase64 !== publicKey) {
+          // Clear any locally saved copy too: the chain is the authority on
+          // who holds a name, and a profile still showing it would be
+          // claiming something untrue.
+          if (savedUsername === normalized) await persistUsername('')
           setSubmit({ kind: 'rejected', reason: 'Кто-то другой закрепил это имя раньше' })
           return
         }
+        // On-chain and ours: now it is genuinely this account's name, so
+        // the profile can show it. Done at first sight rather than at full
+        // confirmation depth, because the user may well close this screen
+        // before then and the effect stops with it — and if a reorg later
+        // hands the name to someone else, the branch above catches that on
+        // the next tip change.
+        await persistUsername(normalized)
         const tip = await queryLedgerChainTip()
         if (cancelled) return
         const depth = tip.height - owner.claimedAtHeight + 1
@@ -160,7 +171,12 @@ export default function UsernameScreen() {
     setSubmit({ kind: 'submitting' })
     try {
       await submitLedgerUsernameClaim(normalized)
-      await persistUsername(normalized)
+      // Deliberately *not* saved to the profile here. Submitting a claim
+      // puts it in the mempool; it becomes this account's name only once a
+      // block carries it, which may be minutes away and may never happen
+      // (nobody is obliged to mine). Saving it now made the profile show a
+      // name the chain had never heard of — and the claim screen say it was
+      // still waiting at the same time.
       setSubmit({ kind: 'pending' })
     } catch (e) {
       setSubmit({ kind: 'rejected', reason: e instanceof Error ? e.message : 'Не удалось отправить заявку' })
