@@ -328,6 +328,23 @@ async fn main() {
                     // count is more informative than a line per peer — a
                     // relay on the public DHT churns through hundreds.
                     P2pEvent::PeerConnected(peer) => {
+                        // Catch this relay's own ledger up to whatever the
+                        // new peer has. Without this a relay could never
+                        // get the chain at all: gossip only carries *new*
+                        // blocks, and a node at height 0 cannot apply a
+                        // block at height 5000 — it has none of its
+                        // parents. So a relay that started after a miner
+                        // stayed empty forever, and every phone that
+                        // synced from it got an empty chain back, which is
+                        // what made a submitted @username claim sit
+                        // unconfirmed with no explanation.
+                        //
+                        // Sent to every peer, as the app does: most of
+                        // them are ordinary IPFS nodes that do not speak
+                        // this protocol, and those requests simply fail.
+                        // A no-op when this node's chain is already at
+                        // least as heavy.
+                        let _ = node.command(Command::RequestChainSync { peer });
                         connected_peers.insert(peer);
                         peer_events += 1;
                         if peer_events <= PEER_EVENTS_LOGGED_IN_FULL {
@@ -399,6 +416,7 @@ async fn main() {
                     P2pEvent::MixForwardFailed { reason } => log(&format!("mix forward failed: {reason}")),
                     P2pEvent::AddressAnnouncementFailed { reason } => log(&format!("address announcement failed: {reason}")),
                     P2pEvent::ChainTipChanged { height, .. } => log(&format!("ledger tip now at height {height}")),
+                    P2pEvent::ChainSyncCompleted { height } => log(&format!("ledger synced, now at height {height}")),
                     // Distinct from the tip moving, which also fires for blocks
                     // received from other peers: this one is a block *this*
                     // relay found, so it's the only line that tells an operator
