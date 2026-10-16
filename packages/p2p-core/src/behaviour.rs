@@ -106,13 +106,24 @@ pub struct Behaviour {
     /// out of file descriptors or memory, and the first thing to notice is
     /// whatever else is on the box.
     ///
-    /// The numbers are deliberately unexciting: enough headroom that a
-    /// healthy node never meets them (Kademlia keeps far fewer peers
-    /// connected than it knows about), low enough that a hostile or broken
-    /// peer cannot grow this process without limit. `max_established_per_peer`
-    /// is above one on purpose — two peers that discover each other
-    /// simultaneously legitimately open a connection each before one is
-    /// dropped (see node.rs's `ConnectionClosed` handling).
+    /// These are a ceiling against unbounded growth, not a tuning knob,
+    /// and the first attempt got that backwards. 256 established with 128
+    /// inbound sounded conservative and was simply wrong: a standing relay
+    /// in the public DHT settles at two hundred-odd peers, mostly inbound,
+    /// so the inbound limit was reached in ordinary operation. Past it,
+    /// libp2p refuses the connection mid-handshake and the dialling peer
+    /// sees only "Handshake failed: unexpected end of file" — which is how
+    /// a phone was unable to reach a relay that was working perfectly.
+    ///
+    /// The limit has to sit well above what a healthy node reaches on its
+    /// own, or it stops being a safety net and becomes the fault. Worth
+    /// pairing with a raised `LimitNOFILE`, since every connection costs
+    /// descriptors; the relay's own systemd unit sets 65536.
+    ///
+    /// `max_established_per_peer` is above one on purpose — two peers that
+    /// discover each other simultaneously legitimately open a connection
+    /// each before one is dropped (see node.rs's `ConnectionClosed`
+    /// handling).
     pub connection_limits: connection_limits::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     /// Local-network peer discovery, **optional at runtime**.
@@ -196,10 +207,10 @@ pub fn build(
     Ok(Behaviour {
         connection_limits: connection_limits::Behaviour::new(
             connection_limits::ConnectionLimits::default()
-                .with_max_established(Some(256))
-                .with_max_established_incoming(Some(128))
-                .with_max_pending_incoming(Some(32))
-                .with_max_pending_outgoing(Some(64))
+                .with_max_established(Some(1024))
+                .with_max_established_incoming(Some(768))
+                .with_max_pending_incoming(Some(128))
+                .with_max_pending_outgoing(Some(128))
                 .with_max_established_per_peer(Some(4)),
         ),
         kad,
