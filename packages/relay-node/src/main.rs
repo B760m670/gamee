@@ -31,6 +31,8 @@
 //! degrades exactly as if one more phone went offline. Anyone can run
 //! any number of these.
 
+mod blocked_syscall;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -207,6 +209,11 @@ fn log(message: &str) {
 
 #[tokio::main]
 async fn main() {
+    // Before anything else, so a host that forbids a system call says so
+    // instead of leaving a bare "Bad system call" behind. Costs one
+    // `sigaction` and changes nothing on a host that forbids nothing.
+    blocked_syscall::report_blocked_syscalls();
+
     let config = match parse_args() {
         Ok(config) => config,
         Err(message) => {
