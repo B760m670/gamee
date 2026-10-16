@@ -242,20 +242,40 @@ impl P2pNode {
         // was never going to use. Only being left with *no* listener at
         // all is a real error.
         let port = listen_port.unwrap_or(0);
-        let candidates = [
-            format!("/ip4/0.0.0.0/tcp/{port}"),
-            format!("/ip4/0.0.0.0/udp/{port}/quic-v1"),
-            format!("/ip6/::/tcp/{port}"),
-            format!("/ip6/::/udp/{port}/quic-v1"),
-        ];
         let mut listen_errors: Vec<String> = Vec::new();
         let mut listening = false;
-        for addr in candidates {
+        for addr in wildcard_listen_addresses(port) {
             match swarm.listen_on(addr.parse().expect("valid multiaddr")) {
                 Ok(_) => listening = true,
-                Err(source) => listen_errors.push(format!("{addr}: {source}")),
+                // Debug rather than Display: the error that matters here —
+                // the interface watcher being refused — renders as an empty
+                // string through Display, which makes for a diagnostic that
+                // says only "it failed".
+                Err(source) => listen_errors.push(format!("{addr}: {source:?}")),
             }
         }
+
+        // Android refuses the wildcard case specifically. libp2p-tcp only
+        // creates an interface watcher when the listen address is
+        // unspecified (`0.0.0.0`/`::`), and that watcher needs a netlink
+        // socket, which Android does not grant ordinary apps — so every
+        // wildcard listen fails there while a concrete address would have
+        // worked. Falling back to this device's own addresses is what lets
+        // a node run on a phone at all.
+        //
+        // The addresses are found by asking the routing table, not by
+        // enumerating interfaces: a UDP socket "connected" to a public
+        // address picks a source address without sending anything, and
+        // needs none of the permissions enumeration does.
+        if !listening {
+            for addr in routed_listen_addresses(port) {
+                match swarm.listen_on(addr.parse().expect("valid multiaddr")) {
+                    Ok(_) => listening = true,
+                    Err(source) => listen_errors.push(format!("{addr}: {source:?}")),
+                }
+            }
+        }
+
         if !listening {
             return Err(P2pError::Listen { details: listen_errors.join("; ") });
         }
@@ -372,6 +392,82 @@ fn dns_resolver_opts() -> libp2p::dns::ResolverOpts {
     let mut opts = libp2p::dns::ResolverOpts::default();
     opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
     opts
+}
+
+/// The addresses a node listens on when nothing stands in the way: every
+/// interface, both families, both transports.
+fn wildcard_listen_addresses(port: u16) -> Vec<String> {
+    vec![
+        format!("/ip4/0.0.0.0/tcp/{port}"),
+        format!("/ip4/0.0.0.0/udp/{port}/quic-v1"),
+        format!("/ip6/::/tcp/{port}"),
+        format!("/ip6/::/udp/{port}/quic-v1"),
+    ]
+}
+
+/// Concrete per-family addresses for the fallback described at the call
+/// site, derived from the routing table rather than from an interface
+/// listing.
+fn routed_listen_addresses(port: u16) -> Vec<String> {
+    let mut addresses = Vec::new();
+    // The targets are never contacted — a connected UDP socket sends
+    // nothing — they only tell the kernel which route, and therefore which
+    // source address, this host would use to reach the wider internet.
+    if let Some(ip) = routed_source_address("0.0.0.0:0", "1.1.1.1:53") {
+        addresses.push(format!("/ip4/{ip}/tcp/{port}"));
+        addresses.push(format!("/ip4/{ip}/udp/{port}/quic-v1"));
+    }
+    if let Some(ip) = routed_source_address("[::]:0", "[2606:4700:4700::1111]:53") {
+        addresses.push(format!("/ip6/{ip}/tcp/{port}"));
+        addresses.push(format!("/ip6/{ip}/udp/{port}/quic-v1"));
+    }
+    addresses
+}
+
+/// The source address this host would use to reach `target`, or `None` if
+/// that family has no route at all. Loopback and unspecified results are
+/// discarded: binding to them would produce a node reachable only by
+/// itself, which is worse than having no listener on that family.
+fn routed_source_address(bind: &str, target: &str) -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(target).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+#[cfg(test)]
+mod listen_address_tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_addresses_cover_both_families_and_transports() {
+        let addrs = wildcard_listen_addresses(4001);
+        assert_eq!(addrs.len(), 4);
+        for addr in &addrs {
+            addr.parse::<Multiaddr>().expect("wildcard address is a valid multiaddr");
+        }
+        assert!(addrs.iter().any(|a| a.starts_with("/ip6/")), "IPv6 must be among them");
+        assert!(addrs.iter().any(|a| a.contains("quic-v1")), "QUIC must be among them");
+    }
+
+    /// The fallback only runs where the wildcard listen is refused — which
+    /// is to say, never on a normal Linux host, including CI. Asserting
+    /// what it *produces* rather than that it produces anything keeps this
+    /// meaningful without making it depend on the sandbox having a route.
+    #[test]
+    fn routed_addresses_are_well_formed_and_never_loopback() {
+        for addr in routed_listen_addresses(4001) {
+            let parsed: Multiaddr = addr.parse().expect("routed address is a valid multiaddr");
+            assert!(
+                !addr.contains("/ip4/127.") && !addr.contains("/ip6/::1"),
+                "a loopback listener would be reachable only by this device: {parsed}"
+            );
+            assert!(
+                !addr.contains("/ip4/0.0.0.0") && !addr.contains("/ip6/::/"),
+                "the fallback exists precisely because unspecified addresses fail: {parsed}"
+            );
+        }
+    }
 }
 
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
