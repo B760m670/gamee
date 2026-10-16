@@ -26,6 +26,34 @@ pub const ENVELOPE_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/e
 /// depends on it; `ENVELOPE_PROTOCOL` support is what actually matters).
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "/spiritchat/1.0.0";
 
+/// This project's own Kademlia, which is where every record this network
+/// stores actually lives.
+///
+/// It would be simpler to keep using the public IPFS DHT for records too,
+/// and that is what this did at first. It cannot work, for a reason that
+/// has nothing to do with whether the IPFS nodes accept the writes.
+///
+/// Kademlia does not store a record "somewhere". It stores it on the
+/// nodes whose ids are numerically closest to the record's key, and
+/// answers a lookup by walking toward those same nodes. Closeness is
+/// measured against everyone in the routing table — and in the public
+/// DHT, that is on the order of twenty thousand IPFS nodes against a
+/// handful of ours. The chance that one of ours lands among the closest
+/// peers for any given key rounds to zero. So every record this network
+/// wrote would be handed to strangers who have no interest in keeping
+/// it, and every read would depend on those strangers having kept it.
+///
+/// The public DHT is not broken for this. It is simply somebody else's
+/// store, sized for somebody else's keys.
+///
+/// A separate protocol name is the whole mechanism: a peer that does not
+/// speak it never enters this routing table, so "closest" is measured
+/// only among nodes that run this software and want these records. It
+/// also takes this network's keys out of a public, crawlable index,
+/// which is worth as much as the functional fix — mailbox tags and
+/// rendezvous keys in the public DHT are metadata anyone may harvest.
+pub const PRIVATE_DHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/kad/1.0.0");
+
 /// The wire protocol for fetching a content-addressed blob (e.g. an avatar
 /// image) directly from the peer that registered it via
 /// `Command::SetLocalBlob`. There is nowhere else these bytes live — no
@@ -125,7 +153,21 @@ pub struct Behaviour {
     /// each before one is dropped (see node.rs's `ConnectionClosed`
     /// handling).
     pub connection_limits: connection_limits::Behaviour,
+    /// This network's own DHT — every `put_record`/`get_record` in this
+    /// crate goes here. See `PRIVATE_DHT_PROTOCOL` for why it cannot be
+    /// the public one.
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
+    /// The public IPFS DHT, kept for exactly one job: *finding* the peers
+    /// that speak `PRIVATE_DHT_PROTOCOL`, via the standing-relay provider
+    /// key, plus the bootstrap walk that makes that lookup possible.
+    ///
+    /// Provider records are the one thing the public DHT does do for us.
+    /// They are announced and found by content routing, which the IPFS
+    /// nodes serve for anyone, and a relay really did announce itself
+    /// this way — so a fresh install with no contacts and no local peers
+    /// still has somewhere to start. Nothing of this network's own data
+    /// is written here.
+    pub kad_public: kad::Behaviour<kad::store::MemoryStore>,
     /// Local-network peer discovery, **optional at runtime**.
     ///
     /// mDNS is the one behaviour here that touches the OS when it is
@@ -186,10 +228,24 @@ pub fn build(
     // walk to the key's closest peers before concluding nobody has it —
     // capping this at a shorter, still realistic bound keeps that worst
     // case from stretching a UI "checking..." state out past a minute.
-    let mut kad_config = kad::Config::default();
+    let mut kad_config = kad::Config::new(PRIVATE_DHT_PROTOCOL);
     kad_config.set_query_timeout(Duration::from_secs(25));
     let mut kad = kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), kad_config);
     kad.set_mode(Some(kad::Mode::Server));
+
+    // The public instance keeps the stock `/ipfs/kad/1.0.0` protocol,
+    // because speaking IPFS's own name is the entire point of it. Its
+    // longer timeout is deliberate: a walk across the public DHT visits
+    // far more hops than one across this network, and the 25s above was
+    // chosen for a lookup that fails fast on a small keyspace, not for
+    // content routing among twenty thousand strangers.
+    let mut public_config = kad::Config::default();
+    public_config.set_query_timeout(Duration::from_secs(60));
+    let mut kad_public =
+        kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), public_config);
+    // Server mode here is a courtesy to IPFS, not a requirement of ours:
+    // nothing of this network's is stored in it either way.
+    kad_public.set_mode(Some(kad::Mode::Server));
 
     // Signed (not Anonymous) message authenticity: `propagation_source` on
     // a received `Message` is still just "who forwarded it to us" either
@@ -214,6 +270,7 @@ pub fn build(
                 .with_max_established_per_peer(Some(4)),
         ),
         kad,
+        kad_public,
         // Built best-effort: see the field's own doc comment for why a
         // refusal here must not stop the node from starting.
         mdns: Toggle::from(match mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id) {

@@ -130,10 +130,14 @@ const ADDRESS_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(5);
 /// network needs, and they are the fallback when mDNS is unavailable —
 /// client isolation on a router blocks mDNS while leaving the two devices
 /// routable to each other.
-fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, addresses: &[Multiaddr]) {
+/// Publishes whichever of `addresses` another device could actually dial.
+/// Returns whether a write was issued at all — false means nothing
+/// survived the filter, which is a real outcome the caller may need to
+/// report rather than a silent no-op.
+fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, addresses: &[Multiaddr]) -> bool {
     let publishable: Vec<Multiaddr> = addresses.iter().filter(|addr| is_publishable(addr)).cloned().collect();
     if publishable.is_empty() {
-        return;
+        return false;
     }
     let local_peer = *swarm.local_peer_id();
     let key = rendezvous::record_key_for(&local_peer);
@@ -141,6 +145,7 @@ fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, a
     if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
         pending.announce.insert(query_id);
     }
+    true
 }
 
 /// Whether an address is worth putting in front of another peer.
@@ -280,14 +285,28 @@ impl P2pNode {
             return Err(P2pError::Listen { details: listen_errors.join("; ") });
         }
 
+        // Bootstrap addresses go into both routing tables, because what
+        // they are depends on who passed them. The built-in set is IPFS's
+        // own, and belongs only to the public table; an operator pointing
+        // a node at a relay of this network (`--bootstrap`) means the
+        // private one. Guessing from the address is not possible, and
+        // guessing wrong costs a node its only way in.
+        //
+        // Feeding both is safe because a wrong guess self-corrects: the
+        // first Kademlia request to a peer that does not speak the
+        // protocol fails as unsupported, and libp2p drops it from that
+        // table. An IPFS node put into the private table leaves it again
+        // without ever having been asked to hold a record.
         let have_bootstrap_peers = !bootstrap_addresses.is_empty();
         for addr in bootstrap_addresses {
             if let Some(peer) = peer_id_of(&addr) {
-                swarm.behaviour_mut().kad.add_address(&peer, addr);
+                swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                swarm.behaviour_mut().kad_public.add_address(&peer, addr);
             }
         }
         if have_bootstrap_peers {
             let _ = swarm.behaviour_mut().kad.bootstrap();
+            let _ = swarm.behaviour_mut().kad_public.bootstrap();
         }
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -817,7 +836,7 @@ async fn run_event_loop(
                     // PUBLIC_RELAY_DISCOVERY_INTERVAL tick, so a fresh
                     // install's time-to-usable-relay is bounded by this
                     // lookup, not by a timer.
-                    let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+                    let query_id = swarm.behaviour_mut().kad_public.get_providers(public_relay::provider_key());
                     pending.discover_public_relays.insert(query_id);
                 }
                 handle_swarm_event(
@@ -865,7 +884,7 @@ async fn run_event_loop(
                 // gossip directory isn't already providing.
                 let can_originate = known_mix_relays.values().any(|peer| known_mix_routing_keys.contains_key(peer));
                 if dht_ready && !can_originate {
-                    let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+                    let query_id = swarm.behaviour_mut().kad_public.get_providers(public_relay::provider_key());
                     pending.discover_public_relays.insert(query_id);
                 }
             }
@@ -975,12 +994,25 @@ fn handle_command(
             pending.resolve_peer.insert(query_id, peer);
         }
 
+        // Deliberately the same path, and the same filter, as the
+        // automatic announcement above. Two writers to one DHT key with
+        // different ideas of what belongs in it is a race whoever writes
+        // last wins — and they alternated, so a node's published record
+        // flickered between "with loopback" and "without" depending on
+        // which fired more recently. The relay was the one caller, and it
+        // passes its raw listen addresses, loopback included, which is
+        // precisely what nobody else can dial.
+        //
+        // An explicit request that leaves nothing publishable is answered
+        // rather than dropped: a caller waiting on AddressesAnnounced
+        // would otherwise wait forever for a write that was never going
+        // to happen.
         Command::AnnounceAddresses { addresses } => {
-            let local_peer = *swarm.local_peer_id();
-            let key = rendezvous::record_key_for(&local_peer);
-            let record = Record::new(key, rendezvous::encode_addresses(&addresses));
-            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
-                pending.announce.insert(query_id);
+            if !announce_own_addresses(swarm, pending, &addresses) {
+                let _ = events.send(P2pEvent::AddressAnnouncementFailed {
+                    reason: "none of the given addresses are reachable from outside this device"
+                        .to_string(),
+                });
             }
         }
 
@@ -1071,7 +1103,7 @@ fn handle_command(
         }
 
         Command::AnnouncePublicRelay => {
-            match swarm.behaviour_mut().kad.start_providing(public_relay::provider_key()) {
+            match swarm.behaviour_mut().kad_public.start_providing(public_relay::provider_key()) {
                 Ok(query_id) => {
                     pending.announce_public_relay.insert(query_id);
                 }
@@ -1086,7 +1118,7 @@ fn handle_command(
         }
 
         Command::DiscoverPublicRelays => {
-            let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+            let query_id = swarm.behaviour_mut().kad_public.get_providers(public_relay::provider_key());
             pending.discover_public_relays.insert(query_id);
         }
 
@@ -1293,7 +1325,11 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Kad(kad_event)) => {
-            handle_kad_event(swarm, pending, events, kad_event);
+            handle_kad_event(pending, events, kad_event);
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::KadPublic(kad_event)) => {
+            handle_public_kad_event(swarm, pending, events, kad_event);
         }
 
         // Kademlia's routing table is *not* populated automatically from
@@ -1305,13 +1341,29 @@ fn handle_swarm_event(
         // empty routing table even while directly connected to them, and
         // every put_record/get_record would fail for lack of anyone to
         // ask.
+        //
+        // identify also says which protocols the peer speaks, and that is
+        // what keeps the private table private. Every peer is offered to
+        // the public table — a standing relay holds two hundred-odd IPFS
+        // nodes and they are exactly who serves the provider lookups it
+        // depends on. Only a peer that advertises this network's own
+        // Kademlia enters the private one, so "the nodes closest to this
+        // key" means nodes that run this software, however many IPFS
+        // nodes happen to be connected.
         SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
             ..
         })) => {
+            let speaks_our_dht = info
+                .protocols
+                .iter()
+                .any(|protocol| *protocol == behaviour::PRIVATE_DHT_PROTOCOL);
             for addr in info.listen_addrs {
-                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                if speaks_our_dht {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                }
+                swarm.behaviour_mut().kad_public.add_address(&peer_id, addr);
             }
             let _ = events.send(P2pEvent::PeerIdentified(peer_id));
         }
@@ -1356,7 +1408,18 @@ fn handle_mdns_event(
     }
 }
 
-fn handle_kad_event(
+/// Results from the public IPFS DHT, which this node uses only to find
+/// the peers that speak its own.
+///
+/// Kept apart from `handle_kad_event` rather than merged for a reason
+/// that is easy to miss and impossible to debug afterwards: the two
+/// Kademlia behaviours number their queries independently, both from
+/// zero, so a public query and a private one routinely carry the *same*
+/// `QueryId`. That is harmless only as long as each handler consults
+/// only its own sets in `Pending` — these two, and no others. Merge
+/// them and a provider lookup will happily complete somebody's contact
+/// card announcement.
+fn handle_public_kad_event(
     swarm: &mut Swarm<Behaviour>,
     pending: &mut Pending,
     events: &mpsc::UnboundedSender<P2pEvent>,
@@ -1409,6 +1472,20 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::PublicRelayAnnouncementFailed { reason: err.to_string() });
             }
         }
+        _ => {}
+    }
+}
+
+fn handle_kad_event(
+    pending: &mut Pending,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    event: kad::Event,
+) {
+    let kad::Event::OutboundQueryProgressed { id, result, .. } = event else {
+        return;
+    };
+
+    match result {
         QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(found))) => {
             if let Some(peer) = pending.resolve_peer.remove(&id) {
                 let addresses = rendezvous::decode_addresses(&found.record.value);
