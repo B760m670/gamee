@@ -8,7 +8,7 @@ use std::time::Duration;
 use libp2p::{
     connection_limits, dcutr, gossipsub, identify, kad, mdns, relay,
     request_response::{self, ProtocolSupport},
-    swarm::NetworkBehaviour,
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour},
     PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
@@ -115,7 +115,22 @@ pub struct Behaviour {
     /// dropped (see node.rs's `ConnectionClosed` handling).
     pub connection_limits: connection_limits::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
-    pub mdns: mdns::tokio::Behaviour,
+    /// Local-network peer discovery, **optional at runtime**.
+    ///
+    /// mDNS is the one behaviour here that touches the OS when it is
+    /// built: it opens a UDP socket on 5353 and joins a multicast group.
+    /// Android refuses that to ordinary apps, so on a phone — in Termux,
+    /// or any container sharing the app's network namespace — the call
+    /// fails with `EPERM` and, when it was mandatory, took the entire node
+    /// down with "failed to build behaviour: Permission denied" before a
+    /// single connection was attempted.
+    ///
+    /// Losing it costs only discovery of peers on the same local network.
+    /// Everything that makes a node useful — the DHT, the mix, mailboxes,
+    /// the ledger — is unaffected, and a phone is the last place where
+    /// same-LAN discovery was going to matter. Refusing to start at all
+    /// over it was badly out of proportion.
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub identify: identify::Behaviour,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
@@ -188,7 +203,19 @@ pub fn build(
                 .with_max_established_per_peer(Some(4)),
         ),
         kad,
-        mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
+        // Built best-effort: see the field's own doc comment for why a
+        // refusal here must not stop the node from starting.
+        mdns: Toggle::from(match mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id) {
+            Ok(behaviour) => Some(behaviour),
+            Err(err) => {
+                // No tracing in this crate, and the caller gets a node that
+                // works — so this is the only record that local discovery
+                // is off, which beats silence when someone wonders why two
+                // devices on one network cannot see each other.
+                eprintln!("[p2p-core] local-network discovery (mDNS) unavailable, continuing without it: {err}");
+                None
+            }
+        }),
         identify: identify::Behaviour::new(identify::Config::new(
             IDENTIFY_PROTOCOL_VERSION.to_string(),
             key.public(),
