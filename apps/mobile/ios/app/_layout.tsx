@@ -19,6 +19,7 @@ import { useChatStore } from '../store/chat'
 import { useGroupStore } from '../store/groups'
 import { useContactsStore } from '../store/contacts'
 import { useConsentStore } from '../store/consent'
+import { useNetworkStore } from '../store/network'
 import { handlePeerAvatarEvent } from '../store/peerAvatars'
 
 const queryClient = new QueryClient({
@@ -152,6 +153,12 @@ export default function RootLayout() {
       if (event.type === 'peerConnected') {
         requestLedgerChainSync(event.peerId).catch(() => {})
       }
+
+      // Observational only — see store/network.ts. Fed from this one
+      // global listener rather than from the diagnostics screen's own,
+      // so the screen shows the connection history since launch instead
+      // of only what happened while it was open.
+      useNetworkStore.getState().handleEvent(event)
 
       handlePeerAvatarEvent(event)
       handleRecoveryBackupEvent(event)

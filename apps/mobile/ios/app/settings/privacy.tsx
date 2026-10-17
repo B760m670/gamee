@@ -9,6 +9,8 @@ import {
   mixRelayParticipationEnabled,
   setMixRelayParticipationEnabled,
   mixDummyTrafficBytesPerHourEstimate,
+  allowsDirectDelivery,
+  setAllowsDirectDelivery,
 } from '../../modules/spiritchat-crypto-core'
 
 const BTN_H = 42
@@ -24,9 +26,16 @@ export default function PrivacyScreen() {
   const [mixRelayEnabled, setMixRelayEnabled] = useState(() => mixRelayParticipationEnabled())
   const [trafficEstimate] = useState(() => mixDummyTrafficBytesPerHourEstimate())
 
+  const [directAllowed, setDirectAllowed] = useState(() => allowsDirectDelivery())
+
   const toggleMixRelay = (value: boolean) => {
     setMixRelayParticipationEnabled(value)
     setMixRelayEnabled(value)
+  }
+
+  const toggleDirect = (value: boolean) => {
+    setAllowsDirectDelivery(value)
+    setDirectAllowed(value)
   }
 
   return (
@@ -81,6 +90,30 @@ export default function PrivacyScreen() {
             value={mixRelayEnabled}
             onValueChange={toggleMixRelay}
             trackColor={{ false: '#3a3a3c', true: '#06b6d4' }}
+          />
+        </Pressable>
+
+        <View style={s.rowGap} />
+
+        <Pressable onPress={() => toggleDirect(!directAllowed)} style={s.toggleRow}>
+          <View style={[s.iconWrap, { backgroundColor: '#f59e0b' }]}>
+            <Ionicons name="flash" size={15} color="#fff" />
+          </View>
+          <View style={s.toggleTextWrap}>
+            <Text style={s.toggleTitle}>Прямая доставка при недоступной сети</Text>
+            <Text style={s.rowSubLabel}>
+              Обычно сообщения идут через анонимную сеть, и наблюдатель видит связь
+              с промежуточным узлом, а не с человеком. Шифрование скрывает, что вы
+              написали; только анонимная сеть скрывает, кому.
+              {'\n'}Если включить, то когда анонимный путь недоступен, сообщение уйдёт
+              напрямую собеседнику — быстрее и надёжнее, но ваш оператор связи увидит,
+              с кем именно вы общаетесь. Выключено — сообщение подождёт.
+            </Text>
+          </View>
+          <Switch
+            value={directAllowed}
+            onValueChange={toggleDirect}
+            trackColor={{ false: '#3a3a3c', true: '#f59e0b' }}
           />
         </Pressable>
       </View>

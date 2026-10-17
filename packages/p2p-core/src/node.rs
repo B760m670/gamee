@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use libp2p::identify;
@@ -91,6 +91,98 @@ const MIX_PATH_HOPS: usize = 3;
 /// interval rather than "whenever the app happens to ask".
 const PUBLIC_RELAY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(120);
 
+/// How often this node re-publishes its own addresses into the DHT under
+/// `rendezvous::record_key_for(local_peer_id)`.
+///
+/// Republishing at all is not optional: a Kademlia record expires, and the
+/// peers holding it churn, so a record put once goes stale on its own. The
+/// interval is well inside libp2p's own default record TTL so a lookup
+/// never lands in a window where the record has aged out but nothing has
+/// refreshed it yet.
+const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How soon after the listen-address set changes it gets published.
+///
+/// Deliberately not "immediately, on every `NewListenAddr`": binding
+/// `/ip6/::` and `/ip4/0.0.0.0` reports one address *per interface*, so a
+/// node coming up emits a burst of these within milliseconds of each other.
+/// Publishing per event turns that burst into a burst of Kademlia
+/// `put_record` queries, each superseded by the next and each holding a
+/// query slot until it finishes or times out. Coalescing them into one
+/// publish costs a few seconds of delay on startup and saves every one of
+/// those redundant queries.
+const ADDRESS_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// Publishes this node's current listen addresses into the DHT, so a peer
+/// holding only its `PeerId` (which is all a contact card carries) can
+/// look up somewhere to dial.
+///
+/// Previously this happened only when the app layer explicitly issued
+/// `Command::AnnounceAddresses` — and nothing in the app ever did, so no
+/// device's addresses were ever published and `Command::ResolvePeerAddresses`
+/// could only ever come back empty. Making it automatic is what turns the
+/// rendezvous mechanism from present-but-inert into actually load-bearing.
+///
+/// Addresses that name only this host or only this link are filtered out —
+/// they are useless to a peer looking this record up, and publishing them
+/// just gives it dead addresses to spend dial attempts on. Private LAN
+/// addresses are kept on purpose: they are exactly what a peer on the same
+/// network needs, and they are the fallback when mDNS is unavailable —
+/// client isolation on a router blocks mDNS while leaving the two devices
+/// routable to each other.
+/// Publishes whichever of `addresses` another device could actually dial.
+/// Returns whether a write was issued at all — false means nothing
+/// survived the filter, which is a real outcome the caller may need to
+/// report rather than a silent no-op.
+fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, addresses: &[Multiaddr]) -> bool {
+    let publishable: Vec<Multiaddr> = addresses.iter().filter(|addr| is_publishable(addr)).cloned().collect();
+    if publishable.is_empty() {
+        return false;
+    }
+    let local_peer = *swarm.local_peer_id();
+    let key = rendezvous::record_key_for(&local_peer);
+    let record = Record::new(key, rendezvous::encode_addresses(&publishable));
+    if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
+        pending.announce.insert(query_id);
+    }
+    true
+}
+
+/// Whether an address means anything on a *different* machine — which is
+/// the same question whether we are publishing our own or storing one a
+/// peer told us about.
+///
+/// Loopback names a device to itself. Link-local (IPv6 `fe80::/10`, IPv4
+/// `169.254.0.0/16`) is only meaningful on the interface it came from and
+/// cannot be routed to from anywhere else — and binding `/ip6/::` produces
+/// one of these per interface, so without this filter a published record
+/// would be mostly undialable entries.
+///
+/// Applying it to what identify reports fixes something that reads like a
+/// mystery in the log. IPFS peers advertise their own loopback addresses,
+/// we stored them, and then dialed `/ip4/127.0.0.1/tcp/4001` expecting a
+/// peer in Korea — reaching our own relay, which answered with its own
+/// identity:
+///
+/// ```text
+/// dial FAILED to QmXppAt…: Unexpected peer ID 12D3KooWJRLv… at /ip4/127.0.0.1/tcp/4001/p2p/QmXppAt…
+/// ```
+///
+/// A dozen of those per minute, each one a routing-table entry that can
+/// be handed back as a "closest peer" and fail.
+///
+/// Private ranges (`10/8`, `192.168/16`, `172.16/12`) are deliberately
+/// *not* filtered: unreachable across the internet, but they are exactly
+/// how two phones on one Wi-Fi reach each other, which is a case this
+/// network is meant to serve.
+fn is_publishable(addr: &Multiaddr) -> bool {
+    !addr.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_loopback() || ip.is_link_local(),
+        Protocol::Ip6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xffc0) == 0xfe80,
+        _ => false,
+    })
+}
+
 pub struct P2pNode {
     local_peer_id: PeerId,
     command_tx: mpsc::UnboundedSender<Command>,
@@ -157,24 +249,84 @@ impl P2pNode {
         // which case ReserveRelaySlot is what makes it reachable
         // instead). The resulting address(es) surface as
         // P2pEvent::ListeningOn.
+        //
+        // **IPv6 matters more than it looks here.** Two phones on mobile
+        // networks are normally both behind carrier-grade NAT, where
+        // neither is dialable and a direct connection is impossible
+        // without a third party to coordinate through. But carriers
+        // increasingly hand out real, globally routable IPv6 addresses
+        // (often IPv6-only, with NAT64 covering legacy IPv4) — and two
+        // peers that both have one connect *directly*, with no NAT, no
+        // relay and no hole punching involved at all. Listening only on
+        // IPv4, as this did, silently discarded the single best path
+        // between distant peers.
+        //
+        // Failures are per-family and non-fatal: a host with no IPv6
+        // (or no IPv4) must still come up on whatever it does have,
+        // rather than failing to start a node over an address family it
+        // was never going to use. Only being left with *no* listener at
+        // all is a real error.
         let port = listen_port.unwrap_or(0);
-        let tcp_addr = format!("/ip4/0.0.0.0/tcp/{port}");
-        let quic_addr = format!("/ip4/0.0.0.0/udp/{port}/quic-v1");
-        swarm
-            .listen_on(tcp_addr.parse().expect("valid multiaddr"))
-            .map_err(|source| P2pError::Listen { addr: tcp_addr, source })?;
-        swarm
-            .listen_on(quic_addr.parse().expect("valid multiaddr"))
-            .map_err(|source| P2pError::Listen { addr: quic_addr, source })?;
+        let mut listen_errors: Vec<String> = Vec::new();
+        let mut listening = false;
+        for addr in wildcard_listen_addresses(port) {
+            match swarm.listen_on(addr.parse().expect("valid multiaddr")) {
+                Ok(_) => listening = true,
+                // Debug rather than Display: the error that matters here —
+                // the interface watcher being refused — renders as an empty
+                // string through Display, which makes for a diagnostic that
+                // says only "it failed".
+                Err(source) => listen_errors.push(format!("{addr}: {source:?}")),
+            }
+        }
 
+        // Android refuses the wildcard case specifically. libp2p-tcp only
+        // creates an interface watcher when the listen address is
+        // unspecified (`0.0.0.0`/`::`), and that watcher needs a netlink
+        // socket, which Android does not grant ordinary apps — so every
+        // wildcard listen fails there while a concrete address would have
+        // worked. Falling back to this device's own addresses is what lets
+        // a node run on a phone at all.
+        //
+        // The addresses are found by asking the routing table, not by
+        // enumerating interfaces: a UDP socket "connected" to a public
+        // address picks a source address without sending anything, and
+        // needs none of the permissions enumeration does.
+        if !listening {
+            for addr in routed_listen_addresses(port) {
+                match swarm.listen_on(addr.parse().expect("valid multiaddr")) {
+                    Ok(_) => listening = true,
+                    Err(source) => listen_errors.push(format!("{addr}: {source:?}")),
+                }
+            }
+        }
+
+        if !listening {
+            return Err(P2pError::Listen { details: listen_errors.join("; ") });
+        }
+
+        // Bootstrap addresses go into both routing tables, because what
+        // they are depends on who passed them. The built-in set is IPFS's
+        // own, and belongs only to the public table; an operator pointing
+        // a node at a relay of this network (`--bootstrap`) means the
+        // private one. Guessing from the address is not possible, and
+        // guessing wrong costs a node its only way in.
+        //
+        // Feeding both is safe because a wrong guess self-corrects: the
+        // first Kademlia request to a peer that does not speak the
+        // protocol fails as unsupported, and libp2p drops it from that
+        // table. An IPFS node put into the private table leaves it again
+        // without ever having been asked to hold a record.
         let have_bootstrap_peers = !bootstrap_addresses.is_empty();
         for addr in bootstrap_addresses {
             if let Some(peer) = peer_id_of(&addr) {
-                swarm.behaviour_mut().kad.add_address(&peer, addr);
+                swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                swarm.behaviour_mut().kad_public.add_address(&peer, addr);
             }
         }
         if have_bootstrap_peers {
             let _ = swarm.behaviour_mut().kad.bootstrap();
+            let _ = swarm.behaviour_mut().kad_public.bootstrap();
         }
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -244,13 +396,117 @@ fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<Swarm<Behaviour>> {
         // acceptable trade here since this transport only ever resolves
         // the handful of `/dnsaddr/...` bootstrap addresses in
         // `bootstrap.rs`, not arbitrary user-facing lookups.
-        .with_dns_config(libp2p::dns::ResolverConfig::cloudflare(), libp2p::dns::ResolverOpts::default())
+        .with_dns_config(libp2p::dns::ResolverConfig::cloudflare(), dns_resolver_opts())
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .with_behaviour(behaviour::build)
         .map_err(|err| P2pError::Setup(err.to_string()))?
         .build();
     Ok(swarm)
+}
+
+/// DNS options for the transport, differing from the defaults in exactly
+/// one respect: a lookup returns **both** A and AAAA records rather than
+/// stopping at whichever family answers first.
+///
+/// `ResolverOpts::default()` uses `Ipv4thenIpv6` — query A, and only fall
+/// back to AAAA if that *fails*. On an IPv6-only mobile network (carriers
+/// increasingly run these, with 464XLAT synthesising legacy IPv4) that is
+/// exactly wrong: the A lookup succeeds, so AAAA is never asked for, and
+/// the node is handed an IPv4 address it has no real IPv4 path to. The
+/// dial then sits there until it times out, reported only as
+/// "Failed to negotiate transport protocol(s) … Timeout has been reached".
+///
+/// Observed on a real device: every bootstrap dial timed out this way, so
+/// the node never reached the public DHT — and with no DHT there is no
+/// peer discovery, no address publishing, no ledger sync, and therefore
+/// no `@username` resolution either. Every one of those looked like its
+/// own separate bug.
+///
+/// The bootstrap hosts publish both families (`sv15.bootstrap.libp2p.io`
+/// resolves to `147.135.44.132` and `2604:2dc0:200:484::1`), so asking for
+/// both costs one extra parallel query and lets a node dial whichever
+/// family it can actually route.
+fn dns_resolver_opts() -> libp2p::dns::ResolverOpts {
+    let mut opts = libp2p::dns::ResolverOpts::default();
+    opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
+    opts
+}
+
+/// The addresses a node listens on when nothing stands in the way: every
+/// interface, both families, both transports.
+fn wildcard_listen_addresses(port: u16) -> Vec<String> {
+    vec![
+        format!("/ip4/0.0.0.0/tcp/{port}"),
+        format!("/ip4/0.0.0.0/udp/{port}/quic-v1"),
+        format!("/ip6/::/tcp/{port}"),
+        format!("/ip6/::/udp/{port}/quic-v1"),
+    ]
+}
+
+/// Concrete per-family addresses for the fallback described at the call
+/// site, derived from the routing table rather than from an interface
+/// listing.
+fn routed_listen_addresses(port: u16) -> Vec<String> {
+    let mut addresses = Vec::new();
+    // The targets are never contacted — a connected UDP socket sends
+    // nothing — they only tell the kernel which route, and therefore which
+    // source address, this host would use to reach the wider internet.
+    if let Some(ip) = routed_source_address("0.0.0.0:0", "1.1.1.1:53") {
+        addresses.push(format!("/ip4/{ip}/tcp/{port}"));
+        addresses.push(format!("/ip4/{ip}/udp/{port}/quic-v1"));
+    }
+    if let Some(ip) = routed_source_address("[::]:0", "[2606:4700:4700::1111]:53") {
+        addresses.push(format!("/ip6/{ip}/tcp/{port}"));
+        addresses.push(format!("/ip6/{ip}/udp/{port}/quic-v1"));
+    }
+    addresses
+}
+
+/// The source address this host would use to reach `target`, or `None` if
+/// that family has no route at all. Loopback and unspecified results are
+/// discarded: binding to them would produce a node reachable only by
+/// itself, which is worse than having no listener on that family.
+fn routed_source_address(bind: &str, target: &str) -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(target).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+#[cfg(test)]
+mod listen_address_tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_addresses_cover_both_families_and_transports() {
+        let addrs = wildcard_listen_addresses(4001);
+        assert_eq!(addrs.len(), 4);
+        for addr in &addrs {
+            addr.parse::<Multiaddr>().expect("wildcard address is a valid multiaddr");
+        }
+        assert!(addrs.iter().any(|a| a.starts_with("/ip6/")), "IPv6 must be among them");
+        assert!(addrs.iter().any(|a| a.contains("quic-v1")), "QUIC must be among them");
+    }
+
+    /// The fallback only runs where the wildcard listen is refused — which
+    /// is to say, never on a normal Linux host, including CI. Asserting
+    /// what it *produces* rather than that it produces anything keeps this
+    /// meaningful without making it depend on the sandbox having a route.
+    #[test]
+    fn routed_addresses_are_well_formed_and_never_loopback() {
+        for addr in routed_listen_addresses(4001) {
+            let parsed: Multiaddr = addr.parse().expect("routed address is a valid multiaddr");
+            assert!(
+                !addr.contains("/ip4/127.") && !addr.contains("/ip6/::1"),
+                "a loopback listener would be reachable only by this device: {parsed}"
+            );
+            assert!(
+                !addr.contains("/ip4/0.0.0.0") && !addr.contains("/ip6/::/"),
+                "the fallback exists precisely because unspecified addresses fail: {parsed}"
+            );
+        }
+    }
 }
 
 fn peer_id_of(addr: &Multiaddr) -> Option<PeerId> {
@@ -326,12 +582,16 @@ struct MiningState {
 struct Mining {
     active: Option<MiningState>,
     next_generation: u64,
+    /// Share of one core the nonce search may use — see
+    /// `Command::SetMiningIntensity`. 100 until told otherwise, which is
+    /// how this behaved before the setting existed.
+    intensity_percent: u8,
     result_tx: mpsc::UnboundedSender<(u64, Block)>,
 }
 
 impl Mining {
     fn new(result_tx: mpsc::UnboundedSender<(u64, Block)>) -> Self {
-        Mining { active: None, next_generation: 0, result_tx }
+        Mining { active: None, next_generation: 0, intensity_percent: 100, result_tx }
     }
 
     fn stop(&mut self) {
@@ -345,7 +605,7 @@ impl Mining {
         self.next_generation += 1;
         let stop = Arc::new(AtomicBool::new(false));
         self.active = Some(MiningState { public_key, stop: stop.clone(), generation: self.next_generation });
-        spawn_mining_attempt(chain_store, mempool, public_key, stop, self.next_generation, self.result_tx.clone());
+        spawn_mining_attempt(chain_store, mempool, public_key, stop, self.next_generation, self.intensity_percent, self.result_tx.clone());
     }
 
     /// A no-op unless mining is currently enabled — kills whatever attempt
@@ -372,6 +632,7 @@ fn spawn_mining_attempt(
     public_key: [u8; 32],
     stop: Arc<AtomicBool>,
     generation: u64,
+    intensity_percent: u8,
     result_tx: mpsc::UnboundedSender<(u64, Block)>,
 ) {
     let (Ok(difficulty_target), Ok(median_time_past)) =
@@ -418,7 +679,7 @@ fn spawn_mining_attempt(
         miner_public_key: public_key,
     };
 
-    tokio::task::spawn_blocking(move || mine(header, selected, stop, generation, result_tx));
+    tokio::task::spawn_blocking(move || mine(header, selected, stop, generation, intensity_percent, result_tx));
 }
 
 /// The actual nonce search — pure CPU work, deliberately kept free of any
@@ -432,11 +693,18 @@ fn mine(
     transactions: Vec<Transaction>,
     stop: Arc<AtomicBool>,
     generation: u64,
+    intensity_percent: u8,
     result_tx: mpsc::UnboundedSender<(u64, Block)>,
 ) {
     const CHECK_INTERVAL: u64 = 50_000;
     let target = expand_target(header.difficulty_target);
     let mut attempts: u64 = 0;
+    // How long each batch of `CHECK_INTERVAL` hashes took, so the pause
+    // after it can be derived from real elapsed time rather than a guessed
+    // hash rate — the same percentage then means the same thing on a phone
+    // and on a server.
+    let intensity = intensity_percent.clamp(1, 100) as u64;
+    let mut batch_started = Instant::now();
     loop {
         if header.hash().meets_target(&target) {
             let _ = result_tx.send((generation, Block { header, transactions }));
@@ -448,7 +716,19 @@ fn mine(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
+            // Work for `intensity` parts, idle for the other `100 -
+            // intensity`, so the loop averages that share of one core.
+            // Skipped entirely at 100, where the arithmetic is zero anyway
+            // and a syscall per batch would be pure waste.
+            if intensity < 100 {
+                let worked = batch_started.elapsed();
+                let idle = worked.mul_f64((100 - intensity) as f64 / intensity as f64);
+                // `stop` is only read once per batch, so an unbounded sleep
+                // here would delay a stale attempt's exit by that long.
+                std::thread::sleep(idle.min(Duration::from_millis(250)));
+            }
             header.timestamp = header.timestamp.max(now_unix());
+            batch_started = Instant::now();
         }
     }
 }
@@ -495,6 +775,15 @@ async fn run_event_loop(
     let (mix_forward_tx, mut mix_forward_rx) = mpsc::unbounded_channel::<(PeerId, MixMessage)>();
     let mut dummy_traffic_interval = tokio::time::interval(MIX_DUMMY_TRAFFIC_INTERVAL);
     let mut public_relay_discovery_interval = tokio::time::interval(PUBLIC_RELAY_DISCOVERY_INTERVAL);
+    // Every address this node is currently listening on, accumulated from
+    // `NewListenAddr`, and re-published into the DHT on the interval above
+    // — see `announce_own_addresses`.
+    let mut own_listen_addresses: Vec<Multiaddr> = Vec::new();
+    let mut address_announce_interval = tokio::time::interval(ADDRESS_ANNOUNCE_INTERVAL);
+    let mut address_publish_debounce = tokio::time::interval(ADDRESS_PUBLISH_DEBOUNCE);
+    // Set when `own_listen_addresses` gains an entry, cleared once the
+    // coalesced publish actually goes out.
+    let mut addresses_dirty = false;
     // Gated by `Command::SetMixDummyTrafficActive` — off until the app
     // layer says otherwise (see that command's own doc comment for why).
     let mut mix_dummy_traffic_active = false;
@@ -545,6 +834,17 @@ async fn run_event_loop(
                 }
             }
             swarm_event = swarm.select_next_some() => {
+                // Every new listen address is immediately published, so a
+                // peer holding only this node's PeerId has somewhere to
+                // dial. Intercepted here rather than inside
+                // `handle_swarm_event` purely so the address list can live
+                // in the loop alongside the interval that refreshes it.
+                if let SwarmEvent::NewListenAddr { address, .. } = &swarm_event {
+                    if !own_listen_addresses.contains(address) {
+                        own_listen_addresses.push(address.clone());
+                        addresses_dirty = true;
+                    }
+                }
                 if !dht_ready && matches!(swarm_event, SwarmEvent::ConnectionEstablished { .. }) {
                     dht_ready = true;
                     for command in deferred_commands.drain(..) {
@@ -556,7 +856,7 @@ async fn run_event_loop(
                     // PUBLIC_RELAY_DISCOVERY_INTERVAL tick, so a fresh
                     // install's time-to-usable-relay is bounded by this
                     // lookup, not by a timer.
-                    let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+                    let query_id = swarm.behaviour_mut().kad_public.get_providers(public_relay::provider_key());
                     pending.discover_public_relays.insert(query_id);
                 }
                 handle_swarm_event(
@@ -577,6 +877,25 @@ async fn run_event_loop(
                     emit_dummy_mix_traffic(&mut swarm, &known_mix_relays, &known_mix_routing_keys, local_peer_id, mix_public);
                 }
             }
+            _ = address_publish_debounce.tick() => {
+                // The coalesced publish for a burst of `NewListenAddr`.
+                // Gated on `dht_ready` because a put with no connected peer
+                // resolves to nothing; the flag stays set, so it goes out on
+                // a later tick once there is somewhere to put it.
+                if addresses_dirty && dht_ready {
+                    announce_own_addresses(&mut swarm, &mut pending, &own_listen_addresses);
+                    addresses_dirty = false;
+                }
+            }
+            _ = address_announce_interval.tick() => {
+                // A DHT record expires and the peers holding it churn, so
+                // the put on `NewListenAddr` alone would go stale. Skipped
+                // entirely until the DHT is actually reachable, since a
+                // put with no connected peer resolves to nothing.
+                if dht_ready {
+                    announce_own_addresses(&mut swarm, &mut pending, &own_listen_addresses);
+                }
+            }
             _ = public_relay_discovery_interval.tick() => {
                 // Self-healing for the bootstrap gap public_relay.rs
                 // describes: only while this node can't originate mix
@@ -585,7 +904,7 @@ async fn run_event_loop(
                 // gossip directory isn't already providing.
                 let can_originate = known_mix_relays.values().any(|peer| known_mix_routing_keys.contains_key(peer));
                 if dht_ready && !can_originate {
-                    let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+                    let query_id = swarm.behaviour_mut().kad_public.get_providers(public_relay::provider_key());
                     pending.discover_public_relays.insert(query_id);
                 }
             }
@@ -695,12 +1014,25 @@ fn handle_command(
             pending.resolve_peer.insert(query_id, peer);
         }
 
+        // Deliberately the same path, and the same filter, as the
+        // automatic announcement above. Two writers to one DHT key with
+        // different ideas of what belongs in it is a race whoever writes
+        // last wins — and they alternated, so a node's published record
+        // flickered between "with loopback" and "without" depending on
+        // which fired more recently. The relay was the one caller, and it
+        // passes its raw listen addresses, loopback included, which is
+        // precisely what nobody else can dial.
+        //
+        // An explicit request that leaves nothing publishable is answered
+        // rather than dropped: a caller waiting on AddressesAnnounced
+        // would otherwise wait forever for a write that was never going
+        // to happen.
         Command::AnnounceAddresses { addresses } => {
-            let local_peer = *swarm.local_peer_id();
-            let key = rendezvous::record_key_for(&local_peer);
-            let record = Record::new(key, rendezvous::encode_addresses(&addresses));
-            if let Ok(query_id) = swarm.behaviour_mut().kad.put_record(record, Quorum::One) {
-                pending.announce.insert(query_id);
+            if !announce_own_addresses(swarm, pending, &addresses) {
+                let _ = events.send(P2pEvent::AddressAnnouncementFailed {
+                    reason: "none of the given addresses are reachable from outside this device"
+                        .to_string(),
+                });
             }
         }
 
@@ -791,7 +1123,7 @@ fn handle_command(
         }
 
         Command::AnnouncePublicRelay => {
-            match swarm.behaviour_mut().kad.start_providing(public_relay::provider_key()) {
+            match swarm.behaviour_mut().kad_public.start_providing(public_relay::provider_key()) {
                 Ok(query_id) => {
                     pending.announce_public_relay.insert(query_id);
                 }
@@ -806,7 +1138,7 @@ fn handle_command(
         }
 
         Command::DiscoverPublicRelays => {
-            let query_id = swarm.behaviour_mut().kad.get_providers(public_relay::provider_key());
+            let query_id = swarm.behaviour_mut().kad_public.get_providers(public_relay::provider_key());
             pending.discover_public_relays.insert(query_id);
         }
 
@@ -887,6 +1219,14 @@ fn handle_command(
             mining.start(public_key, chain_store, mempool);
         }
 
+        Command::SetMiningIntensity { percent } => {
+            mining.intensity_percent = percent.clamp(1, 100);
+            // Takes effect on the next attempt rather than the one in
+            // flight — restarting here would throw away whatever work the
+            // current search has already done, for a setting that is not
+            // urgent.
+        }
+
         Command::StopMining => {
             mining.stop();
         }
@@ -964,14 +1304,36 @@ fn handle_swarm_event(
             let _ = events.send(P2pEvent::ListeningOn(address));
         }
 
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        // The mirror of `ConnectionClosed` below: `num_established` counts
+        // this connection, so 1 means it is the first one to this peer.
+        // Announcing every additional link as a fresh `PeerConnected`
+        // would have the app layer re-run its own on-connect work (a
+        // ledger sync request per event, in `_layout.tsx`) for a peer it
+        // was already connected to.
+        SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
             known_mix_relays.insert(mix::node_address_for(&peer_id.to_bytes()), peer_id);
-            let _ = events.send(P2pEvent::PeerConnected(peer_id));
+            if num_established.get() == 1 {
+                let _ = events.send(P2pEvent::PeerConnected(peer_id));
+            }
         }
 
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            known_mix_relays.remove(&mix::node_address_for(&peer_id.to_bytes()));
-            let _ = events.send(P2pEvent::PeerDisconnected(peer_id));
+        // `num_established` is how many connections to this peer remain
+        // *after* this one closed — so anything above zero means the peer
+        // is still connected and this is only one redundant link going
+        // away. Acting on it as a disconnect drops the peer out of
+        // `known_mix_relays` (making it unroutable for mix traffic) and
+        // tells the app layer the contact went offline, both while the
+        // peer is in fact still there.
+        //
+        // Redundant links are routine, not exotic: two peers that discover
+        // each other at the same moment dial each other simultaneously,
+        // libp2p establishes both, and one is then dropped. A phone
+        // switching networks produces the same shape.
+        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+            if num_established == 0 {
+                known_mix_relays.remove(&mix::node_address_for(&peer_id.to_bytes()));
+                let _ = events.send(P2pEvent::PeerDisconnected(peer_id));
+            }
         }
 
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -983,7 +1345,11 @@ fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(BehaviourEvent::Kad(kad_event)) => {
-            handle_kad_event(swarm, pending, events, kad_event);
+            handle_kad_event(pending, events, kad_event);
+        }
+
+        SwarmEvent::Behaviour(BehaviourEvent::KadPublic(kad_event)) => {
+            handle_public_kad_event(swarm, pending, events, kad_event);
         }
 
         // Kademlia's routing table is *not* populated automatically from
@@ -995,13 +1361,34 @@ fn handle_swarm_event(
         // empty routing table even while directly connected to them, and
         // every put_record/get_record would fail for lack of anyone to
         // ask.
+        //
+        // identify also says which protocols the peer speaks, and that is
+        // what keeps the private table private. Every peer is offered to
+        // the public table — a standing relay holds two hundred-odd IPFS
+        // nodes and they are exactly who serves the provider lookups it
+        // depends on. Only a peer that advertises this network's own
+        // Kademlia enters the private one, so "the nodes closest to this
+        // key" means nodes that run this software, however many IPFS
+        // nodes happen to be connected.
         SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
             ..
         })) => {
+            let speaks_our_dht = info
+                .protocols
+                .iter()
+                .any(|protocol| *protocol == behaviour::PRIVATE_DHT_PROTOCOL);
             for addr in info.listen_addrs {
-                swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                // A peer's own loopback is not an address to us — see
+                // `is_publishable` for the dials this was producing.
+                if !is_publishable(&addr) {
+                    continue;
+                }
+                if speaks_our_dht {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                }
+                swarm.behaviour_mut().kad_public.add_address(&peer_id, addr);
             }
             let _ = events.send(P2pEvent::PeerIdentified(peer_id));
         }
@@ -1046,7 +1433,18 @@ fn handle_mdns_event(
     }
 }
 
-fn handle_kad_event(
+/// Results from the public IPFS DHT, which this node uses only to find
+/// the peers that speak its own.
+///
+/// Kept apart from `handle_kad_event` rather than merged for a reason
+/// that is easy to miss and impossible to debug afterwards: the two
+/// Kademlia behaviours number their queries independently, both from
+/// zero, so a public query and a private one routinely carry the *same*
+/// `QueryId`. That is harmless only as long as each handler consults
+/// only its own sets in `Pending` — these two, and no others. Merge
+/// them and a provider lookup will happily complete somebody's contact
+/// card announcement.
+fn handle_public_kad_event(
     swarm: &mut Swarm<Behaviour>,
     pending: &mut Pending,
     events: &mpsc::UnboundedSender<P2pEvent>,
@@ -1099,6 +1497,20 @@ fn handle_kad_event(
                 let _ = events.send(P2pEvent::PublicRelayAnnouncementFailed { reason: err.to_string() });
             }
         }
+        _ => {}
+    }
+}
+
+fn handle_kad_event(
+    pending: &mut Pending,
+    events: &mpsc::UnboundedSender<P2pEvent>,
+    event: kad::Event,
+) {
+    let kad::Event::OutboundQueryProgressed { id, result, .. } = event else {
+        return;
+    };
+
+    match result {
         QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(found))) => {
             if let Some(peer) = pending.resolve_peer.remove(&id) {
                 let addresses = rendezvous::decode_addresses(&found.record.value);

@@ -71,6 +71,14 @@ export default function SettingsScreen() {
           <Text style={s.rowLabel}>Конфиденциальность</Text>
           <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.3)" />
         </SettingsRow>
+
+        <SettingsRow onPress={() => router.push('/settings/network')}>
+          <View style={[s.iconWrap, { backgroundColor: '#0ea5e9' }]}>
+            <Ionicons name="globe-outline" size={15} color="#fff" />
+          </View>
+          <Text style={s.rowLabel}>Сеть</Text>
+          <Ionicons name="chevron-forward" size={16} color="rgba(255,255,255,0.3)" />
+        </SettingsRow>
       </ScrollView>
 
       {/* QR button (left) */}

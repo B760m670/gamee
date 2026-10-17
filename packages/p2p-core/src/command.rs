@@ -296,6 +296,31 @@ pub enum Command {
     /// currently mining.
     StopMining,
 
+    /// What share of one core the nonce search is allowed to use, as a
+    /// percentage from 1 to 100. Defaults to 100 — the behaviour before
+    /// this existed — and applies to the next and all subsequent mining
+    /// attempts.
+    ///
+    /// Mining is an unbroken `loop` with no yield in it, so at 100 it
+    /// saturates a core for as long as it runs. That is fine on a machine
+    /// bought for it and rude on one shared with something that matters —
+    /// and it is usually shared, because the natural place to run a
+    /// standing relay is a box that already does something else.
+    ///
+    /// **Giving up most of a core costs this network nothing.** Difficulty
+    /// retargets toward a fixed block time (see `ledger-core`'s
+    /// `TARGET_BLOCK_TIME_SECS`), so with few miners it settles at
+    /// whatever rate the miners actually supply: a node mining at a
+    /// quarter speed confirms claims just as promptly, against a
+    /// proportionally lower difficulty. The share matters for the chain's
+    /// resistance to a competing miner, not for whether claims confirm.
+    ///
+    /// Deliberately enforced in the search itself rather than left to the
+    /// operator's init system: a cgroup quota only exists where someone
+    /// knew to configure one, and the node should be a good neighbour by
+    /// default on any host.
+    SetMiningIntensity { percent: u8 },
+
     /// Turns this node's Loopix-style dummy traffic generation (drop cover
     /// and loop packets toward known mix relays, on `MIX_DUMMY_TRAFFIC_INTERVAL`)
     /// on or off. Defaults to off at spawn — unlike passive per-packet mix
