@@ -148,13 +148,33 @@ fn announce_own_addresses(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, a
     true
 }
 
-/// Whether an address is worth putting in front of another peer.
+/// Whether an address means anything on a *different* machine — which is
+/// the same question whether we are publishing our own or storing one a
+/// peer told us about.
 ///
-/// Loopback names this device to itself. Link-local (IPv6 `fe80::/10`,
-/// IPv4 `169.254.0.0/16`) is only meaningful on the interface it came from
-/// and cannot be routed to from anywhere else — and binding `/ip6/::`
-/// produces one of these per interface, so without this filter a record
+/// Loopback names a device to itself. Link-local (IPv6 `fe80::/10`, IPv4
+/// `169.254.0.0/16`) is only meaningful on the interface it came from and
+/// cannot be routed to from anywhere else — and binding `/ip6/::` produces
+/// one of these per interface, so without this filter a published record
 /// would be mostly undialable entries.
+///
+/// Applying it to what identify reports fixes something that reads like a
+/// mystery in the log. IPFS peers advertise their own loopback addresses,
+/// we stored them, and then dialed `/ip4/127.0.0.1/tcp/4001` expecting a
+/// peer in Korea — reaching our own relay, which answered with its own
+/// identity:
+///
+/// ```text
+/// dial FAILED to QmXppAt…: Unexpected peer ID 12D3KooWJRLv… at /ip4/127.0.0.1/tcp/4001/p2p/QmXppAt…
+/// ```
+///
+/// A dozen of those per minute, each one a routing-table entry that can
+/// be handed back as a "closest peer" and fail.
+///
+/// Private ranges (`10/8`, `192.168/16`, `172.16/12`) are deliberately
+/// *not* filtered: unreachable across the internet, but they are exactly
+/// how two phones on one Wi-Fi reach each other, which is a case this
+/// network is meant to serve.
 fn is_publishable(addr: &Multiaddr) -> bool {
     !addr.iter().any(|protocol| match protocol {
         Protocol::Ip4(ip) => ip.is_loopback() || ip.is_link_local(),
@@ -1360,6 +1380,11 @@ fn handle_swarm_event(
                 .iter()
                 .any(|protocol| *protocol == behaviour::PRIVATE_DHT_PROTOCOL);
             for addr in info.listen_addrs {
+                // A peer's own loopback is not an address to us — see
+                // `is_publishable` for the dials this was producing.
+                if !is_publishable(&addr) {
+                    continue;
+                }
                 if speaks_our_dht {
                     swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                 }
