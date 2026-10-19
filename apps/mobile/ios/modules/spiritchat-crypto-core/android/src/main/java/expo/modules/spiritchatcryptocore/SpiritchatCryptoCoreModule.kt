@@ -108,6 +108,7 @@ class SpiritchatCryptoCoreModule : Module() {
 
     Function("switchAccount") { slot: Int ->
       IdentitySession.switchTo(slot)
+      Unit
       // Nodes and controllers follow the active account; wiring that
       // follow-through is wave 3, where there is a node to follow.
     }
@@ -115,6 +116,7 @@ class SpiritchatCryptoCoreModule : Module() {
     Function("signOut") {
       IdentitySession.removeSlot(IdentitySession.activeSlot)
       IdentitySession.occupiedSlots().firstOrNull()?.let { IdentitySession.switchTo(it) }
+      Unit
     }
 
     Function("removeAccount") { slot: Int ->
@@ -123,6 +125,7 @@ class SpiritchatCryptoCoreModule : Module() {
       if (wasActive) {
         IdentitySession.occupiedSlots().firstOrNull()?.let { IdentitySession.switchTo(it) }
       }
+      Unit
     }
 
     // ---- The P2P node ----------------------------------------------
@@ -130,7 +133,7 @@ class SpiritchatCryptoCoreModule : Module() {
     // is missing is the session that owns one per account and the pump
     // that turns its events into `onP2pEvent`.
 
-    Function("p2pLocalPeerId") { throw NotPortedYetException("p2pLocalPeerId", "the P2P wave") }
+    Function("p2pLocalPeerId") { notPortedYet("p2pLocalPeerId", "the P2P wave") }
     Function("p2pIsReady") {
       // Answered rather than thrown: this is the question the UI asks to
       // decide whether to show a connected state, and a throw here would
@@ -142,58 +145,58 @@ class SpiritchatCryptoCoreModule : Module() {
     }
     Function("p2pListenAddresses") { emptyList<String>() }
     Function("p2pDial") { _: String, _: List<String> ->
-      throw NotPortedYetException("p2pDial", "the P2P wave")
+      notPortedYet("p2pDial", "the P2P wave")
     }
     Function("p2pResolvePeerAddresses") { _: String ->
-      throw NotPortedYetException("p2pResolvePeerAddresses", "the P2P wave")
+      notPortedYet("p2pResolvePeerAddresses", "the P2P wave")
     }
     Function("p2pAnnounceAddresses") { _: List<String> ->
-      throw NotPortedYetException("p2pAnnounceAddresses", "the P2P wave")
+      notPortedYet("p2pAnnounceAddresses", "the P2P wave")
     }
     Function("p2pSendEnvelope") { _: String, _: ByteArray ->
-      throw NotPortedYetException("p2pSendEnvelope", "the P2P wave")
+      notPortedYet("p2pSendEnvelope", "the P2P wave")
     }
     Function("p2pReserveRelaySlot") { _: String ->
-      throw NotPortedYetException("p2pReserveRelaySlot", "the P2P wave")
+      notPortedYet("p2pReserveRelaySlot", "the P2P wave")
     }
     Function("p2pAnnounceUsername") { _: String ->
-      throw NotPortedYetException("p2pAnnounceUsername", "the P2P wave")
+      notPortedYet("p2pAnnounceUsername", "the P2P wave")
     }
     Function("p2pResolveUsername") { _: String ->
-      throw NotPortedYetException("p2pResolveUsername", "the P2P wave")
+      notPortedYet("p2pResolveUsername", "the P2P wave")
     }
     Function("p2pFetchBlob") { _: String, _: String ->
-      throw NotPortedYetException("p2pFetchBlob", "the P2P wave")
+      notPortedYet("p2pFetchBlob", "the P2P wave")
     }
     Function("p2pSetLocalBlobRaw") { _: String, _: ByteArray ->
-      throw NotPortedYetException("p2pSetLocalBlobRaw", "the P2P wave")
+      notPortedYet("p2pSetLocalBlobRaw", "the P2P wave")
     }
     Function("p2pAnnounceAvatarPointer") { _: ByteArray ->
-      throw NotPortedYetException("p2pAnnounceAvatarPointer", "the P2P wave")
+      notPortedYet("p2pAnnounceAvatarPointer", "the P2P wave")
     }
     Function("p2pResolveAvatarPointer") { _: String ->
-      throw NotPortedYetException("p2pResolveAvatarPointer", "the P2P wave")
+      notPortedYet("p2pResolveAvatarPointer", "the P2P wave")
     }
     Function("p2pRequestChainSync") { _: String ->
-      throw NotPortedYetException("p2pRequestChainSync", "the P2P wave")
+      notPortedYet("p2pRequestChainSync", "the P2P wave")
     }
     Function("p2pQueryChainTip") {
-      throw NotPortedYetException("p2pQueryChainTip", "the P2P wave")
+      notPortedYet("p2pQueryChainTip", "the P2P wave")
     }
     Function("p2pQueryUsernameOwner") { _: String ->
-      throw NotPortedYetException("p2pQueryUsernameOwner", "the P2P wave")
+      notPortedYet("p2pQueryUsernameOwner", "the P2P wave")
     }
     Function("p2pSubmitUsernameClaim") { _: ByteArray ->
-      throw NotPortedYetException("p2pSubmitUsernameClaim", "the P2P wave")
+      notPortedYet("p2pSubmitUsernameClaim", "the P2P wave")
     }
     Function("p2pSubmitMinedBlock") { _: ByteArray ->
-      throw NotPortedYetException("p2pSubmitMinedBlock", "the P2P wave")
+      notPortedYet("p2pSubmitMinedBlock", "the P2P wave")
     }
     Function("ledgerBuildUsernameClaim") { _: String, _: Int, _: ByteArray, _: ByteArray ->
-      throw NotPortedYetException("ledgerBuildUsernameClaim", "the P2P wave")
+      notPortedYet("ledgerBuildUsernameClaim", "the P2P wave")
     }
     Function("p2pStartMining") { _: String ->
-      throw NotPortedYetException("p2pStartMining", "the P2P wave")
+      notPortedYet("p2pStartMining", "the P2P wave")
     }
     Function("p2pStopMining") {
       // Stopping what was never started is not an error anywhere else in
@@ -222,9 +225,12 @@ class SpiritchatCryptoCoreModule : Module() {
     // Wave 2, with the rest of storage.
 
     Function("blobSaveFromFile") { _: String ->
-      throw NotPortedYetException("blobSaveFromFile", "the storage wave")
+      notPortedYet("blobSaveFromFile", "the storage wave")
     }
-    Function("blobLocalPath") { _: String -> null }
+    // The type is spelled out because a lambda returning only `null`
+    // infers `Nothing?`, which cannot be reified any more than
+    // `Nothing` can. It is also what index.ts declares: `string | null`.
+    Function<String?, String>("blobLocalPath") { _ -> null }
     Function("blobClear") { _: String -> }
     Function("blobReserve") { _: String -> false }
 
@@ -233,28 +239,28 @@ class SpiritchatCryptoCoreModule : Module() {
     // outbox, groups and consent are 2,090 lines of ChatManager on iOS.
 
     Function("chatSendMessage") { _: String, _: String, _: String ->
-      throw NotPortedYetException("chatSendMessage", "the chat wave")
+      notPortedYet("chatSendMessage", "the chat wave")
     }
     Function("chatSendMedia") { _: String, _: String, _: String, _: String, _: String?, _: Int? ->
-      throw NotPortedYetException("chatSendMedia", "the chat wave")
+      notPortedYet("chatSendMedia", "the chat wave")
     }
     Function("chatCreateGroup") { _: String, _: List<String> ->
-      throw NotPortedYetException("chatCreateGroup", "the chat wave")
+      notPortedYet("chatCreateGroup", "the chat wave")
     }
     Function("chatSendGroupMessage") { _: String, _: String ->
-      throw NotPortedYetException("chatSendGroupMessage", "the chat wave")
+      notPortedYet("chatSendGroupMessage", "the chat wave")
     }
     Function("chatSendGroupMedia") { _: String, _: String, _: String, _: String?, _: Int? ->
-      throw NotPortedYetException("chatSendGroupMedia", "the chat wave")
+      notPortedYet("chatSendGroupMedia", "the chat wave")
     }
     Function("chatAddGroupMember") { _: String, _: String ->
-      throw NotPortedYetException("chatAddGroupMember", "the chat wave")
+      notPortedYet("chatAddGroupMember", "the chat wave")
     }
     Function("chatRemoveGroupMember") { _: String, _: String ->
-      throw NotPortedYetException("chatRemoveGroupMember", "the chat wave")
+      notPortedYet("chatRemoveGroupMember", "the chat wave")
     }
     Function("chatSetConsent") { _: String, _: String ->
-      throw NotPortedYetException("chatSetConsent", "the chat wave")
+      notPortedYet("chatSetConsent", "the chat wave")
     }
     Function("chatConsentFor") { _: String -> "none" }
     Function("chatConsentList") { emptyList<Map<String, String>>() }
@@ -263,10 +269,10 @@ class SpiritchatCryptoCoreModule : Module() {
     // Wave 3: it is published to and read from the DHT.
 
     Function("recoveryBackupPublish") { _: String ->
-      throw NotPortedYetException("recoveryBackupPublish", "the P2P wave")
+      notPortedYet("recoveryBackupPublish", "the P2P wave")
     }
     Function("recoveryBackupRequest") {
-      throw NotPortedYetException("recoveryBackupRequest", "the P2P wave")
+      notPortedYet("recoveryBackupRequest", "the P2P wave")
     }
 
     // ---- Voice notes -------------------------------------------------
@@ -278,13 +284,27 @@ class SpiritchatCryptoCoreModule : Module() {
         android.content.pm.PackageManager.PERMISSION_GRANTED
     }
     AsyncFunction("requestMicrophonePermission") {
-      throw NotPortedYetException("requestMicrophonePermission", "the platform wave")
+      notPortedYet("requestMicrophonePermission", "the platform wave")
     }
     Function("voiceRecordingStart") {
-      throw NotPortedYetException("voiceRecordingStart", "the platform wave")
+      notPortedYet("voiceRecordingStart", "the platform wave")
     }
-    Function("voiceRecordingStop") { null }
+    Function<Map<String, Any>?>("voiceRecordingStop") { null }
     Function("voiceRecordingCancel") { }
+  }
+
+  /**
+   * Raises [NotPortedYetException], and — the point of existing — is
+   * declared to return Unit while doing it.
+   *
+   * `Function` is `inline fun <reified R> Function(name, body: () -> R)`,
+   * and a lambda whose whole body is a `throw` has type `Nothing`, which
+   * cannot be a reified type argument: "Cannot use 'Nothing' as reified
+   * type parameter", twenty-seven times over. Going through a Unit
+   * function gives the inference something to land on.
+   */
+  private fun notPortedYet(what: String, wave: String) {
+    throw NotPortedYetException(what, wave)
   }
 
   private fun deliveryPreferences() = context.getSharedPreferences(
