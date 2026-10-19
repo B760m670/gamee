@@ -1,0 +1,146 @@
+name: Android app (Expo)
+
+# Builds the real application for Android — the same React Native code
+# the iPhones run, with the native module's Android half underneath it.
+#
+# Not to be confused with "Android APK" (android-build.yml), which builds
+# `apps/android`: a separate Compose shell with four screens and stub
+# data. Two workflows with Android in the name is confusing enough to be
+# worth a sentence: that one builds the old experiment, this one builds
+# the app.
+#
+# This also exists because nothing else can compile the Kotlin. The
+# module's Android half is written against bindings generated from the
+# Rust, and a mistake there — a wrong type, a renamed method — is
+# invisible until a compiler sees it. Until this workflow is green, that
+# code is unverified.
+
+on:
+  push:
+    branches:
+      - claude/messenger-project-review-i4p3vs
+    paths:
+      - 'apps/mobile/ios/**'
+      - 'packages/crypto-core/**'
+      - 'packages/crypto-core-ffi/**'
+      - 'packages/ledger-core/**'
+      - 'packages/p2p-core/**'
+      - 'packages/mls-core/**'
+      - '.github/workflows/android-app-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: android-app-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build the Expo app for Android
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile/ios
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # Empty on purpose: the action's default list includes `tools`,
+          # which Google has withdrawn, and asking for it fails the step.
+          # Same reasoning as in android-build.yml.
+          packages: ''
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/crypto-core-ffi/target
+          key: rust-expo-android-${{ runner.os }}-${{ hashFiles('packages/*/src/**/*.rs', 'packages/*/Cargo.toml') }}
+          restore-keys: |
+            rust-expo-android-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build the crypto core and its Kotlin bindings
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: ./scripts/build-android-native.sh
+
+      - name: Install JS dependencies
+        run: npm install --legacy-peer-deps
+
+      # Regenerates android/ from app.json on every run, the same way the
+      # iOS job regenerates ios/. Keeping the native project out of the
+      # repository means configuration lives in one place instead of two
+      # that disagree.
+      - name: Generate the native Android project
+        run: npx expo prebuild --platform android --no-install
+
+      # Debug rather than release, deliberately. A release APK is unsigned
+      # and cannot be installed without a keystore this repository does
+      # not have and should not hold; a debug APK is signed with the
+      # standard debug key and installs on any phone with "install from
+      # unknown sources". That is what a dev channel wants. It is slower
+      # at runtime than release, which matters for the mining screen and
+      # nothing else.
+      - name: Build the APK
+        working-directory: apps/mobile/ios/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Show what came out
+        working-directory: apps/mobile/ios/android
+        run: ls -lh app/build/outputs/apk/debug/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spiritchat-android-debug
+          path: apps/mobile/ios/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish to the android-dev channel
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-dev
+          name: Android dev channel
+          prerelease: true
+          make_latest: false
+          body: |
+            The Expo app built for Android — the same screens the iOS
+            build has, with the native module's Android half underneath.
+
+            Debug-signed, so it installs directly once "install from
+            unknown sources" is allowed for whatever opens it.
+
+            Built from ${{ github.sha }}.
+          files: apps/mobile/ios/android/app/build/outputs/apk/debug/app-debug.apk
