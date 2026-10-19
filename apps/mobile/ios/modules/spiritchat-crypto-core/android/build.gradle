@@ -26,6 +26,17 @@ version = '0.1.0'
 android {
   namespace 'expo.modules.spiritchatcryptocore'
 
+  // Required, not decorative: expo-autolinking reads versionName while
+  // configuring every linked module and fails the whole build without
+  // it — "'android.defaultConfig.versionName' is not defined", raised
+  // from expo's own build.gradle rather than this one, which is a
+  // confusing place to be told. Every module in node_modules carries
+  // this block for the same reason.
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+
   sourceSets {
     main {
       // Build outputs of packages/crypto-core-ffi, produced by
