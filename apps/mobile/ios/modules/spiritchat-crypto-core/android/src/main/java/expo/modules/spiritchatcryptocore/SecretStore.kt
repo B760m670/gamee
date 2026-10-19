@@ -92,17 +92,25 @@ internal class SecretStore(context: Context) {
     (keyStore.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
 
     val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEY_STORE)
-    generator.init(
-      KeyGenParameterSpec.Builder(
-        KEY_ALIAS,
-        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-      )
-        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-        .setKeySize(256)
-        .setUnlockedDeviceRequired(true)
-        .build()
+    val spec = KeyGenParameterSpec.Builder(
+      KEY_ALIAS,
+      KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
     )
+      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+      .setKeySize(256)
+
+    // Added only where it exists — it arrived in API 28, and this module
+    // builds against the Expo default of 24. Below that the key is still
+    // non-exportable and hardware-held where there is hardware; what is
+    // missing is the refusal to operate while the device has not been
+    // unlocked since boot. Worth having where available and not worth
+    // refusing to run without.
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+      spec.setUnlockedDeviceRequired(true)
+    }
+
+    generator.init(spec.build())
     return generator.generateKey()
   }
 

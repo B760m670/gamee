@@ -1,6 +1,7 @@
 package expo.modules.spiritchatcryptocore
 
 import expo.modules.kotlin.exception.CodedException
+import expo.modules.kotlin.exception.Exceptions
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import uniffi.spiritchat_crypto_core_ffi.FfiRecoveryPhrase
@@ -37,12 +38,12 @@ internal class NotPortedYetException(what: String, wave: String) : CodedExceptio
  */
 class SpiritchatCryptoCoreModule : Module() {
 
-  private val identityStore by lazy {
-    SecretStore(
-      appContext.reactContext
-        ?: throw CodedException("The module was used before Android gave it a context.")
-    )
-  }
+  /** How every module in this SDK reaches a Context, including the
+   *  exception it raises when there is none. */
+  private val context
+    get() = appContext.reactContext ?: throw Exceptions.AppContextLost()
+
+  private val identityStore by lazy { SecretStore(context) }
 
   override fun definition() = ModuleDefinition {
     Name("SpiritchatCryptoCore")
@@ -273,7 +274,7 @@ class SpiritchatCryptoCoreModule : Module() {
     // common with AVAudioRecorder beyond the shape of this interface.
 
     Function("hasMicrophonePermission") {
-      appContext.reactContext?.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+      context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
         android.content.pm.PackageManager.PERMISSION_GRANTED
     }
     AsyncFunction("requestMicrophonePermission") {
@@ -286,9 +287,10 @@ class SpiritchatCryptoCoreModule : Module() {
     Function("voiceRecordingCancel") { }
   }
 
-  private fun deliveryPreferences() =
-    (appContext.reactContext ?: throw CodedException("No Android context."))
-      .getSharedPreferences("com.spiritchat.cryptocore.delivery", android.content.Context.MODE_PRIVATE)
+  private fun deliveryPreferences() = context.getSharedPreferences(
+    "com.spiritchat.cryptocore.delivery",
+    android.content.Context.MODE_PRIVATE,
+  )
 
   private companion object {
     const val ALLOWS_DIRECT = "allows-direct-delivery"
