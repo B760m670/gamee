@@ -1,0 +1,14 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Declared by the library rather than left to the app, because they
+       are what this module itself needs to do its job, and a permission
+       the app manifest forgets fails at runtime in a way that reads like
+       a bug in the networking code.
+
+       INTERNET and ACCESS_NETWORK_STATE: the P2P node dials and listens.
+       RECORD_AUDIO: voice notes, matching the iOS module's microphone
+       usage description. It is a runtime permission as well, which the
+       module asks for through `requestMicrophonePermission`. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.RECORD_AUDIO" />
+</manifest>

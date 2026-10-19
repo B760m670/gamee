@@ -1,6 +1,9 @@
 {
-  "platforms": ["ios"],
+  "platforms": ["ios", "android"],
   "ios": {
     "modules": ["SpiritchatCryptoCoreModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.spiritchatcryptocore.SpiritchatCryptoCoreModule"]
   }
 }

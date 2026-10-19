@@ -1,0 +1,6 @@
+# Build outputs of packages/crypto-core-ffi, produced by
+# scripts/build-android-native.sh. Checked in nowhere: they are compiled
+# from a source tree that is, and a stale copy here would be worse than
+# none — it would compile.
+generated/
+build/
