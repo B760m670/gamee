@@ -135,18 +135,34 @@ pub struct Behaviour {
     /// whatever else is on the box.
     ///
     /// These are a ceiling against unbounded growth, not a tuning knob,
-    /// and the first attempt got that backwards. 256 established with 128
-    /// inbound sounded conservative and was simply wrong: a standing relay
-    /// in the public DHT settles at two hundred-odd peers, mostly inbound,
-    /// so the inbound limit was reached in ordinary operation. Past it,
-    /// libp2p refuses the connection mid-handshake and the dialling peer
-    /// sees only "Handshake failed: unexpected end of file" — which is how
-    /// a phone was unable to reach a relay that was working perfectly.
+    /// and getting the number right took being wrong twice in opposite
+    /// directions.
     ///
-    /// The limit has to sit well above what a healthy node reaches on its
-    /// own, or it stops being a safety net and becomes the fault. Worth
-    /// pairing with a raised `LimitNOFILE`, since every connection costs
-    /// descriptors; the relay's own systemd unit sets 65536.
+    /// 256 established with 128 inbound was reached in ordinary
+    /// operation, because a standing relay advertising itself as a
+    /// *server* in the public DHT settles at two hundred-odd peers,
+    /// mostly inbound. Past the limit libp2p refuses the connection
+    /// mid-handshake and the dialling peer sees only "Handshake failed:
+    /// unexpected end of file" — which is how a phone could not reach a
+    /// relay that was working perfectly.
+    ///
+    /// Raising it to 1024/768 fixed that and made something worse. The
+    /// relay accepted the invitation: 366 peers within twenty seconds of
+    /// starting, 444 MB resident, on a 2 GB machine whose actual job was
+    /// somebody's VPN. A limit set above what the node will reach does
+    /// not bound anything; it just records how much damage is allowed.
+    ///
+    /// The real fix was upstream of both numbers — `kad_public` is a
+    /// client now, so the IPFS network no longer dials us at all and
+    /// the peer count is whatever we sought out plus whoever actually
+    /// wants this network. These numbers sit above that and below what
+    /// a small machine can be asked to hold. They will need raising when
+    /// this network has enough users to approach them, which is a
+    /// pleasant problem and a visible one: the symptom is the handshake
+    /// failure above.
+    ///
+    /// Worth pairing with a raised `LimitNOFILE`, since every connection
+    /// costs descriptors; the relay's own systemd unit sets 65536.
     ///
     /// `max_established_per_peer` is above one on purpose — two peers that
     /// discover each other simultaneously legitimately open a connection
@@ -243,9 +259,26 @@ pub fn build(
     public_config.set_query_timeout(Duration::from_secs(60));
     let mut kad_public =
         kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), public_config);
-    // Server mode here is a courtesy to IPFS, not a requirement of ours:
-    // nothing of this network's is stored in it either way.
-    kad_public.set_mode(Some(kad::Mode::Server));
+    // Client mode, and the reason is worth stating because the first
+    // version of this said the opposite.
+    //
+    // Server mode here was called "a courtesy to IPFS, not a requirement
+    // of ours". The courtesy was not free. Announcing ourselves as a
+    // server in the public DHT invites the whole IPFS network to dial
+    // us, and it accepts: a standing relay went from 90 connections to
+    // 366 in eighteen seconds, settling into hundreds of peers that
+    // store nothing of ours and want nothing from us. At roughly a
+    // megabyte of buffers each, that was 444 MB resident on a 2 GB
+    // machine whose real job is somebody's VPN — twenty times what the
+    // same binary measures with no peers.
+    //
+    // A client-mode node still issues every query we actually use:
+    // `get_providers` to find standing relays, `start_providing` to
+    // become findable, and the bootstrap walk that makes both possible.
+    // What it stops doing is answering other people's lookups. Since
+    // this network's own records moved to `PRIVATE_DHT_PROTOCOL`, that
+    // is the entire difference.
+    kad_public.set_mode(Some(kad::Mode::Client));
 
     // Signed (not Anonymous) message authenticity: `propagation_source` on
     // a received `Message` is still just "who forwarded it to us" either
@@ -263,8 +296,8 @@ pub fn build(
     Ok(Behaviour {
         connection_limits: connection_limits::Behaviour::new(
             connection_limits::ConnectionLimits::default()
-                .with_max_established(Some(1024))
-                .with_max_established_incoming(Some(768))
+                .with_max_established(Some(256))
+                .with_max_established_incoming(Some(128))
                 .with_max_pending_incoming(Some(128))
                 .with_max_pending_outgoing(Some(128))
                 .with_max_established_per_peer(Some(4)),
