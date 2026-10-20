@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - claude/game-app-architecture-discussion-8gn7ep
+      - claude/decentralized-messenger-review-baagfa
+      - claude/messenger-project-review-i4p3vs
     paths:
       - 'apps/android/**'
       - 'packages/crypto-core/**'
@@ -42,6 +44,18 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # Without this the action runs `sdkmanager tools`, because that
+          # is its default package list, and Google has since withdrawn
+          # the `tools` package from the SDK repository. sdkmanager then
+          # reports "Failed to find package 'tools'" and exits non-zero,
+          # which fails this step before a line of our own code is
+          # compiled — the whole build, over a package nothing here uses.
+          #
+          # The runner image ships the SDK already; what this action is
+          # actually wanted for is setting ANDROID_HOME and accepting the
+          # licences, both of which it still does with an empty list.
+          packages: ''
 
       - name: Set up Android NDK
         id: ndk

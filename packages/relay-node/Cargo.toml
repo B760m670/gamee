@@ -12,3 +12,7 @@ path = "src/main.rs"
 spiritchat-p2p-core = { path = "../p2p-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 rand = "0.8"
+# For the SIGSYS reporter only (see src/blocked_syscall.rs): a host that
+# forbids a system call kills us without a word, and this is what turns
+# that into a line naming the call.
+libc = "0.2"

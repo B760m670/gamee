@@ -20,12 +20,19 @@ on:
   push:
     branches:
       - claude/game-app-architecture-discussion-8gn7ep
+      - claude/decentralized-messenger-review-baagfa
+      - claude/messenger-project-review-i4p3vs
     paths:
       - 'apps/mobile/ios/**'
       - 'packages/crypto-core/**'
       - 'packages/crypto-core-ffi/**'
       - 'packages/p2p-core/**'
       - 'packages/ledger-core/**'
+      # mls-core is linked into the same FFI crate the app loads, so a
+      # change there changes the shipped binary just as much as the others
+      # — it was missing from this list, which meant a groups-only change
+      # silently produced no build.
+      - 'packages/mls-core/**'
       - '.github/workflows/ios-unsigned-build.yml'
   workflow_dispatch:
     inputs:

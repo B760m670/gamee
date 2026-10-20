@@ -31,13 +31,15 @@
 //! degrades exactly as if one more phone went offline. Anyone can run
 //! any number of these.
 
+mod blocked_syscall;
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spiritchat_p2p_core::{
     public_dht_bootstrap_addresses, public_key_bytes_from_seed, Command, Multiaddr, P2pEvent,
-    P2pNode,
+    P2pNode, PeerId,
 };
 
 /// How often the mix routing key is re-broadcast to the gossip directory.
@@ -51,11 +53,25 @@ const MIX_RELAY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 /// rendezvous record (records expire; same reason the app re-announces).
 const ADDRESS_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
+/// How many dial failures are printed in full before the log switches to
+/// periodic totals. Enough to diagnose a relay that cannot bootstrap —
+/// where the first failures are the whole story — without letting a
+/// healthy relay's ordinary DHT churn fill the journal.
+const DIAL_FAILURES_LOGGED_IN_FULL: u64 = 20;
+/// After that, one line per this many failures, so the rate stays visible.
+const DIAL_FAILURE_SUMMARY_EVERY: u64 = 500;
+/// The same treatment for connections: the first few prove the relay
+/// reached the network, and after that a peer count every so often says
+/// more than a line per peer.
+const PEER_EVENTS_LOGGED_IN_FULL: u64 = 10;
+
 struct Config {
     data_dir: PathBuf,
     port: Option<u16>,
     bootstrap: Vec<Multiaddr>,
     cover_traffic: bool,
+    /// Share of one core mining may use, 1-100. See `--mine-intensity`.
+    mine_intensity: u8,
     mine: bool,
 }
 
@@ -80,6 +96,17 @@ OPTIONS:
                           useful for a private/test network.
   --no-cover-traffic      Disable Loopix cover/loop traffic (on by default here,
                           since a standing relay pays no battery cost).
+  --mine-intensity <1-100>
+                          What share of ONE core mining may use (default: 25).
+                          The nonce search paces itself to this, so it is a good
+                          neighbour on a machine that does something else — no
+                          cgroup or init-system configuration needed. Lowering it
+                          costs this network nothing while miners are few:
+                          difficulty retargets toward a fixed block time, so a
+                          slower miner confirms claims just as promptly against a
+                          proportionally lower difficulty. Raise it if you want
+                          this relay to carry real weight against a competing
+                          miner.
   --no-mine               Don't mine the @username ledger. Mining is ON by default:
                           it is how claims get confirmed, and relays are the only
                           miners left now that the app no longer mines on phones.
@@ -98,6 +125,12 @@ fn parse_args() -> Result<Config, String> {
         bootstrap: Vec::new(),
         cover_traffic: true,
         mine: true,
+        // A quarter of one core by default rather than all of it. The
+        // natural place to run a standing relay is a machine that already
+        // does something else, and while miners are few this costs the
+        // network nothing — difficulty retargets to whatever rate the
+        // miners supply, so claims confirm just as promptly.
+        mine_intensity: 25,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -116,6 +149,14 @@ fn parse_args() -> Result<Config, String> {
             }
             "--no-cover-traffic" => config.cover_traffic = false,
             "--no-mine" => config.mine = false,
+            "--mine-intensity" => {
+                let value = args.next().ok_or("--mine-intensity needs a percentage")?;
+                let percent: u8 = value.parse().map_err(|_| format!("not a percentage: {value}"))?;
+                if !(1..=100).contains(&percent) {
+                    return Err(format!("--mine-intensity must be between 1 and 100, got {percent}"));
+                }
+                config.mine_intensity = percent;
+            }
             "--help" | "-h" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -168,6 +209,11 @@ fn log(message: &str) {
 
 #[tokio::main]
 async fn main() {
+    // Before anything else, so a host that forbids a system call says so
+    // instead of leaving a bare "Bad system call" behind. Costs one
+    // `sigaction` and changes nothing on a host that forbids nothing.
+    blocked_syscall::report_blocked_syscalls();
+
     let config = match parse_args() {
         Ok(config) => config,
         Err(message) => {
@@ -217,8 +263,12 @@ async fn main() {
         // published to the network in every block header we mined.
         match public_key_bytes_from_seed(&seed) {
             Ok(public_key) => {
+                let _ = node.command(Command::SetMiningIntensity { percent: config.mine_intensity });
                 let _ = node.command(Command::StartMining { public_key });
-                log("mining the @username ledger (one core; --no-mine to disable)");
+                log(&format!(
+                    "mining the @username ledger at {}% of one core (--mine-intensity to change, --no-mine to disable)",
+                    config.mine_intensity
+                ));
             }
             Err(err) => {
                 // Not fatal: a relay that can't mine is still a useful relay,
@@ -232,6 +282,10 @@ async fn main() {
     }
 
     let mut listen_addresses: Vec<Multiaddr> = Vec::new();
+    // Counters behind the log rate limits — see the constants above.
+    let mut dial_failures: u64 = 0;
+    let mut peer_events: u64 = 0;
+    let mut connected_peers: std::collections::HashSet<PeerId> = Default::default();
     let mut mix_announce_ticker = tokio::time::interval(MIX_RELAY_ANNOUNCE_INTERVAL);
     let mut address_announce_ticker = tokio::time::interval(ADDRESS_ANNOUNCE_INTERVAL);
 
@@ -275,15 +329,101 @@ async fn main() {
                     _ => {}
                 }
                 match event {
-                    P2pEvent::PeerConnected(peer) => log(&format!("peer connected: {peer}")),
-                    P2pEvent::PeerDisconnected(peer) => log(&format!("peer disconnected: {peer}")),
+                    // Same reasoning as the dial failures: the first
+                    // connections are what tell an operator the relay
+                    // reached the network at all, and after that a peer
+                    // count is more informative than a line per peer — a
+                    // relay on the public DHT churns through hundreds.
+                    P2pEvent::PeerConnected(peer) => {
+                        // Catch this relay's own ledger up to whatever the
+                        // new peer has. Without this a relay could never
+                        // get the chain at all: gossip only carries *new*
+                        // blocks, and a node at height 0 cannot apply a
+                        // block at height 5000 — it has none of its
+                        // parents. So a relay that started after a miner
+                        // stayed empty forever, and every phone that
+                        // synced from it got an empty chain back, which is
+                        // what made a submitted @username claim sit
+                        // unconfirmed with no explanation.
+                        //
+                        // Sent to every peer, as the app does: most of
+                        // them are ordinary IPFS nodes that do not speak
+                        // this protocol, and those requests simply fail.
+                        // A no-op when this node's chain is already at
+                        // least as heavy.
+                        let _ = node.command(Command::RequestChainSync { peer });
+                        connected_peers.insert(peer);
+                        peer_events += 1;
+                        if peer_events <= PEER_EVENTS_LOGGED_IN_FULL {
+                            log(&format!("peer connected: {peer}"));
+                        } else if peer_events % 100 == 0 {
+                            log(&format!("connected peers: {}", connected_peers.len()));
+                        }
+                    }
+                    P2pEvent::PeerDisconnected(peer) => {
+                        connected_peers.remove(&peer);
+                        peer_events += 1;
+                        if peer_events <= PEER_EVENTS_LOGGED_IN_FULL {
+                            log(&format!("peer disconnected: {peer}"));
+                        }
+                    }
                     P2pEvent::ListeningOn(address) => log(&format!("listening on {address}")),
                     P2pEvent::PublicRelayAnnounced => log("announced as a standing relay in the DHT"),
                     P2pEvent::PublicRelayAnnouncementFailed { reason } => log(&format!("standing-relay announcement FAILED: {reason}")),
+
+                    // Why a relay fails to reach the network, rather than
+                    // silence. A relay that never connects to anything logs
+                    // its listen addresses and then nothing at all, which is
+                    // indistinguishable from one that is working — the
+                    // bootstrap dials fail, and `_ => {}` below used to
+                    // swallow every one of them. Observed on a real
+                    // deployment: zero peers, zero diagnostics, no way to
+                    // tell a DNS problem from a firewall one from a bug.
+                    //
+                    // Rate-limited, because once a relay *is* on the DHT it
+                    // dials a stream of peers it just learned about, and a
+                    // steady fraction of those fail for reasons nobody needs
+                    // told: transports this build has no support for
+                    // (webrtc-direct, webtransport, ws), peers that have gone
+                    // away, hosts that never answer. Unlimited, that is
+                    // thousands of lines a day filling an operator's journal.
+                    // The cap keeps the diagnostic value — a relay that
+                    // cannot bootstrap still prints its first failures, which
+                    // is exactly when they are read — while the periodic
+                    // total keeps the ongoing rate visible.
+                    P2pEvent::DialFailed { peer, reason } => {
+                        dial_failures += 1;
+                        if dial_failures <= DIAL_FAILURES_LOGGED_IN_FULL {
+                            match peer {
+                                Some(peer) => log(&format!("dial FAILED to {peer}: {reason}")),
+                                None => log(&format!("dial FAILED: {reason}")),
+                            }
+                            if dial_failures == DIAL_FAILURES_LOGGED_IN_FULL {
+                                log(&format!(
+                                    "(further dial failures will be summarised, not listed — \
+                                     a running relay fails plenty of them harmlessly)"
+                                ));
+                            }
+                        } else if dial_failures % DIAL_FAILURE_SUMMARY_EVERY == 0 {
+                            log(&format!("dial failures so far: {dial_failures}"));
+                        }
+                    }
+                    // Deliberately not logged: `identify` fires for every
+                    // peer the DHT walk touches, says nothing a connection
+                    // hasn't already said, and on a public relay is pure
+                    // volume.
+                    P2pEvent::PeerIdentified(_) => {}
+                    P2pEvent::PeerDiscoveredLocally(peer) => log(&format!("peer discovered on the local network: {peer}")),
+                    P2pEvent::AddressesAnnounced => log("own addresses published to the DHT"),
+                    P2pEvent::RelayReservationFailed { reason } => log(&format!("relay reservation FAILED: {reason}")),
+                    P2pEvent::MixRelayDiscovered { peer } => log(&format!("mix relay discovered: {peer}")),
+                    P2pEvent::PublicRelayDiscovered { peer } => log(&format!("standing relay discovered: {peer}")),
+
                     P2pEvent::MailboxDepositStored => log("mailbox deposit accepted into the cache"),
                     P2pEvent::MixForwardFailed { reason } => log(&format!("mix forward failed: {reason}")),
                     P2pEvent::AddressAnnouncementFailed { reason } => log(&format!("address announcement failed: {reason}")),
                     P2pEvent::ChainTipChanged { height, .. } => log(&format!("ledger tip now at height {height}")),
+                    P2pEvent::ChainSyncCompleted { height } => log(&format!("ledger synced, now at height {height}")),
                     // Distinct from the tip moving, which also fires for blocks
                     // received from other peers: this one is a block *this*
                     // relay found, so it's the only line that tells an operator

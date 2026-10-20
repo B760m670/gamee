@@ -1,0 +1,61 @@
+// The Android half of the native module.
+//
+// The first version of this file configured everything by hand — Kotlin
+// plugin, compileSdk, Java version, the expo-modules-core dependency —
+// and the build failed with `Function`, `AsyncFunction`, `appContext`
+// and `CodedException` all unresolved while `Module` and
+// `ModuleDefinition` resolved fine. That mixture is what a partially
+// present classpath looks like, and it was self-inflicted: every real
+// module in this SDK (expo-crypto, expo-haptics, all of them) declares
+// two plugins and nothing else, because `expo-module-gradle-plugin`
+// brings the core dependency, the Kotlin setup and the SDK versions
+// with it. Configuring them separately means configuring them
+// differently from every other module in the same build.
+//
+// So: the same two plugins everyone else uses, and only the things
+// genuinely particular to this module below.
+
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.spiritchatcryptocore'
+version = '0.1.0'
+
+android {
+  namespace 'expo.modules.spiritchatcryptocore'
+
+  // Required, not decorative: expo-autolinking reads versionName while
+  // configuring every linked module and fails the whole build without
+  // it — "'android.defaultConfig.versionName' is not defined", raised
+  // from expo's own build.gradle rather than this one, which is a
+  // confusing place to be told. Every module in node_modules carries
+  // this block for the same reason.
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+  }
+
+  sourceSets {
+    main {
+      // Build outputs of packages/crypto-core-ffi, produced by
+      // scripts/build-android-native.sh: cargo-ndk writes one .so per
+      // ABI, uniffi-bindgen writes the Kotlin that calls into them.
+      // Neither is checked in — they are compiled from a source tree
+      // that is — so they live under generated/ rather than in src/,
+      // where they would look hand-written and be edited as if they
+      // were.
+      java.srcDirs += 'generated/java'
+      jniLibs.srcDirs += 'generated/jniLibs'
+    }
+  }
+}
+
+dependencies {
+  // The generated bindings reach the native library through JNA rather
+  // than registering JNI methods by hand. The `@aar` suffix is
+  // load-bearing: the plain jar has no Android native loader and fails
+  // at runtime rather than at build time.
+  implementation 'net.java.dev.jna:jna:5.14.0@aar'
+}

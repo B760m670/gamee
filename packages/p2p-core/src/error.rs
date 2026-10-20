@@ -8,11 +8,12 @@ pub enum P2pError {
     #[error("failed to build the network transport/behaviour: {0}")]
     Setup(String),
 
-    #[error("failed to listen on {addr}: {source}")]
-    Listen {
-        addr: String,
-        source: libp2p::TransportError<std::io::Error>,
-    },
+    /// Every address family this node tried to listen on failed. Carries
+    /// one `addr: reason` entry per attempt, since which families failed
+    /// (IPv4, IPv6, or both) is the whole diagnostic value here — a host
+    /// missing one of the two is normal and not an error on its own.
+    #[error("failed to listen on any address: {details}")]
+    Listen { details: String },
 
     #[error("failed to dial {peer}: {source}")]
     Dial {

@@ -6,9 +6,9 @@
 use std::time::Duration;
 
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns, relay,
+    connection_limits, dcutr, gossipsub, identify, kad, mdns, relay,
     request_response::{self, ProtocolSupport},
-    swarm::NetworkBehaviour,
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour},
     PeerId, StreamProtocol,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,34 @@ pub const ENVELOPE_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/e
 /// SpiritChat node as such, purely informational (no protocol negotiation
 /// depends on it; `ENVELOPE_PROTOCOL` support is what actually matters).
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "/spiritchat/1.0.0";
+
+/// This project's own Kademlia, which is where every record this network
+/// stores actually lives.
+///
+/// It would be simpler to keep using the public IPFS DHT for records too,
+/// and that is what this did at first. It cannot work, for a reason that
+/// has nothing to do with whether the IPFS nodes accept the writes.
+///
+/// Kademlia does not store a record "somewhere". It stores it on the
+/// nodes whose ids are numerically closest to the record's key, and
+/// answers a lookup by walking toward those same nodes. Closeness is
+/// measured against everyone in the routing table — and in the public
+/// DHT, that is on the order of twenty thousand IPFS nodes against a
+/// handful of ours. The chance that one of ours lands among the closest
+/// peers for any given key rounds to zero. So every record this network
+/// wrote would be handed to strangers who have no interest in keeping
+/// it, and every read would depend on those strangers having kept it.
+///
+/// The public DHT is not broken for this. It is simply somebody else's
+/// store, sized for somebody else's keys.
+///
+/// A separate protocol name is the whole mechanism: a peer that does not
+/// speak it never enters this routing table, so "closest" is measured
+/// only among nodes that run this software and want these records. It
+/// also takes this network's keys out of a public, crawlable index,
+/// which is worth as much as the functional fix — mailbox tags and
+/// rendezvous keys in the public DHT are metadata anyone may harvest.
+pub const PRIVATE_DHT_PROTOCOL: StreamProtocol = StreamProtocol::new("/spiritchat/kad/1.0.0");
 
 /// The wire protocol for fetching a content-addressed blob (e.g. an avatar
 /// image) directly from the peer that registered it via
@@ -95,8 +123,83 @@ pub enum BlobResponse {
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
+    /// A ceiling on how many connections this node will hold, enforced
+    /// before anything else gets to see them.
+    ///
+    /// Nothing bounded them before. That is survivable for a phone, which
+    /// nothing is trying to reach, but a standing relay announces itself
+    /// publicly in the DHT and invites the whole network to dial it — and
+    /// it typically shares a machine with something its operator cares
+    /// about. Unbounded, inbound connections grow until the process runs
+    /// out of file descriptors or memory, and the first thing to notice is
+    /// whatever else is on the box.
+    ///
+    /// These are a ceiling against unbounded growth, not a tuning knob,
+    /// and getting the number right took being wrong twice in opposite
+    /// directions.
+    ///
+    /// 256 established with 128 inbound was reached in ordinary
+    /// operation, because a standing relay advertising itself as a
+    /// *server* in the public DHT settles at two hundred-odd peers,
+    /// mostly inbound. Past the limit libp2p refuses the connection
+    /// mid-handshake and the dialling peer sees only "Handshake failed:
+    /// unexpected end of file" — which is how a phone could not reach a
+    /// relay that was working perfectly.
+    ///
+    /// Raising it to 1024/768 fixed that and made something worse. The
+    /// relay accepted the invitation: 366 peers within twenty seconds of
+    /// starting, 444 MB resident, on a 2 GB machine whose actual job was
+    /// somebody's VPN. A limit set above what the node will reach does
+    /// not bound anything; it just records how much damage is allowed.
+    ///
+    /// The real fix was upstream of both numbers — `kad_public` is a
+    /// client now, so the IPFS network no longer dials us at all and
+    /// the peer count is whatever we sought out plus whoever actually
+    /// wants this network. These numbers sit above that and below what
+    /// a small machine can be asked to hold. They will need raising when
+    /// this network has enough users to approach them, which is a
+    /// pleasant problem and a visible one: the symptom is the handshake
+    /// failure above.
+    ///
+    /// Worth pairing with a raised `LimitNOFILE`, since every connection
+    /// costs descriptors; the relay's own systemd unit sets 65536.
+    ///
+    /// `max_established_per_peer` is above one on purpose — two peers that
+    /// discover each other simultaneously legitimately open a connection
+    /// each before one is dropped (see node.rs's `ConnectionClosed`
+    /// handling).
+    pub connection_limits: connection_limits::Behaviour,
+    /// This network's own DHT — every `put_record`/`get_record` in this
+    /// crate goes here. See `PRIVATE_DHT_PROTOCOL` for why it cannot be
+    /// the public one.
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
-    pub mdns: mdns::tokio::Behaviour,
+    /// The public IPFS DHT, kept for exactly one job: *finding* the peers
+    /// that speak `PRIVATE_DHT_PROTOCOL`, via the standing-relay provider
+    /// key, plus the bootstrap walk that makes that lookup possible.
+    ///
+    /// Provider records are the one thing the public DHT does do for us.
+    /// They are announced and found by content routing, which the IPFS
+    /// nodes serve for anyone, and a relay really did announce itself
+    /// this way — so a fresh install with no contacts and no local peers
+    /// still has somewhere to start. Nothing of this network's own data
+    /// is written here.
+    pub kad_public: kad::Behaviour<kad::store::MemoryStore>,
+    /// Local-network peer discovery, **optional at runtime**.
+    ///
+    /// mDNS is the one behaviour here that touches the OS when it is
+    /// built: it opens a UDP socket on 5353 and joins a multicast group.
+    /// Android refuses that to ordinary apps, so on a phone — in Termux,
+    /// or any container sharing the app's network namespace — the call
+    /// fails with `EPERM` and, when it was mandatory, took the entire node
+    /// down with "failed to build behaviour: Permission denied" before a
+    /// single connection was attempted.
+    ///
+    /// Losing it costs only discovery of peers on the same local network.
+    /// Everything that makes a node useful — the DHT, the mix, mailboxes,
+    /// the ledger — is unaffected, and a phone is the last place where
+    /// same-LAN discovery was going to matter. Refusing to start at all
+    /// over it was badly out of proportion.
+    pub mdns: Toggle<mdns::tokio::Behaviour>,
     pub identify: identify::Behaviour,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
@@ -141,10 +244,41 @@ pub fn build(
     // walk to the key's closest peers before concluding nobody has it —
     // capping this at a shorter, still realistic bound keeps that worst
     // case from stretching a UI "checking..." state out past a minute.
-    let mut kad_config = kad::Config::default();
+    let mut kad_config = kad::Config::new(PRIVATE_DHT_PROTOCOL);
     kad_config.set_query_timeout(Duration::from_secs(25));
     let mut kad = kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), kad_config);
     kad.set_mode(Some(kad::Mode::Server));
+
+    // The public instance keeps the stock `/ipfs/kad/1.0.0` protocol,
+    // because speaking IPFS's own name is the entire point of it. Its
+    // longer timeout is deliberate: a walk across the public DHT visits
+    // far more hops than one across this network, and the 25s above was
+    // chosen for a lookup that fails fast on a small keyspace, not for
+    // content routing among twenty thousand strangers.
+    let mut public_config = kad::Config::default();
+    public_config.set_query_timeout(Duration::from_secs(60));
+    let mut kad_public =
+        kad::Behaviour::with_config(peer_id, kad::store::MemoryStore::new(peer_id), public_config);
+    // Client mode, and the reason is worth stating because the first
+    // version of this said the opposite.
+    //
+    // Server mode here was called "a courtesy to IPFS, not a requirement
+    // of ours". The courtesy was not free. Announcing ourselves as a
+    // server in the public DHT invites the whole IPFS network to dial
+    // us, and it accepts: a standing relay went from 90 connections to
+    // 366 in eighteen seconds, settling into hundreds of peers that
+    // store nothing of ours and want nothing from us. At roughly a
+    // megabyte of buffers each, that was 444 MB resident on a 2 GB
+    // machine whose real job is somebody's VPN — twenty times what the
+    // same binary measures with no peers.
+    //
+    // A client-mode node still issues every query we actually use:
+    // `get_providers` to find standing relays, `start_providing` to
+    // become findable, and the bootstrap walk that makes both possible.
+    // What it stops doing is answering other people's lookups. Since
+    // this network's own records moved to `PRIVATE_DHT_PROTOCOL`, that
+    // is the entire difference.
+    kad_public.set_mode(Some(kad::Mode::Client));
 
     // Signed (not Anonymous) message authenticity: `propagation_source` on
     // a received `Message` is still just "who forwarded it to us" either
@@ -160,8 +294,29 @@ pub fn build(
     ledger_gossip.subscribe(&mix_relay_directory_topic())?;
 
     Ok(Behaviour {
+        connection_limits: connection_limits::Behaviour::new(
+            connection_limits::ConnectionLimits::default()
+                .with_max_established(Some(256))
+                .with_max_established_incoming(Some(128))
+                .with_max_pending_incoming(Some(128))
+                .with_max_pending_outgoing(Some(128))
+                .with_max_established_per_peer(Some(4)),
+        ),
         kad,
-        mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?,
+        kad_public,
+        // Built best-effort: see the field's own doc comment for why a
+        // refusal here must not stop the node from starting.
+        mdns: Toggle::from(match mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id) {
+            Ok(behaviour) => Some(behaviour),
+            Err(err) => {
+                // No tracing in this crate, and the caller gets a node that
+                // works — so this is the only record that local discovery
+                // is off, which beats silence when someone wonders why two
+                // devices on one network cannot see each other.
+                eprintln!("[p2p-core] local-network discovery (mDNS) unavailable, continuing without it: {err}");
+                None
+            }
+        }),
         identify: identify::Behaviour::new(identify::Config::new(
             IDENTIFY_PROTOCOL_VERSION.to_string(),
             key.public(),

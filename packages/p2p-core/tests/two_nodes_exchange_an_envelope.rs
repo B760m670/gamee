@@ -83,9 +83,21 @@ async fn a_peer_can_announce_and_resolve_its_own_addresses_via_the_dht() {
     let alice_peer_id = alice.local_peer_id();
     let bob_peer_id = bob.local_peer_id();
 
+    // Loopback is skipped, not merely the wildcard, because a node only
+    // ever publishes addresses another device could dial — announcing
+    // 127.0.0.1 to the network would be announcing nothing. Taking the
+    // first concrete address regardless made this test depend on the
+    // order two listeners happened to come up in, which is how it turned
+    // flaky under parallel load.
     let bob_addr = loop {
         match bob.next_event().await.unwrap() {
-            P2pEvent::ListeningOn(addr) if !addr.to_string().contains("0.0.0.0") => break addr,
+            P2pEvent::ListeningOn(addr)
+                if !addr.to_string().contains("0.0.0.0")
+                    && !addr.to_string().contains("/ip4/127.")
+                    && !addr.to_string().contains("/ip6/::1") =>
+            {
+                break addr
+            }
             _ => continue,
         }
     };
